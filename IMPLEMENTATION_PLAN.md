@@ -156,17 +156,24 @@ export const EnvelopeSchema = z.object({
 });
 
 export type Envelope = z.infer<typeof EnvelopeSchema>;
+export type ComfyError = z.infer<typeof ComfyErrorSchema>;
 export type ParsedEnvelope =
   | { ok: true; command: string; data: unknown }
-  | { ok: false; command: string; error: z.infer<typeof ComfyErrorSchema> };
+  | { ok: false; command: string; where: string | null; error: ComfyError };
 
-export function parseEnvelope(raw: string): ParsedEnvelope {
-  const env = EnvelopeSchema.parse(JSON.parse(raw));
-  if (env.ok) return { ok: true, command: env.command, data: env.data };
-  if (!env.error) throw new Error(`envelope ok:false with no error object (command: ${env.command})`);
-  return { ok: false, command: env.command, error: env.error };
-}
+export function parseEnvelope(raw: string): ParsedEnvelope { /* see amendments */ }
+export function parseEnvelopeValue(value: unknown): ParsedEnvelope { /* see amendments */ }
 ```
+
+**Amendments (post-review, 2026-08-03).** Code review mutation-tested the first implementation and found four surviving mutants; these changes were adjudicated and are binding:
+
+1. **`EnvelopeParseError`** — an exported error class carrying the raw output, thrown at *every* failure site in the module. Without it, Task 1.3's executor can only blanket-catch, which swallows its own bugs and misreports them to the user as CLI contract violations.
+2. **`where` is preserved on the failure arm** (shown above). It is the CLI's local-vs-cloud routing target, unrecoverable once dropped, and this stage exists to make diagnostics good.
+3. **`ComfyErrorSchema` uses `z.looseObject`** so upstream error-field additions survive rather than being silently stripped. Same append-only reasoning as the open `code` string. Top-level envelope stripping stays as-is.
+4. **Empty/whitespace stdout gets its own guard** — a killed or timed-out `comfy` is a common real failure and "not valid JSON (received: )" misdirects the reader.
+5. **`parseEnvelopeValue(value: unknown)`** is exported alongside the string entry point. Task 3.2 parses NDJSON line by line and will already hold a parsed value; without this it would re-serialize to call a string-only API.
+
+**Mutation testing is a required gate for this module.** These four mutants must each turn the suite red: success path returning `data: null`; `hint`/`details` removed from `ComfyErrorSchema`; `schema` literal weakened to `z.string()`; `type` literal weakened to `z.string()`.
 
 **Step 4:** `bun test tests/envelope.test.ts` → PASS.
 **Step 5 — commit:** `feat: parse comfy envelope/1 contract`
