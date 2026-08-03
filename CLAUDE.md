@@ -36,4 +36,12 @@ Confirm these against reality before relying on them; they are intent, not fact.
 
 This repo is managed with GitButler (current branch: `gitbutler/workspace`). See the
 global `~/.claude/CLAUDE.md` for the required workflow — in short, use the `gitbutler`
-skill and `but commit` rather than `git commit`, and never commit directly to `main`.
+skill and `but commit` rather than `git commit`.
+
+**Project override:** this repo lands virtual branches directly onto `main` with
+`but land <branch>` instead of opening pull requests. This overrides the global
+default of "always open a PR." Work still gets committed to a named virtual branch
+first — land the branch, don't commit to `main` directly.
+
+Landing pushes to `origin/main` immediately and `but undo` cannot un-push it, so
+confirm the commits are correct before landing.
