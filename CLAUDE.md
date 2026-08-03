@@ -4,9 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status: unscaffolded
 
-This repository currently contains only `README.md` and `.gitignore`. There is no
-`package.json`, no source tree, and no test setup. Build, lint, and test commands
-cannot be documented until the project is scaffolded — **do not assume any exist.**
+This repository currently contains only `README.md`, `.gitignore`, `UNLICENSE`, and
+this file. There is no `package.json`, no source tree, and no test setup. Build,
+lint, and test commands cannot be documented until the project is scaffolded —
+**do not assume any exist.**
 
 Whoever scaffolds this project should replace this section with the real commands
 (install, build, run the server, run the full test suite, run a single test) and a
