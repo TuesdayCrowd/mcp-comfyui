@@ -1,0 +1,22 @@
+{
+  "name": "mcp-comfyui",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "mcp-comfyui": "./dist/mcp-comfyui"
+  },
+  "scripts": {
+    "test": "bun test",
+    "build": "bun build src/index.ts --compile --outfile dist/mcp-comfyui",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.4.3"
+  }
+}
