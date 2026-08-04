@@ -1,15 +1,15 @@
 /**
  * Where a ComfyUI instance lives, and how to say so consistently.
  *
- * Every module that talks to an instance — the object_info cache, the workflow
- * wrappers, instance detection — needs the same defaults and the same wildcard
- * handling. Three copies of that had already started to drift (one stripped
- * IPv6 brackets before the wildcard check and one did not, so `[::]` resolved
- * correctly in one module and leaked through in the other), which is what this
- * module exists to prevent.
+ * Every module that talks to an instance needs the same defaults and the same
+ * wildcard handling. Two copies of that had already diverged before this module
+ * existed — `comfy/objectInfo.ts` stripped IPv6 brackets before the wildcard
+ * check and `workflows/slots.ts` did not, so `[::]` resolved to loopback in one
+ * and leaked through as a literal host in the other. This is the one place that
+ * logic lives now.
  */
 
-export const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 8188;
 
 /**
@@ -19,20 +19,35 @@ export const DEFAULT_PORT = 8188;
  */
 const WILDCARD_HOSTS = new Set(["0.0.0.0", "::"]);
 
+function unbracket(host: string): string {
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+
 /**
- * The address to connect to, unbracketed: `[::1]` and `::1` are one host, and
- * the brackets must come off before the wildcard check or `[::]` slips through.
+ * The address to connect to, always unbracketed: `[::1]` and `::1` are one
+ * host, and the brackets must come off before the wildcard check or `[::]`
+ * slips through.
+ *
+ * @throws {TypeError} the host is present but empty — a misconfiguration that
+ * would otherwise build `http://:8188/` and be reported as an unreachable
+ * server, sending the operator to check a server that is running fine.
  */
 export function resolveHost(host: string | undefined): string {
   if (host === undefined) return DEFAULT_HOST;
-  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  if (host.trim() === "") {
+    throw new TypeError("host is empty; omit it to use the default, or give an address");
+  }
+  const bare = unbracket(host);
   return WILDCARD_HOSTS.has(bare) ? DEFAULT_HOST : bare;
 }
 
 /**
- * `host:port` for a URL. An IPv6 literal has to be bracketed, or `fetch`
- * rejects the whole string as invalid before a single packet moves.
+ * The `host:port` authority for a URL. An IPv6 literal has to be bracketed or
+ * `fetch` rejects the whole string before a single packet moves — and bracketed
+ * exactly once, so this tolerates a host that arrives already bracketed rather
+ * than producing `[[::1]]`.
  */
 export function authority(host: string, port: number): string {
-  return `${host.includes(":") ? `[${host}]` : host}:${port}`;
+  const bare = unbracket(host);
+  return `${bare.includes(":") ? `[${bare}]` : bare}:${port}`;
 }

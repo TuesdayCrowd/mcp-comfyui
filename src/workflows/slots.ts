@@ -152,9 +152,9 @@ function apiFormatGuidance(workflowPath: string): string {
 
 /**
  * Run the command, enriching the one failure whose fix is not obvious from its
- * code. The error keeps its type, code, `where` and stack: callers branch on
- * the append-only code registry, and swapping in a bespoke type per code would
- * both break that and lose what the CLI said.
+ * code. The error keeps its type, code, `where`, `hint` and `details`: callers
+ * branch on the append-only code registry, and swapping in a bespoke type per
+ * code would both break that and lose what the CLI said.
  */
 async function fetchPayload(workflowPath: string, opts: ListSlotsOptions): Promise<unknown> {
   const args = ["workflow", "slots", workflowPath, ...schemaSourceArgs(opts)];
@@ -163,6 +163,17 @@ async function fetchPayload(workflowPath: string, opts: ListSlotsOptions): Promi
     return await runComfy(args, { timeoutMs: opts.timeoutMs });
   } catch (err) {
     if (err instanceof ComfyCliError && err.code === NOT_FRONTEND_FORMAT) {
+      // Rewritten in place rather than re-thrown as a new error: ComfyCliError
+      // keeps only its formatted message and discards the CLI's raw one, so
+      // re-constructing would double-prefix.
+      //
+      // INVARIANT: nothing may read `err.stack` between `runComfy` throwing and
+      // this line. A JSC stack embeds the `Name: message` header and is
+      // memoized on first read, so a logger or retry wrapper added in that
+      // window would freeze the pre-enrichment text into `.stack` while
+      // `.message` carries the guidance, and the two would then disagree with
+      // nothing to say why. If you need to read the stack there, append this
+      // guidance where the error is constructed instead.
       err.message = `${err.message}\n${apiFormatGuidance(workflowPath)}`;
     }
     throw err;

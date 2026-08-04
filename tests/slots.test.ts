@@ -221,6 +221,57 @@ test("a boolean current_value survives", async () => {
   expect((await listSlots("/workflows/flow.json")).slots[0]?.current_value).toBe(true);
 });
 
+test("a null current_value survives as null", async () => {
+  // An unset optional widget is representable, and Task 2.3 reads null as "no
+  // default" — which it can only do if the value arrives neither coerced into
+  // some other type nor dropped along with its slot.
+  servePayload({
+    workflow: "/workflows/flow.json",
+    id: "flow",
+    count: 1,
+    slots: [
+      {
+        address: "14.lora_name",
+        name: "lora_name",
+        type: "COMBO",
+        current_value: null,
+        instance_id: "14",
+        node_type: "LoraLoader",
+      },
+    ],
+  });
+
+  const listing = await listSlots("/workflows/flow.json");
+  expect(listing.slots).toHaveLength(1); // the slot is not dropped
+  expect(listing.slots[0]?.current_value).toBeNull(); // and the value is not coerced
+});
+
+test("an unfamiliar slot field is stripped, not rejected", async () => {
+  // Strip-not-reject is deliberate: upstream adds fields, and one unfamiliar
+  // key must neither sink the listing nor appear on a Slot, whose type says it
+  // cannot be there.
+  servePayload({
+    workflow: "/workflows/flow.json",
+    id: "flow",
+    count: 1,
+    slots: [
+      {
+        address: "3.seed",
+        name: "seed",
+        type: "INT",
+        current_value: 1,
+        instance_id: "3",
+        node_type: "KSampler",
+        tooltip: "a field this server has never heard of",
+      },
+    ],
+  });
+
+  const listing = await listSlots("/workflows/flow.json");
+  expect(listing.slots[0]?.address).toBe("3.seed"); // parsed, not rejected
+  expect(listing.slots[0]).not.toHaveProperty("tooltip"); // and not passed through
+});
+
 test("a subgraph address with more than two segments is preserved verbatim", async () => {
   // Addresses inside an expanded subgraph carry the enclosing instance too, so
   // an address is opaque and authoritative — never `instance_id` + `.` + `name`.
@@ -296,7 +347,6 @@ test("an unrelated CLI failure propagates untouched", async () => {
 
 test("a timeout propagates as a timeout, on the caller's budget", async () => {
   process.env.FAKE_COMFY_MODE = "hang";
-  process.env.FAKE_COMFY_PID_OUT = join(workdir, "pid");
 
   const started = Date.now();
   const err = await rejection(listSlots("/workflows/flow.json", { timeoutMs: 250 }));
@@ -311,9 +361,16 @@ test("a payload with no slots array is rejected with a description of the payloa
   const err = await rejection(listSlots("/workflows/flow.json"));
   expect(err).toBeInstanceOf(SlotListingParseError);
   expect(err).not.toBeInstanceOf(ComfyCliError);
+
   const message = (err as Error).message;
-  expect(message).toContain("slots");
-  expect(message).toContain("/workflows/flow.json");
+  // Deliberately past the constant prefix, which already contains both the word
+  // "slots" and the workflow path and so can satisfy a naive assertion on its
+  // own. What makes this message worth reading is the zod detail...
+  expect(message).toContain("Invalid input: expected array, received undefined");
+  expect(message).toContain("→ at slots"); // which field, and where
+  // ...and the payload itself, which is the only record of what actually came
+  // back once the process has exited.
+  expect(message).toContain(`received: {"workflow":"/workflows/flow.json","id":"flow","count":0}`);
 });
 
 test("a slot missing its address is rejected rather than half-typed", async () => {
