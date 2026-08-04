@@ -1,10 +1,31 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { basename, isAbsolute } from "node:path";
 import { z } from "zod";
-import { detectInstance, launchInstance, type LaunchArgs, type RunningInstance } from "./comfy/instance.ts";
+import {
+  detectInstance,
+  ensureInstance,
+  launchInstance,
+  type LaunchArgs,
+  type RunningInstance,
+} from "./comfy/instance.ts";
 import { cancelJob, getJobStatus, type CancelResult, type JobStatus } from "./comfy/jobs.ts";
-import { getObjectInfo, objectInfoCachePath } from "./comfy/objectInfo.ts";
-import { workflowRoots, type Environment } from "./config.ts";
+import {
+  getObjectInfo,
+  objectInfoCachePath,
+  ObjectInfoFetchError,
+} from "./comfy/objectInfo.ts";
+import {
+  ALLOW_LAUNCH_ENV,
+  AUTO_LAUNCH_ENV,
+  CACHE_DIR_ENV,
+  HOST_ENV,
+  PORT_ENV,
+  WORKSPACE_ENV,
+  flag,
+  setting,
+  workflowRoots,
+  type Environment,
+} from "./config.ts";
 import { toolAnswer, WorkflowNotFoundError } from "./toolResult.ts";
 import { describeSlots } from "./workflows/describe.ts";
 import { discoverWorkflows } from "./workflows/discover.ts";
@@ -52,12 +73,6 @@ const WAIT_TIMEOUT_MS = 300_000;
 /** The widest budget a caller may ask for: half an hour, for a video workflow. */
 const MAX_TIMEOUT_SECONDS = 1_800;
 
-/** The exact opt-in that adds `launch_comfyui`. See {@link toolConfig}. */
-const ALLOW_LAUNCH_ENV = "MCP_COMFYUI_ALLOW_LAUNCH";
-const HOST_ENV = "MCP_COMFYUI_HOST";
-const PORT_ENV = "MCP_COMFYUI_PORT";
-const CACHE_DIR_ENV = "MCP_COMFYUI_CACHE_DIR";
-
 const MIN_PORT = 1;
 const MAX_PORT = 65535;
 
@@ -69,24 +84,17 @@ export interface ToolConfig {
   port: number | undefined;
   /** Where the `/object_info` cache lives. `undefined` means `~/.cache/mcp-comfyui`. */
   cacheDir: string | undefined;
-  /** Whether `launch_comfyui` is registered at all. */
+  /** The ComfyUI directory to launch from. `undefined` lets comfy resolve one. */
+  workspace: string | undefined;
+  /**
+   * May this server start ComfyUI when a tool needs one and nothing answers?
+   * Defaults to **true**.
+   */
+  autoLaunch: boolean;
+  /** Whether `launch_comfyui` is registered at all. Defaults to false. */
   allowLaunch: boolean;
   /** The environment the workflow roots are read from, per call. */
   env: Environment;
-}
-
-/**
- * An operator setting, or `undefined`.
- *
- * An empty value reads as unset, exactly as `config.ts` treats an empty
- * `MCP_COMFYUI_WORKFLOW_DIRS`: a shell that exports a variable it never assigned
- * produces `""`, and that means the operator said nothing. It also closes the
- * one path by which `resolveHost("")` — a bare `TypeError` from deep inside the
- * library — could be reached from configuration.
- */
-function setting(env: Environment, name: string): string | undefined {
-  const value = env[name]?.trim();
-  return value === undefined || value === "" ? undefined : value;
 }
 
 /**
@@ -113,9 +121,21 @@ export function toolConfig(env: Environment = process.env): ToolConfig {
     host: setting(env, HOST_ENV),
     port,
     cacheDir: setting(env, CACHE_DIR_ENV),
-    // Exactly `"1"`, not a truthiness test: an operator who writes `0` or
-    // `false` has said no, and a truthy check would read both as yes.
-    allowLaunch: env[ALLOW_LAUNCH_ENV] === "1",
+    workspace: setting(env, WORKSPACE_ENV),
+    // The two launch settings answer two different questions, which is why
+    // there are two of them and why neither gates the other:
+    //
+    //   AUTO_LAUNCH  — may THIS SERVER start ComfyUI when a tool needs one?
+    //   ALLOW_LAUNCH — may a MODEL start one, with startup flags of its own?
+    //
+    // The second is strictly the more powerful: `launch_comfyui` takes --cpu,
+    // --listen and a free-form argument list, so it stays opt-in even now that
+    // the first defaults to on. Keeping them independent is also what lets an
+    // operator say "never behind my back, but do give me a tool my client will
+    // prompt me to approve" — which is what ALLOW_LAUNCH alone used to mean, so
+    // nobody who set it sees their configuration change meaning.
+    autoLaunch: flag(env, AUTO_LAUNCH_ENV, true),
+    allowLaunch: flag(env, ALLOW_LAUNCH_ENV, false),
     env,
   };
 }
@@ -123,6 +143,24 @@ export function toolConfig(env: Environment = process.env): ToolConfig {
 /** The address arguments every CLI-backed call passes through. */
 function target(config: ToolConfig): { host?: string; port?: number } {
   return { host: config.host, port: config.port };
+}
+
+/**
+ * A running ComfyUI, started if need be and if permitted.
+ *
+ * Only the two tools that genuinely cannot work without a server call this.
+ * `comfy_status` never does — it is the tool you call to *ask* whether anything
+ * is running, and a status query that starts a GPU process is indefensible.
+ * `get_job` and `cancel_job` never do either: a freshly started ComfyUI has no
+ * record of the job being asked about, so launching one would burn a minute to
+ * answer the same question worse.
+ */
+function ensureRunning(config: ToolConfig) {
+  return ensureInstance({
+    ...target(config),
+    workspace: config.workspace,
+    autoLaunch: config.autoLaunch,
+  });
 }
 
 // --- workflow handles ----------------------------------------------------
@@ -261,6 +299,34 @@ function runBody(
   return body;
 }
 
+/**
+ * The node definitions, starting ComfyUI only if there is no other way to get
+ * them.
+ *
+ * The cache is tried first and is usually enough — that is the entire point of
+ * landmine #7, and it is why describing a workflow normally touches nothing.
+ * Only when the cache is missing or stale *and* the fetch that would refresh it
+ * fails is a launch worth considering, and even then only if nothing is already
+ * answering: a fetch that failed against a **running** instance failed for some
+ * other reason, and re-fetching after confirming it is up would just produce the
+ * same error a second time.
+ */
+async function withObjectInfo(
+  location: { host?: string; port?: number; cacheDir?: string },
+  config: ToolConfig,
+) {
+  try {
+    return await getObjectInfo(location);
+  } catch (err) {
+    if (!(err instanceof ObjectInfoFetchError) || !config.autoLaunch) throw err;
+    const ensured = await ensureRunning(config);
+    // It was up all along, so the address is not the problem; the original
+    // diagnosis is the better one and a retry would only obscure it.
+    if (ensured.outcome === "already_running") throw err;
+    return await getObjectInfo({ ...location, refresh: true });
+  }
+}
+
 // --- input schemas -------------------------------------------------------
 
 const workflowArgument = z
@@ -382,9 +448,16 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "lists inputs whose constraints could not be recovered — usually an uninstalled custom " +
         "node, or a dropdown whose model list is empty on this machine; those inputs are still " +
         "settable, but the schema cannot say what they accept. Reads node definitions from a " +
-        "local cache, so it works while ComfyUI is stopped.",
+        "local cache, so it normally works while ComfyUI is stopped." +
+        (config.autoLaunch
+          ? " If that cache is missing or stale and ComfyUI is not running, this will start " +
+            "ComfyUI to rebuild it, which can take a minute or two."
+          : ""),
       inputSchema: { workflow: workflowArgument },
-      annotations: { readOnlyHint: true, openWorldHint: true },
+      // Honest rather than flattering: with auto-launch on, this tool may start
+      // a GPU process, and `readOnlyHint: true` is a promise that it will not.
+      // See {@link registerTools}.
+      annotations: { readOnlyHint: !config.autoLaunch, openWorldHint: true },
     },
     async ({ workflow }) =>
       toolAnswer(async () => {
@@ -393,7 +466,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // Fetched and cached in one step, then the *path* is handed to the CLI:
         // the join below needs the parsed document, and `slots --input` needs
         // the file (landmine #7). Reading it twice would cost a second 1.7MB.
-        const objectInfo = await getObjectInfo(location);
+        const objectInfo = await withObjectInfo(location, config);
         const listing = await listSlots(resolved.path, {
           ...target(config),
           objectInfoPath: objectInfoCachePath(location),
@@ -423,7 +496,12 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "`wait: true` to block until the run finishes and get the output paths back directly, " +
         "which suits a short image render and not a long video one. A `wait: true` run that " +
         "outlasts its budget is not lost — the error names the `prompt_id`, and the run carries " +
-        "on inside ComfyUI.",
+        "on inside ComfyUI." +
+        (config.autoLaunch
+          ? " If ComfyUI is not running this will start ComfyUI first, so the first call after a " +
+            "cold machine can take a minute or two before the run is even submitted; later calls " +
+            "are immediate."
+          : ""),
       inputSchema: {
         workflow: workflowArgument,
         inputs: inputsArgument.optional(),
@@ -462,6 +540,12 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
               ? WAIT_TIMEOUT_MS
               : SUBMIT_TIMEOUT_MS
             : timeout_seconds * 1_000;
+
+        // Before anything else: `set-slot` validates against the server's node
+        // schemas and `run` submits to it, so both steps below need one. Doing
+        // this first also means the wait for a cold start is not counted
+        // against the CLI budgets computed above.
+        await ensureRunning(config);
 
         // A run needs a live server whatever happens, so `set-slot` is pointed
         // at the same server rather than at the offline cache: making the edit
@@ -590,6 +674,7 @@ function registerLaunch(server: McpServer, config: ToolConfig): void {
         };
         const result = await launchInstance({
           ...target(config),
+          workspace: config.workspace,
           args: launchArgs,
           extraArgs: args.extra_args ?? [],
         });

@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ComfyCliError, ComfyUnavailableError } from "../src/comfy/exec";
 import {
+  InstanceUnavailableError,
   LaunchArgumentError,
   LaunchTimeoutError,
   detectInstance,
+  ensureInstance,
   launchInstance,
   type InstanceDetection,
   type RunningInstance,
@@ -57,6 +59,13 @@ const SYSTEM_STATS = {
 /** No test may reach a real `comfy`; every invocation goes to this fake. */
 const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
 
+/**
+ * The same fake behind a wrapper that APPENDS every invocation to a log.
+ * `$FAKE_COMFY_ARGV_OUT` is overwritten per call and so cannot answer "how many
+ * times was the CLI run", which is the whole question a deduplication test asks.
+ */
+const FAKE_COMFY_LOGGING = join(import.meta.dir, "fixtures", "fake-comfy-dispatch");
+
 type Handler = (request: Request) => Response | Promise<Response>;
 type TestServer = ReturnType<typeof Bun.serve>;
 
@@ -81,8 +90,45 @@ afterEach(() => {
   delete process.env.FAKE_COMFY_PID_OUT;
   delete process.env.FAKE_COMFY_ERROR_CODE;
   delete process.env.FAKE_COMFY_ERROR_MESSAGE;
+  delete process.env.FAKE_COMFY_DISPATCH_LOG;
   rmSync(workdir, { recursive: true, force: true });
 });
+
+/**
+ * Point the CLI at the appending wrapper and hand back the log's path.
+ * Every invocation lands on its own line, so a count is a line count.
+ */
+function countingCli(mode: string): string {
+  const log = join(workdir, "invocations");
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
+  process.env.FAKE_COMFY_MODE = mode;
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
+  return log;
+}
+
+/** How many times the CLI was invoked. Zero when it never was. */
+function invocations(log: string): number {
+  if (!existsSync(log)) return 0;
+  return readFileSync(log, "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "").length;
+}
+
+/**
+ * The invocation count, once it has stopped moving.
+ *
+ * A launch deliberately does not wait for the CLI — readiness is the HTTP
+ * probe's to decide (landmine #9) — so `launchInstance` returns while the spawn
+ * is still starting. Counting immediately would read zero for a launch that did
+ * happen. Waiting for `expected` and then pausing again is what makes "exactly
+ * one" mean it: the second pause is the window a duplicate would appear in.
+ */
+async function settledInvocations(log: string, expected: number, timeoutMs = 5_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  while (invocations(log) < expected && Date.now() < deadline) await Bun.sleep(5);
+  await Bun.sleep(60);
+  return invocations(log);
+}
 
 /** Start a loopback server on an ephemeral port and hand back that port. */
 function serve(handler: Handler = () => stats(), hostname = "127.0.0.1"): number {
@@ -669,4 +715,194 @@ test("a port outside the TCP range is refused before anything is spawned", async
   expect(err).toBeInstanceOf(LaunchArgumentError);
   expect((err as Error).message).toContain("70000");
   expect(existsSync(argvOut)).toBe(false);
+});
+
+// --- the workspace comfy launches from ------------------------------------
+
+test("a configured workspace is a root flag, before the subcommand", async () => {
+  // Landmine #3: `--workspace` lives on the Typer root, so `comfy launch
+  // --workspace <p>` fails where `comfy --workspace <p> launch` works. On this
+  // machine comfy resolves to a default workspace that is not on disk, so this
+  // flag is the difference between launching and `not_in_workspace`.
+  const port = serveReadyAfter(1);
+  const argvOut = armCli("launch");
+
+  await launchInstance({ port, workspace: "/Users/lawls/ComfyUI-Installs/ComfyUI/ComfyUI", pollIntervalMs: 10 });
+
+  const argv = await argvOf(argvOut);
+  expect(argv).toContain("--workspace");
+  expect(argv[argv.indexOf("--workspace") + 1]).toBe("/Users/lawls/ComfyUI-Installs/ComfyUI/ComfyUI");
+  expect(argv.indexOf("--workspace")).toBeLessThan(argv.indexOf("launch"));
+  expect(argv[0]).toBe("--skip-prompt");
+});
+
+test("no configured workspace sends no --workspace at all", async () => {
+  // Letting comfy resolve on its own is what keeps a user who has run
+  // `comfy install` on their recorded default or recent workspace.
+  const port = serveReadyAfter(1);
+  const argvOut = armCli("launch");
+
+  await launchInstance({ port, pollIntervalMs: 10 });
+
+  expect(await argvOf(argvOut)).not.toContain("--workspace");
+});
+
+test("not_in_workspace is answered with the setting that fixes it", async () => {
+  // The expected first-run failure on a machine whose comfy-cli config names no
+  // workspace: comfy resolves to a directory that does not exist. The code alone
+  // says nothing a user can act on.
+  process.env.FAKE_COMFY_MODE = "launch_fail";
+  process.env.FAKE_COMFY_ERROR_CODE = "not_in_workspace";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "ComfyUI is not available.";
+  const port = serveReadyAfter(Number.MAX_SAFE_INTEGER);
+
+  const err = await rejection(launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 }));
+
+  expect(err).toBeInstanceOf(ComfyCliError);
+  expect((err as ComfyCliError).code).toBe("not_in_workspace");
+  const message = (err as Error).message;
+  expect(message).toContain("MCP_COMFYUI_WORKSPACE");
+  expect(message).toContain("comfy install");
+  expect(message).toContain("does not exist");
+  // This machine's two installs are its own accident, not a general fact.
+  expect(message).not.toContain("ComfyUI-Installs");
+});
+
+test("not_in_workspace names the workspace this server actually passed", async () => {
+  process.env.FAKE_COMFY_MODE = "launch_fail";
+  process.env.FAKE_COMFY_ERROR_CODE = "not_in_workspace";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "ComfyUI is not available.";
+  const port = serveReadyAfter(Number.MAX_SAFE_INTEGER);
+
+  const err = await rejection(
+    launchInstance({ port, workspace: "/tmp/not-a-workspace", timeoutMs: 5_000, pollIntervalMs: 10 }),
+  );
+
+  // Without this the user re-reads a setting they have already set correctly.
+  expect((err as Error).message).toContain("/tmp/not-a-workspace");
+});
+
+test("a failure that is not not_in_workspace is passed through unembellished", async () => {
+  process.env.FAKE_COMFY_MODE = "launch_fail";
+  process.env.FAKE_COMFY_ERROR_CODE = "port_in_use";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "port 8188 is already bound";
+  const port = serveReadyAfter(Number.MAX_SAFE_INTEGER);
+
+  const err = await rejection(launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 }));
+
+  expect((err as ComfyCliError).code).toBe("port_in_use");
+  expect((err as Error).message).not.toContain("MCP_COMFYUI_WORKSPACE");
+});
+
+// --- ensureInstance -------------------------------------------------------
+
+test("ensureInstance returns a running instance and invokes nothing", async () => {
+  // The guard, reached through the new door. Auto-launch must not become a way
+  // round the one rule this module exists to enforce (landmine #8).
+  const port = serve();
+  const log = countingCli("launch");
+
+  const ensured = await ensureInstance({ port, autoLaunch: true });
+
+  expect(ensured.outcome).toBe("already_running");
+  expect(ensured.instance.version).toBe("0.29.0");
+  expect(await settledInvocations(log, 0)).toBe(0);
+});
+
+test("ensureInstance launches when nothing is answering", async () => {
+  const port = serveReadyAfter(2);
+  const log = countingCli("launch");
+
+  const ensured = await ensureInstance({ port, autoLaunch: true, pollIntervalMs: 10 });
+
+  expect(ensured.outcome).toBe("launched");
+  expect(ensured.instance.version).toBe("0.29.0");
+  expect(await settledInvocations(log, 1)).toBe(1);
+});
+
+test("a ComfyUI that appears between the two probes is not raced", async () => {
+  // ensureInstance probes, sees nothing, and hands over to launchInstance —
+  // which probes AGAIN before spawning. That second probe is the guard proper,
+  // and this is the window it exists for: something came up in between, and a
+  // launch now would be the second instance landmine #8 forbids.
+  const port = serveReadyAfter(1);
+  const log = countingCli("launch");
+
+  const ensured = await ensureInstance({ port, autoLaunch: true, pollIntervalMs: 10 });
+
+  expect(ensured.outcome).toBe("already_running");
+  expect(await settledInvocations(log, 0)).toBe(0);
+});
+
+test("ensureInstance refuses actionably when auto-launch is off", async () => {
+  const port = closedPort();
+  const log = countingCli("launch");
+
+  const err = await rejection(ensureInstance({ port, autoLaunch: false }));
+
+  expect(err).toBeInstanceOf(InstanceUnavailableError);
+  const message = (err as Error).message;
+  expect(message).toContain(String(port)); // the address that was probed
+  expect(message).toContain("MCP_COMFYUI_AUTO_LAUNCH"); // and how to change the answer
+  expect(await settledInvocations(log, 0)).toBe(0);
+});
+
+test("concurrent ensures start exactly one ComfyUI", async () => {
+  // The failure the whole guard exists to prevent, now reachable because
+  // auto-launch fires from tool handlers rather than from one explicit call.
+  const port = serveReadyAfter(4);
+  const log = countingCli("launch");
+
+  const ensured = await Promise.all([
+    ensureInstance({ port, autoLaunch: true, pollIntervalMs: 10 }),
+    ensureInstance({ port, autoLaunch: true, pollIntervalMs: 10 }),
+    ensureInstance({ port, autoLaunch: true, pollIntervalMs: 10 }),
+  ]);
+
+  expect(await settledInvocations(log, 1)).toBe(1);
+  for (const result of ensured) expect(result.instance.version).toBe("0.29.0");
+});
+
+test("a launch already in flight is joined rather than started again", async () => {
+  const port = serveReadyAfter(4);
+  const log = countingCli("launch");
+
+  const [first, second] = await Promise.all([
+    launchInstance({ port, pollIntervalMs: 10 }),
+    launchInstance({ port, pollIntervalMs: 10 }),
+  ]);
+
+  expect(await settledInvocations(log, 1)).toBe(1);
+  expect(first.instance.url).toBe(second.instance.url);
+});
+
+test("a later launch runs again, because the in-flight entry is released", async () => {
+  // Cleanup has to happen on the failure path too, or one bad launch wedges
+  // this process until it restarts.
+  const closed = closedPort();
+  process.env.FAKE_COMFY_MODE = "launch_fail";
+  process.env.FAKE_COMFY_ERROR_CODE = "port_in_use";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "bound";
+  const log = countingCli("launch_fail");
+
+  await rejection(launchInstance({ port: closed, timeoutMs: 3_000, pollIntervalMs: 10 }));
+  await rejection(launchInstance({ port: closed, timeoutMs: 3_000, pollIntervalMs: 10 }));
+
+  expect(await settledInvocations(log, 2)).toBe(2);
+});
+
+test("a caller's bad argument fails only that caller", async () => {
+  // Validation happens before the shared region: one caller's typo must not
+  // fail a launch somebody else asked for.
+  const port = serveReadyAfter(2);
+  const log = countingCli("launch");
+
+  const [bad, good] = await Promise.all([
+    rejection(launchInstance({ port, extraArgs: ["--"], pollIntervalMs: 10 })),
+    launchInstance({ port, pollIntervalMs: 10 }),
+  ]);
+
+  expect(bad).toBeInstanceOf(LaunchArgumentError);
+  expect(good.outcome).toBe("launched");
+  expect(await settledInvocations(log, 1)).toBe(1);
 });

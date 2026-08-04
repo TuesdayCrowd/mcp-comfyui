@@ -4,6 +4,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -22,10 +23,11 @@ import { toolConfig } from "../src/tools";
  * No test here may contact a ComfyUI, invoke the real `comfy`, or leave a
  * process behind. Every CLI invocation goes to `tests/fixtures/fake-comfy` (via
  * the dispatcher, since one tool call can make two CLI calls with different
- * subcommands), every HTTP probe goes to a hermetic `Bun.serve` on an ephemeral
- * port, and the instance address every tool defaults to is pointed at a port
- * nothing is listening on — so an accidental fetch cannot reach the ComfyUI
- * Desktop that may well be running on 8188 on this machine.
+ * subcommands), and every HTTP probe goes to a hermetic `Bun.serve` on an
+ * ephemeral port. The instance address is never left at its 8188 default, so an
+ * accidental probe cannot reach the ComfyUI that may well be running on this
+ * machine — and auto-launch is OFF unless a test turns it on, so nothing here
+ * can start one.
  */
 
 const FIXTURES = join(import.meta.dir, "fixtures");
@@ -61,6 +63,8 @@ let servers: TestServer[] = [];
 let open: Array<() => Promise<void>> = [];
 /** The port every tool talks to unless a test says otherwise; nothing listens. */
 let deadPort: number;
+/** How many times `/object_info` was asked for, across every served instance. */
+let objectInfoRequests = 0;
 
 const MANAGED_ENV = [
   "COMFY_BIN",
@@ -87,6 +91,8 @@ const MANAGED_ENV = [
   "MCP_COMFYUI_HOST",
   "MCP_COMFYUI_PORT",
   "MCP_COMFYUI_ALLOW_LAUNCH",
+  "MCP_COMFYUI_AUTO_LAUNCH",
+  "MCP_COMFYUI_WORKSPACE",
 ];
 
 beforeEach(() => {
@@ -98,13 +104,18 @@ beforeEach(() => {
   mkdirSync(cacheDir);
   servers = [];
   open = [];
+  objectInfoRequests = 0;
   deadPort = closedPort();
 
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
   process.env.MCP_COMFYUI_WORKFLOW_DIRS = roots;
   process.env.MCP_COMFYUI_CACHE_DIR = cacheDir;
-  process.env.MCP_COMFYUI_PORT = String(deadPort);
+  // A ComfyUI is answering by default, because that is the state every tool
+  // that needs one is written for. Tests about the other state call
+  // `nothingRunning()`; tests about starting one turn auto-launch back on.
+  serveInstance();
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "0";
 });
 
 afterEach(async () => {
@@ -134,16 +145,58 @@ function closedPort(): number {
   return port;
 }
 
-/** Stand up a loopback `/system_stats` and point the server's target at it. */
+/**
+ * Stand up a loopback ComfyUI and point the server's target at it.
+ *
+ * Only `/system_stats` is answered. `/object_info` deliberately 404s: this fake
+ * is a *reachable instance*, not a complete ComfyUI, and a describe that needs
+ * node definitions must be given a seeded cache rather than quietly reading a
+ * system-stats body as a node dictionary.
+ */
 function serveInstance(body: unknown = SYSTEM_STATS): number {
   const bound = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch: () => new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } }),
+    fetch: (request) => {
+      const path = new URL(request.url).pathname;
+      if (path === "/object_info") objectInfoRequests += 1;
+      return path === "/system_stats"
+        ? new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } })
+        : new Response("not found", { status: 404 });
+    },
   });
   servers.push(bound);
   const port = portOf(bound);
   process.env.MCP_COMFYUI_PORT = String(port);
+  return port;
+}
+
+/** Point the server's target at an address nothing answers on. */
+function nothingRunning(): number {
+  process.env.MCP_COMFYUI_PORT = String(deadPort);
+  return deadPort;
+}
+
+/**
+ * A ComfyUI that refuses until it has been probed `failures` times — what a
+ * cold start looks like from outside — with auto-launch turned on.
+ */
+function launchable(failures: number): number {
+  let seen = 0;
+  const bound = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: (request) => {
+      if (new URL(request.url).pathname !== "/system_stats") return new Response("nf", { status: 404 });
+      return seen++ < failures
+        ? new Response("starting", { status: 503 })
+        : new Response(JSON.stringify(SYSTEM_STATS), { headers: { "content-type": "application/json" } });
+    },
+  });
+  servers.push(bound);
+  const port = portOf(bound);
+  process.env.MCP_COMFYUI_PORT = String(port);
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
   return port;
 }
 
@@ -366,13 +419,29 @@ test("launch_comfyui appears when the operator opts in", async () => {
   expect(toolNamed(list, "launch_comfyui").annotations?.readOnlyHint).toBe(false);
 });
 
-test("only the exact opt-in value enables launch_comfyui", async () => {
-  // A truthiness test would let `0` and `false` turn it on, which is the
-  // opposite of what an operator writing either of those meant.
-  for (const value of ["0", "false", "true", "yes", " 1", ""]) {
+test("a setting spelled off keeps launch_comfyui unregistered", async () => {
+  for (const value of ["0", "false", "no", "off", "OFF", ""]) {
     process.env.MCP_COMFYUI_ALLOW_LAUNCH = value;
     expect(await toolNames(await connect())).not.toContain("launch_comfyui");
   }
+});
+
+test("a setting spelled on registers launch_comfyui", async () => {
+  for (const value of ["1", "true", "yes", "on", "ON", " true "]) {
+    process.env.MCP_COMFYUI_ALLOW_LAUNCH = value;
+    expect(await toolNames(await connect())).toContain("launch_comfyui");
+  }
+});
+
+test("a setting that is neither is refused at startup rather than guessed at", async () => {
+  // Silently reading `maybe` as off is how an operator ends up believing they
+  // enabled something they did not.
+  expect(() => createServer({ MCP_COMFYUI_ALLOW_LAUNCH: "maybe" })).toThrow(
+    /MCP_COMFYUI_ALLOW_LAUNCH/,
+  );
+  expect(() => createServer({ MCP_COMFYUI_AUTO_LAUNCH: "sometimes" })).toThrow(
+    /MCP_COMFYUI_AUTO_LAUNCH/,
+  );
 });
 
 // --- the descriptions a model plans from ---------------------------------
@@ -447,7 +516,6 @@ test("an argument of the wrong type is rejected before any subprocess runs", asy
 // --- comfy_status --------------------------------------------------------
 
 test("comfy_status reports a running instance", async () => {
-  serveInstance();
   const body = await ok(await connect(), "comfy_status");
 
   expect(body["running"]).toBe(true);
@@ -462,6 +530,7 @@ test("comfy_status reports a running instance", async () => {
 test("nothing running is a successful answer, not a tool error", async () => {
   // Every other tool probes first; reporting the normal state of a machine as
   // a failure would train a caller to ignore failures.
+  nothingRunning();
   const { result, body } = await call(await connect(), "comfy_status");
 
   expect(result.isError).toBeFalsy();
@@ -882,6 +951,7 @@ test("a payload the CLI contract does not allow is a contract violation, not a C
 
 test("node definitions that cannot be fetched name the address and the cache path", async () => {
   writeWorkflow("flow");
+  nothingRunning();
   serveSlots(); // nothing seeds the cache, and nothing answers on the port
 
   const error = await failure(await connect(), "describe_workflow", { workflow: "flow" });
@@ -983,7 +1053,6 @@ test("launch_comfyui refuses when an instance is already answering", async () =>
   // Landmine #8: a second instance fights the first for the port, for VRAM and
   // for the shared model directory.
   process.env.MCP_COMFYUI_ALLOW_LAUNCH = "1";
-  serveInstance();
   process.env.FAKE_COMFY_MODE = "launch";
 
   const body = await ok(await connect(), "launch_comfyui");
@@ -1032,7 +1101,7 @@ test("an empty address setting means unset, as an exported-but-unset shell varia
 });
 
 test("the configured address is the one every tool talks to", async () => {
-  const port = serveInstance();
+  const port = Number(process.env.MCP_COMFYUI_PORT);
   const body = await ok(await connect(), "comfy_status");
   expect(body["port"]).toBe(port);
   expect(body["url"]).toBe(`http://127.0.0.1:${port}/system_stats`);
@@ -1136,3 +1205,229 @@ async function readUntil(
   }
   return text;
 }
+
+// --- auto-launch ---------------------------------------------------------
+
+/** Count CLI invocations: $FAKE_COMFY_ARGV_OUT keeps only the last one. */
+function cliLog(): string {
+  const log = join(workdir, "invocations");
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
+  return log;
+}
+
+function invocationsOf(log: string, matching: string): string[] {
+  if (!existsSync(log)) return [];
+  return readFileSync(log, "utf8")
+    .split("\n")
+    .filter((line) => line.includes(matching));
+}
+
+/**
+ * The matching invocations, once they have stopped arriving. A launch does not
+ * wait for the CLI, so a tool call can return before the spawn has recorded
+ * itself; the trailing pause is the window a duplicate would appear in.
+ */
+async function settledInvocationsOf(log: string, matching: string, expected: number): Promise<string[]> {
+  const deadline = Date.now() + 5_000;
+  while (invocationsOf(log, matching).length < expected && Date.now() < deadline) await Bun.sleep(5);
+  await Bun.sleep(60);
+  return invocationsOf(log, matching);
+}
+
+test("auto-launch is on by default", async () => {
+  // The user's requirement: if ComfyUI is not running, the server starts it.
+  expect(toolConfig({})).toMatchObject({ autoLaunch: true });
+});
+
+test("the explicit launch tool stays opt-in even though auto-launch is not", async () => {
+  // The two settings answer different questions: may this server start ComfyUI
+  // when it needs one, and may a MODEL start one with startup flags of its own.
+  expect(toolConfig({})).toMatchObject({ autoLaunch: true, allowLaunch: false });
+});
+
+test("run_workflow starts ComfyUI when nothing is answering", async () => {
+  writeWorkflow("flow");
+  launchable(2);
+  const log = cliLog();
+  process.env.FAKE_COMFY_RUN_MODE = "run_stream";
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "flow" });
+
+  expect(body["status"]).toBe("queued");
+  expect(await settledInvocationsOf(log, "launch", 1)).toHaveLength(1);
+});
+
+test("run_workflow does not start a second ComfyUI when one is answering", async () => {
+  // The guard, reached through the auto-launch door rather than the tool.
+  writeWorkflow("flow");
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  await ok(await connect(), "run_workflow", { workflow: "flow" });
+
+  expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+test("two concurrent run_workflow calls start exactly one ComfyUI", async () => {
+  writeWorkflow("flow");
+  launchable(4);
+  const log = cliLog();
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  const client = await connect();
+
+  const [first, second] = await Promise.all([
+    call(client, "run_workflow", { workflow: "flow" }),
+    call(client, "run_workflow", { workflow: "flow" }),
+  ]);
+
+  expect(first.result.isError).toBeFalsy();
+  expect(second.result.isError).toBeFalsy();
+  expect(await settledInvocationsOf(log, "launch", 1)).toHaveLength(1);
+});
+
+test("run_workflow refuses actionably when auto-launch is off and nothing runs", async () => {
+  writeWorkflow("flow");
+  nothingRunning();
+  const log = cliLog();
+
+  const error = await failure(await connect(), "run_workflow", { workflow: "flow" });
+
+  expect(error["kind"]).toBe("comfyui_not_running");
+  expect(String(error["message"])).toContain("MCP_COMFYUI_AUTO_LAUNCH");
+  expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+test("comfy_status never launches, whatever the setting says", async () => {
+  // It is the tool you call to ask whether anything is running; a status query
+  // that starts a GPU process is indefensible.
+  nothingRunning();
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+
+  const body = await ok(await connect(), "comfy_status");
+
+  expect(body["running"]).toBe(false);
+  expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+test("get_job does not launch, because a fresh server would not know the job", async () => {
+  nothingRunning();
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+  process.env.FAKE_COMFY_JOBS_MODE = "fail_code";
+  process.env.FAKE_COMFY_MODE = "fail_code";
+  process.env.FAKE_COMFY_ERROR_CODE = "server_not_running";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "no server";
+
+  await failure(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+test("describe_workflow serves a fresh cache without starting anything", async () => {
+  // Landmine #7 is the whole reason the cache exists: introspection must not
+  // need a server, and must therefore not start one.
+  writeWorkflow("flow");
+  nothingRunning();
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+  seedObjectInfoCache();
+  serveSlots();
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "flow" });
+
+  expect(body["slot_count"]).toBe(13);
+  expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+test("describe_workflow starts ComfyUI when it has no usable cache", async () => {
+  writeWorkflow("flow");
+  const port = launchable(2);
+  const log = cliLog();
+  // The launched instance serves object_info once it is up.
+  servers.push(
+    Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: () => new Response("{}"),
+    }),
+  );
+  process.env.FAKE_COMFY_MODE = "data_file";
+  process.env.FAKE_COMFY_DATA_FILE = SLOTS_SAMPLE;
+
+  // No cache is seeded, so the first fetch fails and the launch path is taken.
+  const error = await failure(await connect(), "describe_workflow", { workflow: "flow" });
+
+  // The launch happened; the instance simply has no /object_info to give.
+  expect(await settledInvocationsOf(log, "launch", 1)).toHaveLength(1);
+  expect(error["kind"]).toBe("object_info_unavailable");
+  expect(String(error["url"])).toContain(String(port));
+});
+
+test("a fetch that failed against a running ComfyUI is not retried", async () => {
+  // ensureInstance answering `already_running` means the address was never the
+  // problem, so refetching would spend a second 1.7MB round trip to produce the
+  // same failure — and report the retry's error in place of the original.
+  writeWorkflow("flow");
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+  serveSlots(); // no cache is seeded, and this instance 404s /object_info
+
+  const error = await failure(await connect(), "describe_workflow", { workflow: "flow" });
+
+  expect(error["kind"]).toBe("object_info_unavailable");
+  expect(objectInfoRequests).toBe(1);
+  expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+test("the configured workspace reaches comfy launch as a root flag", async () => {
+  writeWorkflow("flow");
+  launchable(2);
+  const log = cliLog();
+  process.env.MCP_COMFYUI_WORKSPACE = "/Users/lawls/ComfyUI-Installs/ComfyUI/ComfyUI";
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  await ok(await connect(), "run_workflow", { workflow: "flow" });
+
+  const launch = (await settledInvocationsOf(log, "launch", 1))[0] ?? "";
+  const argv = launch.trim().split(" ");
+  expect(argv).toContain("--workspace");
+  expect(argv.indexOf("--workspace")).toBeLessThan(argv.indexOf("launch"));
+});
+
+// --- annotations must not lie about launching ----------------------------
+
+test("describe_workflow is not read-only when it may start ComfyUI", async () => {
+  // readOnlyHint means the tool does not modify its environment. Starting a GPU
+  // process plainly does, and a client that auto-approves read-only tools would
+  // be auto-approving that.
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const describe = toolNamed(await tools(await connect()), "describe_workflow");
+  expect(describe.annotations?.readOnlyHint).toBe(false);
+  expect(describe.description ?? "").toContain("start ComfyUI");
+});
+
+test("describe_workflow is read-only when it cannot start anything", async () => {
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "0";
+  const describe = toolNamed(await tools(await connect()), "describe_workflow");
+  expect(describe.annotations?.readOnlyHint).toBe(true);
+});
+
+test("the tools that never launch stay read-only either way", async () => {
+  for (const value of ["0", "1"]) {
+    process.env.MCP_COMFYUI_AUTO_LAUNCH = value;
+    const list = await tools(await connect());
+    for (const name of ["comfy_status", "list_workflows", "get_job"]) {
+      expect(toolNamed(list, name).annotations?.readOnlyHint).toBe(true);
+    }
+  }
+});
+
+test("run_workflow's description warns that the first call may start ComfyUI", async () => {
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const description = toolNamed(await tools(await connect()), "run_workflow").description ?? "";
+  expect(description).toContain("start ComfyUI");
+  expect(description).toContain("minute");
+});

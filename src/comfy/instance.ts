@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { AUTO_LAUNCH_ENV, WORKSPACE_ENV } from "../config.ts";
 import { snippet } from "./envelope.ts";
 import { ComfyCliError, ComfyUnavailableError, runComfy } from "./exec.ts";
 import { DEFAULT_PORT, authority, resolveHost } from "./target.ts";
@@ -29,11 +30,22 @@ import { DEFAULT_PORT, authority, resolveHost } from "./target.ts";
 const DEFAULT_PROBE_TIMEOUT_MS = 2_000;
 
 /**
- * How long to wait for a launched ComfyUI to answer. Generous because a cold
- * start imports torch and scans models, and the alternative to waiting is
- * reporting a failure for a server that was seconds away.
+ * How long to wait for a launched ComfyUI to answer.
+ *
+ * Five minutes, raised from two when launching became something this server does
+ * on its own initiative rather than only on an explicit request. A cold start
+ * imports torch, initialises MPS and scans every model and custom node on disk,
+ * and on this machine's shared model directory that is comfortably a minute
+ * before anything binds a port; a machine with many custom nodes is worse.
+ *
+ * The cost of being generous is bounded and the cost of being mean is not. A
+ * failure the CLI has *diagnosed* — `not_in_workspace`, `port_in_use`, a missing
+ * binary — aborts this wait immediately (see {@link isVerdict}), so the full
+ * budget is only ever spent on a ComfyUI that really is starting. Cutting it
+ * short would report a failure for a server that was thirty seconds away, and
+ * leave it running afterwards for good measure.
  */
-const DEFAULT_READY_TIMEOUT_MS = 120_000;
+const DEFAULT_READY_TIMEOUT_MS = 300_000;
 
 /** Between readiness probes. Short enough to feel immediate, idle otherwise. */
 const DEFAULT_POLL_INTERVAL_MS = 500;
@@ -61,6 +73,22 @@ const BACKGROUND = "--background";
  * `launch(extra: list[str] = typer.Argument(None))` is the whole contract.
  */
 const SEPARATOR = "--";
+
+/**
+ * The workspace flag, and a **Typer root flag** — so it precedes the subcommand
+ * (landmine #3): `comfy launch --workspace <p>` fails where
+ * `comfy --workspace <p> launch` works.
+ *
+ * It matters more than it looks. comfy-cli resolves its workspace from its own
+ * config (`default_workspace`, then `recent_workspace`) and falls back to
+ * `~/Documents/comfy/ComfyUI` — a path that need not exist, and on a machine
+ * whose config names neither, does not. A bare `comfy launch` there fails
+ * `not_in_workspace` before it starts anything.
+ */
+const WORKSPACE_FLAG = "--workspace";
+
+/** The one launch failure this module says more about than the CLI does. */
+const NOT_IN_WORKSPACE = "not_in_workspace";
 
 /** ComfyUI startup flags whose value this module reads back out of an argv. */
 const LISTEN_FLAG = "--listen";
@@ -207,6 +235,12 @@ export interface LaunchOptions {
   /** The address checked before launching, and polled unless the args override it. */
   host?: string;
   port?: number;
+  /**
+   * The ComfyUI directory to launch from — the one holding `main.py` — sent as
+   * the root flag `--workspace`. Omit to let comfy resolve its own default or
+   * recent workspace, which is what a user who has run `comfy install` wants.
+   */
+  workspace?: string;
   args?: LaunchArgs;
   /**
    * Startup arguments the allowlist does not cover, passed through verbatim
@@ -247,6 +281,33 @@ export type LaunchResult =
  */
 export class LaunchArgumentError extends Error {
   override readonly name = "LaunchArgumentError";
+}
+
+/**
+ * Nothing is answering and this server is not permitted to start anything.
+ *
+ * Its own type rather than a bare failure because it is the one launch-adjacent
+ * outcome with a fix the *operator* holds: every other failure here is about a
+ * launch that was attempted, and this one is about a launch that was declined.
+ * The message names both ways out — start ComfyUI, or let this server do it —
+ * because which is appropriate depends on a preference only they have.
+ */
+export class InstanceUnavailableError extends Error {
+  override readonly name = "InstanceUnavailableError";
+  /** The address that was probed. */
+  readonly url: string;
+  /** The probe's own account of why nothing answered. */
+  readonly reason: string;
+
+  constructor(absent: AbsentInstance) {
+    super(
+      `no ComfyUI is answering at ${absent.url}: ${absent.reason}\n` +
+        `Start ComfyUI yourself, or set ${AUTO_LAUNCH_ENV}=1 to let this server start one ` +
+        `when a tool needs it.`,
+    );
+    this.url = absent.url;
+    this.reason = absent.reason;
+  }
 }
 
 /**
@@ -506,9 +567,65 @@ function parsePort(value: string): number {
  * something to separate, since a trailing bare `--` is noise in every
  * diagnostic. `--skip-prompt` is `runComfy`'s to prepend.
  */
-function launchArgv(argv: readonly string[]): string[] {
-  const invocation = [JSON_MODE, "launch", BACKGROUND];
+function launchArgv(argv: readonly string[], workspace: string | undefined): string[] {
+  // `--workspace` joins `--json` ahead of the subcommand, because both are Typer
+  // root flags. Putting it after `launch` is not a style difference: Typer
+  // rejects it there, and the launch fails for a reason that has nothing to do
+  // with the workspace.
+  const root = workspace === undefined ? [JSON_MODE] : [WORKSPACE_FLAG, workspace, JSON_MODE];
+  const invocation = [...root, "launch", BACKGROUND];
   return argv.length === 0 ? invocation : [...invocation, SEPARATOR, ...argv];
+}
+
+/**
+ * Say what an operator can do about a workspace comfy could not find.
+ *
+ * This is the expected first failure on a machine whose comfy-cli config records
+ * neither a default nor a recent workspace: the CLI falls back to a path under
+ * `~/Documents` that need not exist, and reports only `not_in_workspace`. The
+ * code alone sends nobody anywhere.
+ *
+ * Deliberately generic about *which* directory to name. Whatever installs
+ * happen to be on one machine is that machine's accident, and a message that
+ * guessed between two of them would eventually point at the wrong ComfyUI —
+ * which, pointed at the same shared model directory, is a mistake nobody would
+ * see until the output was wrong.
+ */
+function workspaceGuidance(workspace: string | undefined): string {
+  const passed =
+    workspace === undefined
+      ? `This server sent no ${WORKSPACE_FLAG}, so comfy resolved one of its own.`
+      : `This server sent ${WORKSPACE_FLAG} ${workspace}; check that that directory exists ` +
+        `and holds main.py.`;
+  return (
+    `${passed}\n` +
+    `comfy-cli takes its workspace from its own config (default_workspace, then ` +
+    `recent_workspace) and otherwise falls back to a path under ~/Documents that does not ` +
+    `exist unless something created it.\n` +
+    `Set ${WORKSPACE_ENV} to the ComfyUI directory to launch — the one holding main.py — or ` +
+    `run \`comfy install\` once to create a workspace and record it.`
+  );
+}
+
+/**
+ * Enrich the one verdict whose fix is not visible from its code.
+ *
+ * Rewritten in place rather than re-thrown as a new error, exactly as
+ * `workflows/slots.ts` does and for the same reason: `ComfyCliError` keeps only
+ * its formatted message, so re-constructing would double-prefix, and callers
+ * branching on `.code` must go on working.
+ *
+ * INVARIANT: nothing may read `err.stack` between `runComfy` rejecting and this
+ * line. A JSC stack embeds the `Name: message` header and memoizes on first
+ * read, so a logger added in that window would freeze the pre-enrichment text
+ * into `.stack` while `.message` carried the guidance, with nothing to explain
+ * the disagreement.
+ */
+function explainVerdict(failure: unknown, workspace: string | undefined): unknown {
+  if (failure instanceof ComfyCliError && failure.code === NOT_IN_WORKSPACE) {
+    failure.message = `${failure.message}\n${workspaceGuidance(workspace)}`;
+  }
+  return failure;
 }
 
 /**
@@ -575,8 +692,51 @@ function describeFailure(failure: unknown): string | null {
  * @throws {LaunchTimeoutError} nothing answered inside the budget.
  */
 export async function launchInstance(opts: LaunchOptions = {}): Promise<LaunchResult> {
+  // Validated OUTSIDE the shared region below, and first: a caller's own bad
+  // argument is theirs alone, and must neither fail a launch somebody else
+  // asked for nor be silently discarded by joining one.
   const argv = comfyuiArgs(opts.args ?? {}, opts.extraArgs ?? []);
   validateComfyuiArgs(argv);
+
+  const running = inFlightLaunch;
+  if (running !== null) return running;
+
+  const pending = performLaunch(opts, argv);
+  inFlightLaunch = pending;
+  try {
+    return await pending;
+  } finally {
+    // By identity, so a launch started after this one finished is not cleared
+    // out from under its own callers. Runs on failure too, or one bad launch
+    // would wedge this process until it restarts.
+    if (inFlightLaunch === pending) inFlightLaunch = null;
+  }
+}
+
+/**
+ * The launch this process is currently performing, if any.
+ *
+ * **One, globally — not one per address.** `comfy/objectInfo.ts` keys its
+ * in-flight map by cache path because two different payloads really are two
+ * independent pieces of work. Launching is not like that: what a second launch
+ * would collide with is not a port, it is the machine's accelerator and its
+ * shared model directory (landmine #8), and those are singular however many
+ * addresses are involved. A map keyed by target address would happily start a
+ * second ComfyUI on 8189 alongside the first on 8188 — which is exactly the
+ * thing the guard exists to prevent.
+ *
+ * This became reachable when auto-launch started firing from tool handlers:
+ * before, a launch took a deliberate call, and two of them at once took two.
+ *
+ * A joiner gets the leader's result, which is the truth about what is now
+ * running. Its own startup arguments are **not** applied — the leader's ComfyUI
+ * is the one that exists — and that is the right trade against starting a second
+ * server to honour them.
+ */
+let inFlightLaunch: Promise<LaunchResult> | null = null;
+
+/** The launch itself, once it has been established that this caller leads it. */
+async function performLaunch(opts: LaunchOptions, argv: string[]): Promise<LaunchResult> {
   const target = launchTarget(opts, argv);
 
   const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
@@ -592,7 +752,7 @@ export async function launchInstance(opts: LaunchOptions = {}): Promise<LaunchRe
     if (there.running) return { outcome: "already_running", instance: there };
   }
 
-  const cli = startLaunch(launchArgv(argv), timeoutMs);
+  const cli = startLaunch(launchArgv(argv, opts.workspace), timeoutMs);
 
   const deadline = Date.now() + timeoutMs;
   let lastReason = "no probe completed";
@@ -604,11 +764,58 @@ export async function launchInstance(opts: LaunchOptions = {}): Promise<LaunchRe
     // Checked after the probe, not before it: if a ComfyUI is answering, it is
     // running whatever the CLI thinks, and reality outranks the CLI's opinion.
     const failure = cli.failure();
-    if (isVerdict(failure)) throw failure;
+    if (isVerdict(failure)) throw explainVerdict(failure, opts.workspace);
 
     if (Date.now() >= deadline) break;
     await Bun.sleep(opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
   }
 
   throw new LaunchTimeoutError(targetUrl, timeoutMs, lastReason, describeFailure(cli.failure()));
+}
+
+/** What {@link ensureInstance} had to do to produce an instance. */
+export interface EnsureResult {
+  /** `launched` means this call started the ComfyUI it is handing back. */
+  outcome: "already_running" | "launched";
+  instance: RunningInstance;
+}
+
+export interface EnsureOptions extends LaunchOptions {
+  /**
+   * Whether a launch is permitted when nothing answers. Defaults to `true`,
+   * matching the function's name: `ensureInstance` that could only ever report
+   * an absence would not be ensuring anything.
+   */
+  autoLaunch?: boolean;
+}
+
+/**
+ * A running ComfyUI, starting one if that is permitted and necessary.
+ *
+ * The order is the whole point, and it is the same order {@link launchInstance}
+ * already enforces rather than a second copy of it: **detect, and only launch
+ * when nothing answered**. The probe here is not redundant with the one inside
+ * `launchInstance` — it is what keeps the overwhelmingly common case (ComfyUI is
+ * already up) off the launch path entirely, and what makes a refusal possible
+ * without going near the CLI when auto-launch is off.
+ *
+ * @throws {InstanceUnavailableError} nothing answered and launching is not
+ * permitted. Actionable on purpose: it is the operator, not the model, who
+ * decides which of the two fixes applies.
+ * @throws {ComfyCliError} the CLI diagnosed a failure. `not_in_workspace`
+ * carries added guidance; every other code passes through as the CLI wrote it.
+ * @throws {LaunchTimeoutError} a launch was started but nothing answered.
+ * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
+ */
+export async function ensureInstance(opts: EnsureOptions = {}): Promise<EnsureResult> {
+  const detection = await detectInstance({
+    host: opts.host,
+    port: opts.port,
+    timeoutMs: opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
+  });
+  if (detection.running) return { outcome: "already_running", instance: detection };
+
+  if (opts.autoLaunch === false) throw new InstanceUnavailableError(detection);
+
+  return launchInstance(opts);
 }

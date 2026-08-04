@@ -1,7 +1,11 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { EnvelopeParseError } from "./comfy/envelope.ts";
 import { ComfyCliError, ComfyTimeoutError, ComfyUnavailableError } from "./comfy/exec.ts";
-import { LaunchArgumentError, LaunchTimeoutError } from "./comfy/instance.ts";
+import {
+  InstanceUnavailableError,
+  LaunchArgumentError,
+  LaunchTimeoutError,
+} from "./comfy/instance.ts";
 import { JobPayloadError } from "./comfy/jobs.ts";
 import { ObjectInfoCacheWriteError, ObjectInfoFetchError } from "./comfy/objectInfo.ts";
 import { RunContractError, RunFailedError, type RunEvent } from "./workflows/run.ts";
@@ -71,6 +75,12 @@ export type ToolErrorKind =
   | "object_info_cache_unwritable"
   /** `comfy launch` ran but no ComfyUI answered inside the budget. */
   | "launch_timeout"
+  /**
+   * Nothing is answering and this server may not start anything. Distinct from
+   * `comfy_cli`, because nothing was attempted and no CLI was consulted — the
+   * fix is a configuration choice or a hand-started ComfyUI, not a retry.
+   */
+  | "comfyui_not_running"
   /** A fault in this server. Reported as such rather than blamed on the caller. */
   | "internal_error";
 
@@ -289,6 +299,9 @@ export function describeError(err: unknown): ToolErrorBody {
       url: err.url,
       timeout_ms: err.timeoutMs,
     };
+  }
+  if (err instanceof InstanceUnavailableError) {
+    return { kind: "comfyui_not_running", message: err.message, url: err.url };
   }
 
   return {

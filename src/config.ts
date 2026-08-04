@@ -28,6 +28,72 @@ export const DEFAULT_WORKFLOW_DIR = "/Users/lawls/ComfyUI-Shared/user/default/wo
 export const WORKFLOW_DIRS_ENV = "MCP_COMFYUI_WORKFLOW_DIRS";
 
 /**
+ * Every setting this server has, named in one place.
+ *
+ * They live here rather than beside the code that reads them because the names
+ * are the operator's interface: they are what goes in an MCP client's config
+ * block, what the documentation tabulates, and what an error message has to
+ * quote to be actionable. `comfy/instance.ts` needs {@link WORKSPACE_ENV} for
+ * exactly that last reason, and a second copy of the spelling is how the error
+ * message and the reader would eventually disagree.
+ */
+/** Where ComfyUI is. Absent means the library default, `127.0.0.1`. */
+export const HOST_ENV = "MCP_COMFYUI_HOST";
+export const PORT_ENV = "MCP_COMFYUI_PORT";
+/** Where the `/object_info` cache lives. Absent means `~/.cache/mcp-comfyui`. */
+export const CACHE_DIR_ENV = "MCP_COMFYUI_CACHE_DIR";
+/**
+ * The ComfyUI directory `comfy launch` should start from, passed as the Typer
+ * root flag `--workspace`. Absent lets comfy resolve its own default or recent
+ * workspace, which is what a user who has run `comfy install` will want.
+ */
+export const WORKSPACE_ENV = "MCP_COMFYUI_WORKSPACE";
+/** May this server start ComfyUI when a tool needs one? Default: yes. */
+export const AUTO_LAUNCH_ENV = "MCP_COMFYUI_AUTO_LAUNCH";
+/** May a *model* start one, with startup flags of its own? Default: no. */
+export const ALLOW_LAUNCH_ENV = "MCP_COMFYUI_ALLOW_LAUNCH";
+
+/** The spellings of yes and no, so no two settings disagree about them. */
+const TRUE_VALUES = new Set(["1", "true", "yes", "on"]);
+const FALSE_VALUES = new Set(["0", "false", "no", "off"]);
+
+/**
+ * One operator setting, or `undefined` when they said nothing.
+ *
+ * An empty or all-blank value reads as unset, exactly as an empty
+ * {@link WORKFLOW_DIRS_ENV} does: a shell that exports a variable it never
+ * assigned produces `""`, and that means silence rather than an instruction. It
+ * is also what keeps an empty host out of `resolveHost`, which would otherwise
+ * throw a bare `TypeError` from deep inside the library.
+ */
+export function setting(env: Environment, name: string): string | undefined {
+  const value = env[name]?.trim();
+  return value === undefined || value === "" ? undefined : value;
+}
+
+/**
+ * A boolean setting.
+ *
+ * Unrecognised values are **refused**, not read as false. A setting is only
+ * worth having if an operator can tell whether it took effect, and silently
+ * treating `MCP_COMFYUI_AUTO_LAUNCH=maybe` as off is precisely how someone ends
+ * up believing they configured something they did not. Same fail-fast reasoning
+ * as the port check.
+ *
+ * @throws {Error} the value is neither a yes nor a no.
+ */
+export function flag(env: Environment, name: string, fallback: boolean): boolean {
+  const value = setting(env, name)?.toLowerCase();
+  if (value === undefined) return fallback;
+  if (TRUE_VALUES.has(value)) return true;
+  if (FALSE_VALUES.has(value)) return false;
+  throw new Error(
+    `${name}=${JSON.stringify(env[name])} is not a yes or a no ` +
+      `(accepted: ${[...TRUE_VALUES].join(", ")}, ${[...FALSE_VALUES].join(", ")}).`,
+  );
+}
+
+/**
  * The directories to scan for workflow files, in the operator's own order.
  *
  * Order is preserved and load-bearing: `workflows/discover.ts` gives the first
