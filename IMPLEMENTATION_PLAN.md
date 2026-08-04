@@ -59,7 +59,7 @@ On failure `ok:false` and `error:{code,message,hint,details}`.
 
 **Goal**: A tested `runComfy()` that spawns `comfy`, parses `envelope/1`, and maps errors — the substrate everything else sits on.
 **Success Criteria**: Executor returns typed success data or a typed error; tests pass without a real ComfyUI or a real `comfy` binary.
-**Status**: Not Started
+**Status**: Complete — 43 tests, 15 mutants killed
 
 ### Task 1.1: Scaffold
 
@@ -222,7 +222,7 @@ esac
 
 **Goal**: `describe_workflow` produces a JSON Schema with real enums and bounds.
 **Success Criteria**: For `default_image_gen.json`, `sampler_name` is an enum of ~44 samplers and `steps` carries `minimum:1, maximum:10000`.
-**Status**: Not Started
+**Status**: Complete — 210 tests total; verified against a real 210-slot workflow (210/210 resolved, 97 enums, 0 unresolved, 1ms)
 
 ### Task 2.1: object_info cache
 
