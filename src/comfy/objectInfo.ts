@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { z } from "zod";
 import { snippet } from "./envelope.ts";
+import { DEFAULT_PORT, authority, resolveHost } from "./target.ts";
 
 /**
  * ComfyUI's `/object_info` is the only source of input constraints: `comfy
@@ -18,16 +19,6 @@ import { snippet } from "./envelope.ts";
  * file on disk is plain, unmodified JSON. Callers that need the path *and* a
  * guarantee the contents are current want {@link ensureObjectInfoCache}.
  */
-
-const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_PORT = 8188;
-
-/**
- * A wildcard bind address is not a connect address (landmine #10). An operator
- * who launched ComfyUI with `--listen 0.0.0.0` will hand us that same string,
- * and `--listen ::` is the IPv6 spelling of the same mistake.
- */
-const WILDCARD_HOSTS = new Set(["0.0.0.0", "::"]);
 
 /**
  * 24 hours. The payload only changes when custom nodes or models are installed,
@@ -167,13 +158,6 @@ const ObjectInfoSchema = z.record(z.string(), z.record(z.string(), z.unknown()))
  */
 const inFlight = new Map<string, Promise<ObjectInfo>>();
 
-/** The address to connect to, unbracketed: `[::1]` and `::1` are one host. */
-function resolveHost(host: string | undefined): string {
-  if (host === undefined) return DEFAULT_HOST;
-  const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
-  return WILDCARD_HOSTS.has(bare) ? DEFAULT_HOST : bare;
-}
-
 function defaultCacheDir(): string {
   return join(homedir(), ".cache", "mcp-comfyui");
 }
@@ -200,10 +184,7 @@ export function objectInfoCachePath(opts: ObjectInfoLocation = {}): string {
 }
 
 function objectInfoUrl(host: string, port: number): string {
-  // An IPv6 literal has to be bracketed in a URL, or `fetch` rejects the whole
-  // string as invalid before a single packet moves.
-  const authority = host.includes(":") ? `[${host}]` : host;
-  return `http://${authority}:${port}/object_info`;
+  return `http://${authority(host, port)}/object_info`;
 }
 
 function parse(text: string): ObjectInfo {

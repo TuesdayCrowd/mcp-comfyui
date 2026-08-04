@@ -9,6 +9,9 @@
 #                          prove a timed-out child was actually killed
 #   $FAKE_COMFY_ORPHAN_OUT file to record a surviving descendant's pid in
 #   $FAKE_COMFY_PROBE      value echoed back by the echo_env mode
+#   $FAKE_COMFY_DATA_FILE  JSON file served as the envelope's data (data_file mode)
+#   $FAKE_COMFY_ERROR_CODE     error code returned by the fail_code mode
+#   $FAKE_COMFY_ERROR_MESSAGE  error message returned by the fail_code mode
 
 [ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
 
@@ -66,6 +69,18 @@ case "$FAKE_COMFY_MODE" in
   cwd)
     printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"pwd","version":"0.0.0","where":null,"data":{"cwd":"%s"},"error":null}\n' "$(pwd -P)"
     exit 0 ;;
+  data_file)
+    # Wrap a JSON file as the envelope's data, so a test can serve real captured
+    # output — or any variant of it — without a mode per payload.
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"workflow slots","version":"0.0.0","where":null,"data":'
+    cat "$FAKE_COMFY_DATA_FILE"
+    printf ',"error":null}\n'
+    exit 0 ;;
+  fail_code)
+    # A failure envelope with a caller-chosen code, for testing how one
+    # particular code is surfaced without pinning a mode to it.
+    printf '{"schema":"envelope/1","type":"envelope","ok":false,"command":"workflow slots","version":"0.0.0","where":null,"data":null,"error":{"code":"%s","message":"%s","hint":null,"details":null}}\n' "$FAKE_COMFY_ERROR_CODE" "$FAKE_COMFY_ERROR_MESSAGE"
+    exit 1 ;;
   *)
     echo "$OK"
     exit 0 ;;
