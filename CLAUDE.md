@@ -57,7 +57,7 @@ These are not style preferences. Each was measured, and each has a test pinning 
 
 **5. stdout is the MCP protocol.** Nothing may `console.log`. Diagnostics go to stderr.
 
-**6. Never launch a second ComfyUI.** Detect first, on both the detection target and the address the startup args name.
+**6. Never launch a second ComfyUI.** Detect first, on both the detection target and the address the startup args name. Auto-launch is on by default, so this fires from ordinary tool handlers — hence the single global in-flight launch in `instance.ts`, deliberately *not* keyed by address. `comfy_status` never launches. A tool that may launch cannot be annotated `readOnlyHint: true`.
 
 The full list of 14 verified landmines — each with the measurement behind it — is in [`docs/comfy-cli-ground-truth.md`](docs/comfy-cli-ground-truth.md). **Read it before changing anything that touches the CLI.** Several were found only after the bug they caused; none is inferred.
 
@@ -77,8 +77,14 @@ GitButler. Use the `gitbutler` skill and `but commit`, never `git commit`.
 
 **Project override:** this repo lands virtual branches directly onto `main` with `but land <branch>` instead of opening pull requests. Work is still committed to a named virtual branch first — land the branch, don't commit to `main` directly. Landing pushes to `origin/main` immediately and `but undo` cannot un-push it.
 
+## Verified end to end
+
+Against a live ComfyUI 0.29.0 through the compiled binary over stdio: `describe_workflow` returned bounds for all five slots of `workflow.smoke` with zero unresolved, and `run_workflow {1.width:128, 1.height:96} wait:true` produced a 128×96 PNG. `get_job` reported an earlier submit `completed` with its output. `applySlots` was separately verified to keep a 2^64−1 seed byte-exact.
+
+A real run also confirmed three things previously known only from source: `converted` and `prompt_preview` **are** emitted and are absent from comfy-cli's published event enum; `prompt_preview` carries the whole graph (landmine #12); and `queued`/`executed` carry undeclared fields (`validation_warnings`, `nodes`, structured `outputs`) that `looseObject` preserves.
+
 ## Known gaps
 
-- **No real end-to-end run has been executed.** `applySlots` was verified against the real CLI (a 2^64−1 seed survives byte-exact), but `runWorkflow` and the job wrappers are tested only against the fake. `tests/fixtures/workflow.smoke.json` needs no checkpoint and exists to close this — run it against a live instance.
+- **Outputs come back as `/view?…` URLs rather than filesystem paths** when comfy has no resolvable workspace, which is the default state on a Desktop-only machine. The file is on disk; comfy just can't name it. `classifyOutputs` returns both forms distinctly, so callers can tell. Setting `MCP_COMFYUI_WORKSPACE` likely changes this — untested.
 - **A detection probe that times out reads as `running: false`**, so a ComfyUI wedged mid-sampling could pass the launch guard onto a different port. Deliberate: treating timeouts as "refuse" would block every launch behind a flaky probe.
 - **One unreproduced transient test failure** was observed once at verified-pristine checksums and has not recurred across many runs.

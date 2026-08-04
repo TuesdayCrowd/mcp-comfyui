@@ -44,10 +44,26 @@ claude mcp add comfyui /absolute/path/to/dist/mcp-comfyui
 | Variable | Default | Meaning |
 |---|---|---|
 | `MCP_COMFYUI_WORKFLOW_DIRS` | `~/ComfyUI-Shared/user/default/workflows` | Colon-separated roots to scan, like `PATH` |
-| `MCP_COMFYUI_ALLOW_LAUNCH` | unset | Set to `1` to expose the `launch_comfyui` tool |
+| `MCP_COMFYUI_AUTO_LAUNCH` | **on** | May the server start ComfyUI when a tool needs one and nothing answers? |
+| `MCP_COMFYUI_ALLOW_LAUNCH` | off | May a *model* start one, with startup flags of its own? Registers `launch_comfyui` |
+| `MCP_COMFYUI_WORKSPACE` | unset | ComfyUI directory to launch from |
+| `MCP_COMFYUI_HOST` / `_PORT` | `127.0.0.1` / `8188` | Where ComfyUI is |
+| `MCP_COMFYUI_CACHE_DIR` | `~/.cache/mcp-comfyui` | `/object_info` cache |
 | `COMFY_BIN` | `comfy` | Path to the `comfy` binary |
 
-`launch_comfyui` is off by default on purpose. Starting a GPU process is not something a model should be able to do on inference alone.
+Booleans accept `1/true/yes/on` and `0/false/no/off`; anything else is refused at startup rather than read as off.
+
+The two launch switches answer different questions and are deliberately separate. `AUTO_LAUNCH` governs launches **the server decides to make** on your behalf. `ALLOW_LAUNCH` governs whether **a model may ask for one** with `--cpu`, `--listen` and a free-form argument list — strictly more powerful, so it stays opt-in.
+
+### Set `MCP_COMFYUI_WORKSPACE` if you don't already use comfy-cli
+
+Auto-launch runs `comfy launch`, which needs a comfy-cli *workspace*. ComfyUI Desktop is not one. If comfy-cli has never been configured it resolves to `~/Documents/comfy/ComfyUI`, which usually doesn't exist, and you'll get an error naming this variable:
+
+```bash
+MCP_COMFYUI_WORKSPACE=/path/to/ComfyUI     # the directory containing main.py
+```
+
+There is deliberately no auto-discovery. Picking between several installs by name is exactly how you end up launching the wrong ComfyUI against the right models.
 
 ## Tools
 
@@ -59,9 +75,11 @@ claude mcp add comfyui /absolute/path/to/dist/mcp-comfyui
 | `run_workflow` | | Apply inputs and execute |
 | `get_job` | ✓ | Poll a job by `prompt_id` |
 | `cancel_job` | | Stop a running job |
-| `launch_comfyui` | | Start ComfyUI — only when `MCP_COMFYUI_ALLOW_LAUNCH=1` |
+| `launch_comfyui` | | Start ComfyUI with explicit flags — only when `MCP_COMFYUI_ALLOW_LAUNCH=1` |
 
 The intended order is `list_workflows` → `describe_workflow` → `run_workflow`. Inputs are keyed by slot address (`3.seed`, `6.text`), which `describe_workflow` gives you.
+
+`describe_workflow` is read-only only when auto-launch is off — with it on, the tool may start ComfyUI if it has no cached `/object_info`, and `readOnlyHint` has to say so. `comfy_status` never launches under any setting; it's the tool you call to ask whether anything is running.
 
 ## Design notes
 
@@ -71,7 +89,7 @@ Three decisions that are not obvious and are load-bearing.
 
 The same problem recurs on the way back: `comfy run --json` echoes the whole graph as a `prompt_preview` event on every run. The server drops it during decode.
 
-**It refuses to start a second ComfyUI.** If anything is already answering — on the detection target *or* on the address your startup arguments name — `launch_comfyui` returns `already_running` and spawns nothing. ComfyUI Desktop manages its own process and is not a comfy-cli workspace; a second instance would fight it for the port, for VRAM, and for the shared model directory.
+**It starts ComfyUI when one is needed, and never starts a second.** A tool that needs a live server detects first; if nothing answers it launches one, and if anything is already answering — on the detection target *or* on the address the startup arguments name — it uses that instead. Concurrent calls arriving while ComfyUI is down share a single launch, because what a second launch collides with is the machine's accelerator and its shared model directory, and those are singular however many addresses are involved.
 
 **Every registry from the CLI is an open string.** Error codes, slot types, job statuses, run event types. Upstream documents its error codes as append-only, and its *published* schemas are already behind its own source — `comfy jobs`' status enum omits `cancelled`, which the CLI demonstrably emits, and the run-event enum omits `converted` and `prompt_preview`. A server that closes those enums breaks on the next release.
 
