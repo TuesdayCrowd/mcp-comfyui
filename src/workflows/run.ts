@@ -1,6 +1,13 @@
 import { z } from "zod";
-import { parseEnvelopeValue, snippet, type ParsedEnvelope } from "../comfy/envelope.ts";
-import { ComfyCliError, runComfyRaw, type ComfyRun } from "../comfy/exec.ts";
+import {
+  parseEnvelopeValue,
+  snippet,
+  type ComfyError,
+  type ParsedEnvelope,
+} from "../comfy/envelope.ts";
+import { ComfyCliError, ComfyTimeoutError, runComfyRaw, type ComfyRun } from "../comfy/exec.ts";
+import { isTerminal } from "../comfy/jobs.ts";
+import { classifyOutputs, type ClassifiedOutputs } from "../comfy/outputs.ts";
 import { DEFAULT_PORT, resolveHost } from "../comfy/target.ts";
 import type { PreparedWorkflow } from "./setSlots.ts";
 
@@ -14,7 +21,7 @@ import type { PreparedWorkflow } from "./setSlots.ts";
  * `JSON.parse` over the whole of stdout throws on the second line and would
  * fail every run that emitted a single event.
  *
- * Three properties of the CLI shape everything below:
+ * Four properties of the CLI shape everything below:
  *
  * - **The envelope is the outcome, never the exit code.** Upstream returns 1
  *   for a missing file, a downed server, an HTTP error, a failed conversion and
@@ -25,6 +32,9 @@ import type { PreparedWorkflow } from "./setSlots.ts";
  * - **Submitting is the default; `--wait` blocks.** Without it the command
  *   returns as soon as the graph is queued, with a `prompt_id` and a detached
  *   watcher keeping the job's state file up to date.
+ * - **The stream hands the whole workflow graph back to us**, unconditionally,
+ *   on the `prompt_preview` event. That is landmine #12, and it is why
+ *   {@link sanitiseEvent} exists — see {@link GRAPH_FIELD}.
  */
 
 /** The status of a run that was submitted but not waited for. */
@@ -41,8 +51,68 @@ const ENVELOPE_TYPE = "envelope";
  */
 const MAX_UNRECOGNISED_LINES = 10;
 
-/** `http` and `https`, case-insensitively — a URI scheme is case-insensitive. */
-const HTTP_URL = /^https?:\/\//i;
+/**
+ * How many events to carry back, and how large one undeclared field may be
+ * before it is dropped.
+ *
+ * Both bounds exist because this result is an MCP response. A 400-step run
+ * emits an event per step per node and every key the CLI sent is retained;
+ * unbounded, one measured run produced 107KB of result JSON.
+ *
+ * The **last** events are kept rather than the first. The early ones are
+ * recoverable elsewhere — the envelope's payload carries the `prompt_id`, and
+ * {@link DecodedStream.promptId} is captured before any truncation — while the
+ * late ones are not: `execution_error` carries the server's whole traceback and
+ * arrives at the end of the run it explains.
+ */
+const MAX_EVENTS = 200;
+const MAX_EVENT_FIELD_BYTES = 8_192;
+
+/**
+ * The field of `prompt_preview` that carries the entire workflow graph.
+ *
+ * `renderer.event("prompt_preview", prompt=workflow)` is unconditional in
+ * stream mode — not gated on `--print-prompt` — so every run hands the graph
+ * back to us, and `JSON.parse` has already rounded every integer in it past
+ * 2^53 by the time this module sees it. Measured, on a real seed:
+ *
+ * ```
+ * emitted by comfy : 18446744073709551615
+ * after JSON.parse : 18446744073709552000
+ * ```
+ *
+ * `workflows/setSlots.ts` is an entire byte-copy architecture built to keep
+ * this server's JS away from the graph, and surfacing this field would undo it
+ * one layer up. The images would still be right, because `comfy` did the
+ * submit; the *report* would be wrong. A reproduce-this-render loop reads its
+ * seed from that report, re-runs with a rounded value, gets a different image,
+ * and nothing errors (landmine #11, recurring as #12).
+ *
+ * So it is dropped, unconditionally and by name. Nothing is lost: the graph is
+ * the caller's own file, which they already have. If an audit trail is ever
+ * wanted, carry the raw line **text** — never the parsed object.
+ */
+const GRAPH_FIELD = "prompt";
+
+/** What replaces a dropped graph, so the drop is never silent. */
+const DROPPED_GRAPH = "<dropped: workflow graph; read it from the workflow file>";
+
+/**
+ * The fields `schema.run_event.json` declares. All of them are scalars, so all
+ * of them are safe to carry whole; everything else is undeclared and bounded by
+ * {@link MAX_EVENT_FIELD_BYTES}.
+ */
+const DECLARED_EVENT_FIELDS = new Set([
+  "schema",
+  "type",
+  "node",
+  "title",
+  "class_type",
+  "completed",
+  "total",
+  "prompt_id",
+  "url",
+]);
 
 /**
  * One NDJSON progress event.
@@ -58,7 +128,8 @@ const HTTP_URL = /^https?:\/\//i;
  * its undeclared `details` field, which carries the server's whole traceback,
  * and `executed` carries an undeclared `outputs` array of structured file
  * records. Stripping unknown keys would throw away the diagnosis and keep the
- * envelope.
+ * envelope. What passing them through would otherwise cost is handled by
+ * {@link sanitiseEvent}.
  *
  * `schema` is likewise decoded as an open string. A future `event/2` renames or
  * retypes fields, all of which are optional here, so the line still decodes to
@@ -84,8 +155,8 @@ export type RunEvent = z.infer<typeof RunEventSchema>;
 /**
  * A non-fatal note about the run. Deliberately a twin of `set-slot`'s warning
  * schema rather than a shared export: the two commands happen to describe a
- * warning the same way today, and `comfy/target.ts` already holds the part that
- * genuinely must not diverge.
+ * warning the same way today, and `comfy/outputs.ts` and `comfy/target.ts`
+ * already hold the parts that genuinely must not diverge.
  */
 export const RunWarningSchema = z.looseObject({
   code: z.string(),
@@ -117,22 +188,6 @@ const RunPayloadSchema = z.looseObject({
   elapsed_seconds: z.number().nullable().optional(),
 });
 
-/**
- * The artifacts a run produced, kept apart by kind.
- *
- * On a loopback host with a resolvable workspace the CLI emits absolute
- * filesystem paths; otherwise it emits `/view?...` URLs, and per
- * `docs/json-output.md:253` any non-`http(s)` value is a path. One merged list
- * would leave every caller re-deriving that rule, and getting it wrong means
- * either opening a URL as a file or fetching a path as a URL.
- */
-export interface RunOutputs {
-  /** Artifacts on this machine's filesystem, openable directly. */
-  files: string[];
-  /** Artifacts behind `http(s)`, which have to be fetched. */
-  urls: string[];
-}
-
 /** What one execution of a workflow produced. */
 export interface WorkflowRun {
   /**
@@ -148,18 +203,25 @@ export interface WorkflowRun {
    */
   status: string;
   /**
-   * The job handle, for `comfy jobs status`/`cancel`. Always present when
-   * `status` is `queued`; `null` only where the CLI omitted it on a run that
-   * had already finished, where the outputs are what the caller wanted.
+   * Whether {@link status} is one `comfy` treats as finished. Derived with the
+   * same `isTerminal` `comfy/jobs.ts` uses, so a run and a later poll of the
+   * same job can never disagree about whether it is over.
+   */
+  terminal: boolean;
+  /**
+   * The job handle, for the `get_job` and `cancel_job` tools. Always present
+   * when `status` is `queued`; `null` only where the CLI omitted it on a run
+   * that had already finished, where the outputs are what the caller wanted.
    */
   promptId: string | null;
-  outputs: RunOutputs;
+  outputs: ClassifiedOutputs;
   /** Advisory notes; the run happened regardless. */
   warnings: RunWarning[];
   /** Wall-clock duration of a `--wait` run; `null` for a submit. */
   elapsedSeconds: number | null;
   /**
-   * Every event line, in the order it arrived.
+   * The events, in the order they arrived, sanitised by {@link sanitiseEvent}
+   * and capped at the most recent {@link MAX_EVENTS}.
    *
    * Buffered, not streamed. {@link runComfyRaw} hands back whole streams, so
    * nothing can reach a caller before the child exits; an `onEvent` callback
@@ -167,6 +229,8 @@ export interface WorkflowRun {
    * plan rules out a streaming API, so the array is the honest shape.
    */
   events: RunEvent[];
+  /** Whether older events were dropped to keep {@link events} bounded. */
+  eventsTruncated: boolean;
   /**
    * stdout lines that were neither an event nor an envelope, snippetted and
    * bounded. Always empty against a CLI honouring the contract. They do not
@@ -218,6 +282,47 @@ export class RunContractError extends Error {
 }
 
 /**
+ * The run itself failed, with the events that explain it attached.
+ *
+ * A {@link ComfyCliError} — every caller branching on `.code` keeps working —
+ * carrying the half of the diagnosis the envelope does not have. Upstream is
+ * explicit about the split:
+ *
+ * ```python
+ * # execution.py:559-561
+ * # The event keeps the full server payload (incl. complete traceback);
+ * # the error envelope carries the classified one-line verdict.
+ * ```
+ *
+ * So the envelope says `execution_error: Node 3 raised`, while the traceback,
+ * the failing node's inputs and the exception type are on the `execution_error`
+ * event and nowhere else. Decoding those and dropping them would leave the
+ * caller with the one line they could already guess.
+ */
+export class RunFailedError extends ComfyCliError {
+  /** The failed run's events, sanitised and capped as on {@link WorkflowRun}. */
+  readonly events: RunEvent[];
+  readonly eventsTruncated: boolean;
+
+  constructor(
+    command: string,
+    where: string | null,
+    error: ComfyError,
+    events: RunEvent[],
+    eventsTruncated: boolean,
+  ) {
+    super(command, where, error);
+    // `ComfyCliError` declares `name` as a `readonly` field, which TypeScript
+    // narrows to the literal `"ComfyCliError"` — so no subclass can redeclare
+    // it. Assigned instead, which is what a field declaration compiles to
+    // anyway, and which keeps the property's attributes as the base set them.
+    Object.assign(this, { name: "RunFailedError" });
+    this.events = events;
+    this.eventsTruncated = eventsTruncated;
+  }
+}
+
+/**
  * The invocation. `--json` is passed explicitly even though piped stdout would
  * select it anyway (landmine #2), and `--host`/`--port` are sent even at their
  * defaults so the target never depends on whatever workspace config the CLI
@@ -248,6 +353,51 @@ function looksLikeEnvelope(value: unknown): boolean {
   return value.schema === ENVELOPE_SCHEMA || value.type === ENVELOPE_TYPE;
 }
 
+/** The serialised size of a value, for deciding whether it can be carried. */
+function measure(value: unknown): number {
+  try {
+    return (JSON.stringify(value) ?? "").length;
+  } catch {
+    // Not reachable from `JSON.parse` output, which cannot be cyclic. Treated
+    // as oversized rather than thrown from: an event must never fail a run.
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * Strip an event of what must not travel out of this module.
+ *
+ * Two rules, for two different reasons. The workflow graph goes because this
+ * server's JS has already corrupted it (see {@link GRAPH_FIELD}); that is a
+ * correctness rule and applies at any size. Any *other* undeclared field goes
+ * when it is oversized, which is a budget rule: the result is an MCP response.
+ *
+ * The size rule is also the general defence behind the named one. A graph
+ * arriving under a field nobody has named yet is caught by being huge; a small
+ * graph is caught by being called `prompt`. Neither mechanism covers the other,
+ * which is why both are here.
+ *
+ * Dropped, never truncated: a truncated graph is still a graph with rounded
+ * digits in it, and half a JSON object reads as data rather than as the marker
+ * it is. The replacement says what happened, so no drop is silent.
+ */
+function sanitiseEvent(event: RunEvent): RunEvent {
+  const clean: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(event)) {
+    if (DECLARED_EVENT_FIELDS.has(key)) {
+      clean[key] = value;
+      continue;
+    }
+    if (key === GRAPH_FIELD) {
+      clean[key] = DROPPED_GRAPH;
+      continue;
+    }
+    const size = measure(value);
+    clean[key] = size > MAX_EVENT_FIELD_BYTES ? `<dropped: ${size} bytes>` : value;
+  }
+  return clean as RunEvent;
+}
+
 /** The exit code and a bounded look at both streams. */
 function streamDiagnostics(run: ComfyRun): string {
   return (
@@ -261,18 +411,19 @@ function streamDiagnostics(run: ComfyRun): string {
 }
 
 /**
- * Where to go when this server cannot say how the run ended. The events carry
- * the `prompt_id` from the moment the graph is queued, so even a stream that
- * never reached its envelope usually names the job that is still running.
+ * Where to go when this server cannot say how the run ended.
+ *
+ * Both an MCP tool and the shell command behind it are named where both exist:
+ * a model calling this server can use the first and cannot run the second, and
+ * an operator reading a log is in the opposite position.
  */
-function whereToLook(events: RunEvent[]): string {
-  const promptId = events.find((event) => typeof event.prompt_id === "string")?.prompt_id;
-  if (typeof promptId !== "string") {
-    return `  The run's outcome is unknown; \`comfy jobs ls\` lists the jobs the CLI recorded.`;
+function whereToLook(promptId: string | null): string {
+  if (promptId === null) {
+    return `  The run's outcome is unknown; \`comfy jobs ls\` in a shell lists the jobs the CLI recorded.`;
   }
   return (
     `  The run was submitted as prompt ${promptId} and may still be executing; ` +
-    `\`comfy jobs status ${promptId}\` will say.`
+    `the get_job tool — or \`comfy jobs status ${promptId}\` in a shell — will say.`
   );
 }
 
@@ -282,10 +433,17 @@ function describe(value: unknown): string {
 }
 
 interface DecodedStream {
+  /** Sanitised, and capped to the most recent {@link MAX_EVENTS}. */
   events: RunEvent[];
+  eventsTruncated: boolean;
   /** The run's verdict, or `null` if the stream never carried one. */
   envelope: ParsedEnvelope | null;
   unrecognised: string[];
+  /**
+   * The first `prompt_id` seen on any event, captured **before** truncation so
+   * that a run chatty enough to lose its `queued` event can still be found.
+   */
+  promptId: string | null;
 }
 
 /**
@@ -300,16 +458,17 @@ interface DecodedStream {
  * be returned is not known to describe the finished run. Both are refused, with
  * the job named so the caller can settle it themselves.
  */
-function decodeStream(workflowPath: string, run: ComfyRun): DecodedStream {
-  const events: RunEvent[] = [];
+function decodeStream(workflowPath: string, stdout: string): DecodedStream {
+  const all: RunEvent[] = [];
   const unrecognised: string[] = [];
   let envelope: ParsedEnvelope | null = null;
+  let promptId: string | null = null;
 
   const remember = (line: string): void => {
     if (unrecognised.length < MAX_UNRECOGNISED_LINES) unrecognised.push(snippet(line));
   };
 
-  for (const line of run.stdout.split("\n")) {
+  for (const line of stdout.split("\n")) {
     // Not a violation, and not rare: NDJSON terminates every line with `\n`, so
     // the final split always yields an empty one, and a killed run yields
     // nothing but blank lines.
@@ -330,7 +489,7 @@ function decodeStream(workflowPath: string, run: ComfyRun): DecodedStream {
           `  stdout carried more than one envelope/1 line, so the run has two verdicts and ` +
             `there is no rule for choosing between them.\n` +
             `  second envelope: ${snippet(line)}\n` +
-            whereToLook(events),
+            whereToLook(promptId),
         );
       }
       // Uncaught on purpose: an envelope that violates envelope/1 is the result
@@ -351,22 +510,50 @@ function decodeStream(workflowPath: string, run: ComfyRun): DecodedStream {
         `  an event arrived after the envelope, so the envelope was not the final line and ` +
           `the run's reported outcome is not known to be its last.\n` +
           `  trailing event: ${snippet(line)}\n` +
-          whereToLook(events),
+          whereToLook(promptId),
       );
     }
-    events.push(event.data);
+    if (promptId === null && typeof event.data.prompt_id === "string") {
+      promptId = event.data.prompt_id;
+    }
+    all.push(sanitiseEvent(event.data));
   }
 
-  return { events, envelope, unrecognised };
+  const eventsTruncated = all.length > MAX_EVENTS;
+  return {
+    events: eventsTruncated ? all.slice(-MAX_EVENTS) : all,
+    eventsTruncated,
+    envelope,
+    unrecognised,
+    promptId,
+  };
 }
 
-function classifyOutputs(outputs: string[]): RunOutputs {
-  const files: string[] = [];
-  const urls: string[] = [];
-  for (const output of outputs) {
-    (HTTP_URL.test(output) ? urls : files).push(output);
+/**
+ * Name the job on the one error that otherwise cannot.
+ *
+ * A `--wait` run exceeding its budget is the likeliest failure of this tool, and
+ * the run is unaffected by it — the CLI was killed, ComfyUI was not. The partial
+ * stdout carried on the error holds the `queued` event and with it the handle,
+ * so the difference between a dead end and a recoverable state is decoding what
+ * has already been read.
+ */
+function nameTheJob(workflowPath: string, err: ComfyTimeoutError): ComfyTimeoutError {
+  let guidance: string;
+  try {
+    guidance = whereToLook(decodeStream(workflowPath, err.stdout).promptId);
+  } catch {
+    // A stream cut mid-flight is exactly where a contract violation is expected,
+    // and it is not the error worth reporting: the timeout is.
+    guidance = whereToLook(null);
   }
-  return { files, urls };
+  // Mutated rather than rebuilt, as `workflows/slots.ts` does and for the same
+  // reason: the message is assembled in the constructor, and re-deriving it here
+  // would duplicate that. Safe because `runComfyRaw` throws this error and it is
+  // caught here with nothing in between — nothing has read `.stack`, whose first
+  // read memoizes the `Name: message` header.
+  err.message = `${err.message}\n${guidance}`;
+  return err;
 }
 
 /**
@@ -386,38 +573,48 @@ function classifyOutputs(outputs: string[]): RunOutputs {
  *
  * @throws {RunContractError} the stream carried no verdict, more than one, or a
  * payload that is not a run result.
- * @throws {ComfyCliError} the CLI reported a failure — `execution_error` for a
- * node that raised, `cancelled` for an interrupted run, with its own diagnosis
- * attached.
+ * @throws {RunFailedError} the CLI reported a failure — `execution_error` for a
+ * node that raised, `cancelled` for an interrupted run — with the CLI's own
+ * diagnosis and the events that explain it attached. A {@link ComfyCliError}.
  * @throws {EnvelopeParseError} a line claiming to be the envelope was not one.
  * @throws {ComfyTimeoutError} the call exceeded `timeoutMs`. The run itself is
- * unaffected and continues on the server; the partial stdout carried on the
- * error holds the `queued` event, and with it the job's `prompt_id`.
+ * unaffected and goes on executing; the message names the job to poll.
  * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
+ * @throws {TypeError} `host` was given as an empty string, which would build
+ * `http://:8188/` and be reported as an unreachable server.
  */
 export async function runWorkflow(
   prepared: PreparedWorkflow,
   opts: RunWorkflowOptions = {},
 ): Promise<WorkflowRun> {
   try {
-    const run = await runComfyRaw(runArgs(prepared.path, opts), { timeoutMs: opts.timeoutMs });
+    let run: ComfyRun;
+    try {
+      run = await runComfyRaw(runArgs(prepared.path, opts), { timeoutMs: opts.timeoutMs });
+    } catch (err) {
+      if (err instanceof ComfyTimeoutError) throw nameTheJob(prepared.source, err);
+      throw err;
+    }
+
     // Diagnostics name the caller's own file: the copy is about to be deleted,
     // and its path means nothing to whoever has to act on the message.
-    const stream = decodeStream(prepared.source, run);
+    const stream = decodeStream(prepared.source, run.stdout);
 
     if (stream.envelope === null) {
       throw new RunContractError(
         prepared.source,
         `  the NDJSON stream ended with no envelope/1 line, so the CLI never reported an outcome.\n` +
           `${streamDiagnostics(run)}\n` +
-          `${whereToLook(stream.events)}`,
+          `${whereToLook(stream.promptId)}`,
       );
     }
     if (!stream.envelope.ok) {
-      throw new ComfyCliError(
+      throw new RunFailedError(
         stream.envelope.command,
         stream.envelope.where,
         stream.envelope.error,
+        stream.events,
+        stream.eventsTruncated,
       );
     }
 
@@ -439,18 +636,20 @@ export async function runWorkflow(
         prepared.source,
         `  the CLI reported status "${QUEUED}" with no prompt_id, so the run it started ` +
           `cannot be polled or cancelled.\n` +
-          `  \`comfy jobs ls\` lists the jobs the CLI recorded.`,
+          `  \`comfy jobs ls\` in a shell lists the jobs the CLI recorded.`,
       );
     }
 
     return {
       source: prepared.source,
       status: payload.status,
+      terminal: isTerminal(payload.status),
       promptId,
       outputs: classifyOutputs(payload.outputs ?? []),
       warnings: payload.warnings ?? [],
       elapsedSeconds: payload.elapsed_seconds ?? null,
       events: stream.events,
+      eventsTruncated: stream.eventsTruncated,
       unrecognisedLines: stream.unrecognised,
     };
   } finally {

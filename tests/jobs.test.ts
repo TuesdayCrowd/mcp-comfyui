@@ -188,7 +188,7 @@ test("a running job reports its status and nothing it has not produced yet", asy
   expect(job.promptId).toBe(PROMPT_ID);
   expect(job.status).toBe("running");
   expect(job.terminal).toBe(false);
-  expect(job.outputs).toEqual([]);
+  expect(job.outputs).toEqual({ files: [], urls: [] });
   expect(job.workflowSize).toBe(12);
   // `jobs status` never emits one — only `jobs ls` rows carry a queue position.
   expect(job.queuePosition).toBeNull();
@@ -202,7 +202,9 @@ test("a completed job carries its outputs and reads as terminal", async () => {
 
   expect(job.status).toBe("completed");
   expect(job.terminal).toBe(true);
-  expect(job.outputs).toEqual([OUTPUT_URL]);
+  // Split by kind, exactly as `run_workflow` splits them: one `comfy/outputs.ts`
+  // rule, so the same two strings never arrive in two shapes.
+  expect(job.outputs).toEqual({ files: [], urls: [OUTPUT_URL] });
   expect(job.host).toBe("127.0.0.1");
   expect(job.port).toBe(8188);
 });
@@ -320,6 +322,29 @@ test("several jobs come back in the order the CLI merged them", async () => {
   expect(result.jobs[3]?.workflowPath).toBeNull();
 });
 
+test("a job this server submitted reports no workflow path, because its copy is gone", async () => {
+  // `runWorkflow` hands `comfy` a private copy, the CLI records that absolute
+  // path as the job's workflow, and the copy is deleted the moment the run
+  // returns. Reporting it would name a UUID directory that no longer exists and
+  // invite a caller to open it; the run's own `source` is the real answer.
+  const temp = join(tmpdir(), "mcp-comfyui-apply-5ae64eed-0000-4000-8000-000000000000", "flow.json");
+  const mine = "/Users/lawls/ComfyUI-Shared/user/default/workflows/flow.json";
+  serve(
+    "ls",
+    listing([
+      jobRow({ workflow_path: temp }),
+      jobRow({ prompt_id: OTHER_ID, workflow_path: mine }),
+    ]),
+  );
+
+  const result = await listJobs();
+
+  expect(result.jobs[0]?.workflowPath).toBeNull();
+  // ...and a path that is somebody else's is untouched, which is the whole
+  // point of recognising ours rather than nulling the field outright.
+  expect(result.jobs[1]?.workflowPath).toBe(mine);
+});
+
 test("a row's `outputs` is a count, and is named so it cannot be read as the artifacts", async () => {
   // The same key is an array of URLs on a `jobs status` payload. Carrying both
   // through under one name is how a caller ends up iterating the number 2.
@@ -344,7 +369,9 @@ test("a listing that is not a listing is refused", async () => {
   const err = await rejection(listJobs());
 
   expect(err).toBeInstanceOf(JobPayloadError);
-  expect((err as Error).message).toContain("jobs");
+  // Named path, not the bare word: `toContain("jobs")` holds for any payload
+  // error from `listJobs`, because the command name is in every message.
+  expect((err as Error).message).toContain("→ at jobs");
 });
 
 test("a row missing its status is refused rather than listed as undefined", async () => {
@@ -408,8 +435,17 @@ test("an id the CLI has never heard of is reported as unknown, not as a cancel",
   if (result.outcome !== "not_found") throw new Error("unreachable");
   // The CLI's own diagnosis survives the reclassification: code, message, hint,
   // `where` and details are all still there for whoever has to act on it.
-  expect(result.error).toBeInstanceOf(ComfyCliError);
-  expect(result.error.code).toBe("prompt_not_found");
+  // Asserted through a serialisation round trip, which is the only way this
+  // can be checked: an `Error` carries `message` on the non-enumerable
+  // prototype, so a live-object assertion passes while the value an MCP client
+  // receives has no message at all.
+  const wire = JSON.parse(JSON.stringify(result)) as typeof result;
+  if (wire.outcome !== "not_found") throw new Error("unreachable");
+  expect(wire.error.code).toBe("prompt_not_found");
+  expect(wire.error.message).toContain("prompt_not_found");
+  expect(wire.error).toHaveProperty("hint");
+  expect(wire.error).toHaveProperty("where");
+  expect(wire.error).toHaveProperty("details");
   expect(subcommands()).toEqual(["status", "cancel"]);
 });
 

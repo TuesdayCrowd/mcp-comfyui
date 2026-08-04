@@ -10,8 +10,10 @@
 #   $FAKE_COMFY_ORPHAN_OUT file to record a surviving descendant's pid in
 #   $FAKE_COMFY_PROBE      value echoed back by the echo_env mode
 #   $FAKE_COMFY_DATA_FILE  JSON file served as the envelope's data (data_file mode)
-#   $FAKE_COMFY_ERROR_CODE     error code returned by the fail_code mode
-#   $FAKE_COMFY_ERROR_MESSAGE  error message returned by the fail_code mode
+#   $FAKE_COMFY_ERROR_CODE     error code returned by the fail_code and
+#                              launch_fail modes
+#   $FAKE_COMFY_ERROR_MESSAGE  error message returned by the fail_code and
+#                              launch_fail modes
 #   $FAKE_COMFY_APPLIED        set_slot: literal JSON array to report as
 #                              data.applied instead of echoing what arrived
 #   $FAKE_COMFY_WARNINGS       set_slot: literal JSON array for data.warnings
@@ -19,6 +21,7 @@
 #   $FAKE_COMFY_STREAM_FILE    run_stream: file whose bytes become stdout verbatim
 #   $FAKE_COMFY_STDERR         run_stream: one line of human chatter for stderr
 #   $FAKE_COMFY_EXIT           run_stream: exit code to end with (default 0)
+#   $FAKE_COMFY_HANG          run_stream: block after the stream instead of exiting
 #   $FAKE_COMFY_ARGV_LOG       jobs: file each invocation's argv is APPENDED to,
 #                              because one cancel makes two calls and
 #                              $FAKE_COMFY_ARGV_OUT only ever holds the last
@@ -149,6 +152,12 @@ case "$FAKE_COMFY_MODE" in
     # parser must never infer the outcome from it.
     [ -n "$FAKE_COMFY_STREAM_FILE" ] && cat "$FAKE_COMFY_STREAM_FILE"
     [ -n "$FAKE_COMFY_STDERR" ] && printf '%s\n' "$FAKE_COMFY_STDERR" >&2
+    # $FAKE_COMFY_HANG turns the same stream into a `--wait` run that never
+    # finishes: the events are flushed, then the process blocks holding stdout
+    # open. That is what a real long render looks like to a caller whose budget
+    # runs out, and the only way to test what is recoverable from a partial
+    # stream. exec so the sleeper keeps this pid.
+    [ -n "$FAKE_COMFY_HANG" ] && exec sleep 30
     exit "${FAKE_COMFY_EXIT:-0}" ;;
   jobs)
     # `comfy jobs`, dispatching on the subcommand: one cancel makes two calls
@@ -184,6 +193,23 @@ case "$FAKE_COMFY_MODE" in
     cat "$file"
     printf ',"error":null}\n'
     exit 0 ;;
+  launch)
+    # `comfy launch --background` as it answers a `--json` caller: one envelope
+    # on stdout, then an exit, with the ComfyUI it started left running
+    # elsewhere. This fake starts nothing and binds nothing — a test that needs
+    # a launched server stands one up itself on an ephemeral port, which is the
+    # only way readiness can be observed without a real ComfyUI.
+    echo '{"schema":"envelope/1","type":"envelope","ok":true,"command":"launch","version":"0.0.0","where":null,"data":{"background":true,"listen":"127.0.0.1","port":8188,"url":"http://127.0.0.1:8188","pid":4242},"error":null,"changed":true}'
+    exit 0 ;;
+  launch_fail)
+    # The launch failures that matter are the CLI's own verdicts:
+    # `not_in_workspace` on a machine with no comfy-cli workspace — which is
+    # this user's, since ComfyUI Desktop is not one — plus `port_in_use` and
+    # `server_already_running`. The code is the caller's to choose, as in
+    # fail_code, because what is being tested is uniform across all of them.
+    printf '{"schema":"envelope/1","type":"envelope","ok":false,"command":"launch","version":"0.0.0","where":null,"data":null,"error":{"code":"%s","message":"%s","hint":null,"details":null}}\n' \
+      "$FAKE_COMFY_ERROR_CODE" "$FAKE_COMFY_ERROR_MESSAGE"
+    exit 1 ;;
   *)
     echo "$OK"
     exit 0 ;;

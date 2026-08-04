@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { snippet } from "./envelope.ts";
 import { ComfyCliError, runComfy } from "./exec.ts";
+import { classifyOutputs, isPreparedCopy, type ClassifiedOutputs } from "./outputs.ts";
 import { DEFAULT_PORT, resolveHost } from "./target.ts";
 
 /**
@@ -163,12 +164,15 @@ export interface JobStatus {
   /** Node count of the submitted graph, where the CLI knew it. */
   workflowSize: number | null;
   /**
-   * The artifacts, exactly as the CLI spelled them. A live-server status
-   * reports `/view?...` URLs; a status served from a state file after the
-   * server stopped can hold the absolute paths `run` recorded. Per
-   * `docs/json-output.md:253` any non-`http(s)` value is a filesystem path.
+   * The artifacts, split by kind. A live-server status reports `/view?...`
+   * URLs; a status served from a state file after the server stopped can hold
+   * the absolute paths `run` recorded — so both forms reach a caller through
+   * this one field, and `comfy/outputs.ts` holds the rule that tells them
+   * apart. Split the same way `run_workflow` splits them, because a caller that
+   * runs a workflow and then polls the same job must not be handed the same two
+   * strings in two shapes.
    */
-  outputs: string[];
+  outputs: ClassifiedOutputs;
   /** The server's diagnosis of a failure, or `null`. */
   error: unknown;
   /** The CLI's own resolution of the target. */
@@ -188,7 +192,17 @@ export interface JobSummary {
   outputCount: number | null;
   /** `local` or `cloud`, as the CLI recorded the job's routing target. */
   where: string | null;
-  /** The workflow this server submitted, or `null` for a job it did not. */
+  /**
+   * The workflow file the job was submitted from, where that path is still
+   * usable — so in practice, a job somebody else submitted.
+   *
+   * `null` for every job **this** server submitted, and that is not a gap: the
+   * CLI records the absolute path it was handed, `run_workflow` hands it a
+   * private copy, and that copy is deleted the moment the run returns. Reporting
+   * it would name a UUID directory that no longer exists and invite a caller to
+   * open it. The run's own result carries `source`, the caller's real file,
+   * which is the answer this field cannot give.
+   */
   workflowPath: string | null;
   updatedAt: string | null;
 }
@@ -234,7 +248,7 @@ export interface ListJobsOptions extends JobsOptions {
  *   nothing to stop. **Not an error**: the CLI is idempotent for known jobs,
  *   and reporting this as a failure would train a caller to ignore failures.
  * - `not_found` — no such job anywhere the CLI can see. The CLI's own
- *   `prompt_not_found` error is carried whole rather than flattened to a
+ *   `prompt_not_found` diagnosis is carried whole rather than flattened to a
  *   boolean, so its message, hint, `where` and details survive.
  *
  * The union shape is what makes each arm carry exactly what it can know:
@@ -244,7 +258,38 @@ export interface ListJobsOptions extends JobsOptions {
 export type CancelResult =
   | { outcome: "cancelled"; promptId: string; previousStatus: string | null }
   | { outcome: "already_finished"; promptId: string; previousStatus: string }
-  | { outcome: "not_found"; promptId: string; error: ComfyCliError };
+  | { outcome: "not_found"; promptId: string; error: JobError };
+
+/**
+ * The CLI's diagnosis, as plain data.
+ *
+ * **Not the `ComfyCliError` object**, and the difference is not cosmetic. This
+ * is the one error in this codebase returned as a *value* rather than thrown,
+ * so it is the one that gets serialised on its way to an MCP client — and
+ * `Error.prototype.message` is non-enumerable, so `JSON.stringify` of an
+ * `Error` silently drops the very field that says what went wrong. Every own
+ * property here is enumerable, so what a caller reads is what a caller sends.
+ */
+export interface JobError {
+  /** The CLI's error code, from an append-only registry. */
+  code: string;
+  message: string;
+  hint: string | null;
+  /** The CLI's local-vs-cloud routing target. */
+  where: string | null;
+  details: unknown;
+}
+
+/** Flatten a thrown CLI error into something that survives serialisation. */
+function toJobError(err: ComfyCliError): JobError {
+  return {
+    code: err.code,
+    message: err.message,
+    hint: err.hint,
+    where: err.where,
+    details: err.details,
+  };
+}
 
 /**
  * The CLI answered, but with something this server cannot read as a job.
@@ -293,8 +338,26 @@ function jobsArgs(sub: string, rest: string[], opts: JobsOptions): string[] {
   ];
 }
 
-function isTerminal(status: string): boolean {
+/**
+ * Whether a status is one `comfy` treats as finished.
+ *
+ * Exported because `workflows/run.ts` reports a status too, and a run that says
+ * it is over while a poll of the same job says it is not would be a difference
+ * nothing could explain. One set, one predicate.
+ */
+export function isTerminal(status: string): boolean {
   return TERMINAL_STATUSES.has(status);
+}
+
+/**
+ * A workflow path a caller could actually open, or `null`.
+ *
+ * See {@link JobSummary.workflowPath}: for jobs this server submitted, the
+ * recorded path is a temp copy that `runWorkflow` has already deleted.
+ */
+function usableWorkflowPath(path: string | null | undefined): string | null {
+  if (path === undefined || path === null) return null;
+  return isPreparedCopy(path) ? null : path;
 }
 
 /**
@@ -310,6 +373,8 @@ function isTerminal(status: string): boolean {
  * an id the server does not know, `server_not_running` for a downed server.
  * @throws {ComfyTimeoutError} the call exceeded `timeoutMs`.
  * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
+ * @throws {TypeError} `host` was given as an empty string, which would build
+ * `http://:8188/` and be reported as an unreachable server.
  */
 export async function getJobStatus(promptId: string, opts: JobsOptions = {}): Promise<JobStatus> {
   const data = await runComfy(jobsArgs("status", [promptId], opts), { timeoutMs: opts.timeoutMs });
@@ -324,7 +389,7 @@ export async function getJobStatus(promptId: string, opts: JobsOptions = {}): Pr
     terminal: isTerminal(payload.status),
     queuePosition: payload.queue_position ?? null,
     workflowSize: payload.workflow_size ?? null,
-    outputs: payload.outputs ?? [],
+    outputs: classifyOutputs(payload.outputs ?? []),
     error: payload.error ?? null,
     host: payload.host ?? null,
     port: payload.port ?? null,
@@ -341,6 +406,8 @@ export async function getJobStatus(promptId: string, opts: JobsOptions = {}): Pr
  * @throws {ComfyCliError} the CLI reported a failure.
  * @throws {ComfyTimeoutError} the call exceeded `timeoutMs`.
  * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
+ * @throws {TypeError} `host` was given as an empty string, which would build
+ * `http://:8188/` and be reported as an unreachable server.
  */
 export async function listJobs(opts: ListJobsOptions = {}): Promise<JobListing> {
   const limit = String(opts.limit ?? DEFAULT_LIMIT);
@@ -362,7 +429,7 @@ export async function listJobs(opts: ListJobsOptions = {}): Promise<JobListing> 
       workflowSize: row.workflow_size ?? null,
       outputCount: row.outputs ?? null,
       where: row.where ?? null,
-      workflowPath: row.workflow_path ?? null,
+      workflowPath: usableWorkflowPath(row.workflow_path),
       updatedAt: row.updated_at ?? null,
     })),
     scope: payload.scope ?? null,
@@ -416,6 +483,8 @@ async function probeStatus(promptId: string, opts: JobsOptions): Promise<JobStat
  * returned as the `not_found` arm instead.
  * @throws {ComfyTimeoutError} the call exceeded `timeoutMs`.
  * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
+ * @throws {TypeError} `host` was given as an empty string, which would build
+ * `http://:8188/` and be reported as an unreachable server.
  */
 export async function cancelJob(promptId: string, opts: JobsOptions = {}): Promise<CancelResult> {
   const observed = await probeStatus(promptId, opts);
@@ -431,7 +500,10 @@ export async function cancelJob(promptId: string, opts: JobsOptions = {}): Promi
     // answer to the caller's question, not a fault, and the CLI's own error is
     // carried whole on the arm rather than being flattened away.
     if (err instanceof ComfyCliError && err.code === PROMPT_NOT_FOUND) {
-      return { outcome: "not_found", promptId, error: err };
+      // Flattened, not carried as the Error object: this arm is returned rather
+      // than thrown, so it will be serialised, and an Error's `message` is
+      // non-enumerable — see {@link JobError}.
+      return { outcome: "not_found", promptId, error: toJobError(err) };
     }
     throw err;
   }

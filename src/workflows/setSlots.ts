@@ -5,6 +5,7 @@ import { basename, join } from "node:path";
 import { z } from "zod";
 import { snippet } from "../comfy/envelope.ts";
 import { runComfy } from "../comfy/exec.ts";
+import { PREPARED_COPY_PREFIX } from "../comfy/outputs.ts";
 import { DEFAULT_PORT, resolveHost } from "../comfy/target.ts";
 
 /**
@@ -141,6 +142,65 @@ export class SlotValueError extends Error {
 }
 
 /**
+ * The caller's workflow file could not be read.
+ *
+ * A separate type because it is the likeliest user error of the whole server —
+ * a wrong name, a moved file, a directory the process cannot read — and because
+ * the alternative is what `copyFileSync` raises on its own: a bare `Error` named
+ * `Error`, whose message quotes the destination as well as the source, so the
+ * operator is shown a temp path with a UUID in it that they never chose and
+ * cannot act on.
+ *
+ * The source path is named on its own here, and the OS's reason is kept whole.
+ */
+export class WorkflowFileError extends Error {
+  override readonly name = "WorkflowFileError";
+  /** The caller's own path, exactly as it was passed. */
+  readonly workflowPath: string;
+  /** The OS error code, e.g. `ENOENT` or `EACCES`, where there was one. */
+  readonly code: string | null;
+
+  constructor(workflowPath: string, cause: unknown) {
+    const code = errorCode(cause);
+    super(
+      // The OS reason is deliberately NOT quoted for a code we recognise:
+      // `copyfile`'s own message names the destination as well as the source,
+      // so passing it through is what puts a temp directory nobody chose in
+      // front of the operator. Nothing is lost — the raw error is the `cause`.
+      `cannot read the workflow file ${workflowPath}: ${KNOWN_FILE_ERRORS[code ?? ""] ?? describeCause(cause)}\n` +
+        (code === "ENOENT"
+          ? `The list_workflows tool enumerates the workflows this server can see; ` +
+            `paths are absolute and case-sensitive.`
+          : `Check that the path is a readable file this process has permission to open.`),
+      { cause },
+    );
+    this.workflowPath = workflowPath;
+    this.code = code;
+  }
+}
+
+/**
+ * The errno values a workflow path realistically fails with, spelled without
+ * the paths the OS embeds. Anything outside this set falls back to the raw
+ * message: for an unexpected failure, too much detail beats too little.
+ */
+const KNOWN_FILE_ERRORS: Record<string, string> = {
+  ENOENT: "no such file",
+  EACCES: "permission denied",
+  EISDIR: "that path is a directory, not a workflow file",
+};
+
+function errorCode(cause: unknown): string | null {
+  if (typeof cause !== "object" || cause === null) return null;
+  const code = (cause as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+function describeCause(cause: unknown): string {
+  return cause instanceof Error ? cause.message : String(cause);
+}
+
+/**
  * The CLI answered, but with something that cannot be reconciled with what was
  * asked. Distinct from `ComfyCliError`, which is the CLI reporting a failure it
  * understood: this is the CLI reporting *success* over an answer that does not
@@ -256,16 +316,17 @@ function makeTempDir(): { dir: string; dispose: () => void } {
   // A UUID, not a counter or the workflow's name: two runs of the same workflow
   // are the normal case, and a shared path would have the second overwrite the
   // first's graph while it was still being executed. `mkdirSync` without
-  // `recursive` so a collision would be loud rather than a silent clobber.
-  const dir = join(tmpdir(), `mcp-comfyui-apply-${randomUUID()}`);
+  // `recursive` so a collision would be loud rather than a silent clobber. The
+  // prefix is shared with `comfy/outputs.ts`, which has to recognise these paths
+  // coming back from `comfy jobs` after this directory is gone.
+  const dir = join(tmpdir(), `${PREPARED_COPY_PREFIX}${randomUUID()}`);
   mkdirSync(dir);
 
-  let disposed = false;
   return {
     dir,
+    // Idempotent without a flag to make it so: `force: true` is documented to
+    // ignore a path that does not exist, and the catch covers what is left.
     dispose: () => {
-      if (disposed) return;
-      disposed = true;
       try {
         rmSync(dir, { recursive: true, force: true });
       } catch {
@@ -333,11 +394,15 @@ function describe(value: unknown): string {
  * modified: the copy is what gets edited.
  * @returns a {@link PreparedWorkflow} whose `dispose` the **caller** must call.
  * @throws {SlotValueError} an input could not be encoded; nothing was spawned.
+ * @throws {WorkflowFileError} `workflowPath` could not be read — a wrong name
+ * or a moved file, the likeliest user error here.
  * @throws {SetSlotContractError} the CLI's answer did not match the request.
  * @throws {ComfyCliError} the CLI rejected the edit — `workflow_slot_invalid`
  * for an address or value it could not use, with its own diagnosis attached.
  * @throws {ComfyTimeoutError} the call exceeded `timeoutMs`.
  * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
+ * @throws {TypeError} `host` was given as an empty string, which would build
+ * `http://:8188/` and be reported as an unreachable server.
  */
 export async function applySlots(
   workflowPath: string,
@@ -355,7 +420,15 @@ export async function applySlots(
     // Keeping the original filename makes the copy recognisable in a process
     // list and preserves anything downstream that reads the file's stem.
     const path = join(temp.dir, basename(workflowPath));
-    copyFileSync(workflowPath, path);
+    try {
+      copyFileSync(workflowPath, path);
+    } catch (cause) {
+      // Wrapped rather than propagated: the raw error is named `Error`, is in
+      // none of this function's documented failures, and quotes the temp
+      // destination alongside the source — so the operator is shown a UUID path
+      // they never chose next to the one they got wrong.
+      throw new WorkflowFileError(workflowPath, cause);
+    }
 
     if (pairs.length === 0) {
       return { path, source: workflowPath, applied: [], warnings: [], dispose: temp.dispose };

@@ -1,12 +1,21 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec";
 import {
   SetSlotContractError,
   SlotValueError,
+  WorkflowFileError,
   applySlots,
   type PreparedWorkflow,
 } from "../src/workflows/setSlots";
@@ -122,6 +131,11 @@ test("edits a temp copy under the OS temp dir and leaves the source untouched", 
   expect(dirname(prepared.path)).toStartWith(join(tmpdir(), TEMP_PREFIX));
   expect(prepared.source).toBe(source);
   expect(existsSync(prepared.path)).toBe(true);
+  // The copy keeps the original's filename. comfy-cli displays
+  // `Path(workflow_path).name` and keys template schemas off `.stem`, so a
+  // fixed or generated name would rename the user's workflow in every place
+  // the CLI reports it.
+  expect(basename(prepared.path)).toBe(basename(source));
   // The user's own file is never what gets edited — the reason for the copy.
   expect(sha256(source)).toBe(before);
 
@@ -169,6 +183,38 @@ test("the temp copy keeps an out-of-range integer the caller never mentioned", a
   expect(readFileSync(prepared.path, "utf8")).toContain(HUGE_SEED);
 
   prepared.dispose();
+});
+
+test("a workflow file that is not there is named as such, not as a temp path", async () => {
+  // The likeliest user error of the whole server. Unwrapped, `copyFileSync`
+  // raises a bare `Error` named `Error` whose message quotes the destination
+  // too — so the operator is shown a UUID directory they never chose, next to
+  // the path they actually got wrong.
+  const missing = join(workdir, "does-not-exist.json");
+
+  const err = await rejection(applySlots(missing, { "3.steps": 7 }));
+
+  expect(err).toBeInstanceOf(WorkflowFileError);
+  expect((err as WorkflowFileError).code).toBe("ENOENT");
+  const message = (err as Error).message;
+  expect(message).toContain(missing); // the caller's path
+  expect(message).not.toContain(TEMP_PREFIX); // and not ours
+  expect(message).toContain("list_workflows"); // named as the tool a model has
+  expect(existsSync(argvOut)).toBe(false); // nothing was spawned
+  expect(leakedTempDirs()).toEqual([]); // and nothing was left behind
+});
+
+test("an unreadable workflow file is reported without guessing why", async () => {
+  const unreadable = join(workdir, "unreadable.json");
+  writeFileSync(unreadable, "{}");
+  chmodSync(unreadable, 0o000);
+
+  const err = await rejection(applySlots(unreadable, { "3.steps": 7 }));
+
+  expect(err).toBeInstanceOf(WorkflowFileError);
+  expect((err as WorkflowFileError).code).toBe("EACCES");
+  expect((err as Error).message).toContain(unreadable);
+  expect(leakedTempDirs()).toEqual([]);
 });
 
 // --- the invocation ------------------------------------------------------

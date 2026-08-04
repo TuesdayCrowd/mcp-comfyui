@@ -3,8 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EnvelopeParseError } from "../src/comfy/envelope";
-import { ComfyCliError } from "../src/comfy/exec";
-import { RunContractError, runWorkflow } from "../src/workflows/run";
+import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec";
+import { RunContractError, RunFailedError, runWorkflow } from "../src/workflows/run";
 import { applySlots, type PreparedWorkflow } from "../src/workflows/setSlots";
 
 /**
@@ -18,6 +18,14 @@ const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
 const TEMP_PREFIX = "mcp-comfyui-apply-";
 
 const PROMPT_ID = "9b1c7d2e-0000-4000-8000-000000000001";
+
+/**
+ * 2^64−1, the largest seed ComfyUI accepts, and the value `JSON.parse` cannot
+ * hold: it arrives as `ROUNDED_SEED` instead. It is in these fixtures because
+ * `comfy run --json` really does hand the whole graph back on every run.
+ */
+const HUGE_SEED = "18446744073709551615";
+const ROUNDED_SEED = "18446744073709552000";
 
 /**
  * The two forms `outputs[]` takes. A loopback run with a resolvable workspace
@@ -48,6 +56,7 @@ afterEach(() => {
   delete process.env.FAKE_COMFY_STREAM_FILE;
   delete process.env.FAKE_COMFY_STDERR;
   delete process.env.FAKE_COMFY_EXIT;
+  delete process.env.FAKE_COMFY_HANG;
   rmSync(workdir, { recursive: true, force: true });
   for (const name of leakedTempDirs()) {
     rmSync(join(tmpdir(), name), { recursive: true, force: true });
@@ -291,14 +300,15 @@ test("an event type absent from the published enum is carried, not fatal", async
 });
 
 test("fields the event contract never declared survive on the event", async () => {
-  // The useful part of `execution_error` is `details`, which carries the whole
-  // server payload including the traceback — and which run_event.json does not
-  // declare. Stripping unknown keys would throw away the diagnosis.
+  // `queued` carries `validation_warnings` and `nodes`, neither of which
+  // run_event.json declares, and the run then completes normally. Stripping
+  // unknown keys would keep the envelope and throw away everything the CLI
+  // took the trouble to say.
   serveStream(
     `${[
-      event("execution_error", {
+      event("queued", {
         prompt_id: PROMPT_ID,
-        details: { node_id: "3", exception_message: "API key invalid" },
+        validation_warnings: [{ node_id: "7", message: "input will be ignored" }],
       }),
       envelopeLine(completedPayload()),
     ].join("\n")}\n`,
@@ -306,10 +316,9 @@ test("fields the event contract never declared survive on the event", async () =
 
   const result = await runWorkflow(await prepare(), { wait: true });
 
-  expect(result.events[0]?.details).toEqual({
-    node_id: "3",
-    exception_message: "API key invalid",
-  });
+  expect(result.events[0]?.validation_warnings).toEqual([
+    { node_id: "7", message: "input will be ignored" },
+  ]);
 });
 
 test("a line that is not JSON is kept as a diagnostic and does not fail the run", async () => {
@@ -350,6 +359,122 @@ test("the diagnostic list is bounded rather than mirroring a flood of stdout", a
 
   expect(result.status).toBe("completed");
   expect(result.unrecognisedLines.length).toBeLessThanOrEqual(10);
+});
+
+// --- the graph must never come back through our JS (landmine #12) ---------
+
+test("the workflow graph on prompt_preview is dropped, digits and all", async () => {
+  // `renderer.event("prompt_preview", prompt=workflow)` is unconditional in
+  // stream mode, so every run hands the whole graph back — and `JSON.parse` has
+  // already rounded every integer in it past 2^53 before this module sees it:
+  //
+  //   emitted by comfy : 18446744073709551615
+  //   after JSON.parse : 18446744073709552000
+  //
+  // `setSlots.ts` is a byte-copy architecture built to keep our JS away from
+  // the graph. Surfacing this field would undo it one layer up: comfy did the
+  // submit, so the images are right, and the *report* is wrong. A
+  // reproduce-this-render loop reads its seed from that report.
+  const graph = `{"3":{"class_type":"KSampler","inputs":{"seed":${HUGE_SEED},"steps":20}}}`;
+  serveStream(
+    `${[
+      `{"schema":"event/1","type":"prompt_preview","prompt":${graph},"prompt_id":null}`,
+      ...completedEvents(),
+      envelopeLine(completedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), { wait: true });
+
+  const wire = JSON.stringify(result);
+  // The corrupted digits must not appear anywhere in what the caller receives.
+  expect(wire).not.toContain(ROUNDED_SEED);
+  // Nor may the graph be carried "intact" — our JS cannot do that, so the only
+  // correct answer is absence, said out loud rather than silently. Asserted on
+  // `inputs`, which only a graph has: `class_type` is a declared field of the
+  // `executing` event and is legitimately present.
+  expect(wire).not.toContain('"inputs"');
+  expect(result.events[0]?.type).toBe("prompt_preview");
+  expect(result.events[0]?.prompt).toContain("dropped");
+  expect(result.events[0]?.prompt).toContain("workflow file");
+});
+
+test("a graph arriving under a name nobody has reserved is dropped for its size", async () => {
+  // The named drop covers `prompt`; this is the general defence behind it. A
+  // field big enough to be a graph cannot be carried into an MCP response
+  // whatever it is called, and being dropped is also what keeps its digits out.
+  const big = JSON.stringify(
+    Object.fromEntries(
+      Array.from({ length: 400 }, (_, i) => [String(i), { class_type: "KSampler", seed: HUGE_SEED }]),
+    ),
+  );
+  serveStream(
+    `${[
+      `{"schema":"event/1","type":"some_future_preview","converted_graph":${big}}`,
+      envelopeLine(completedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), { wait: true });
+
+  expect(result.events[0]?.converted_graph).toMatch(/^<dropped: \d+ bytes>$/);
+  expect(JSON.stringify(result)).not.toContain("class_type");
+});
+
+test("an ordinary undeclared field is still carried whole", async () => {
+  // The size rule must not become a reason to lose the traceback: bounding is
+  // for graphs, not for the diagnosis.
+  serveStream(
+    `${[
+      event("execution_error", { details: { traceback: "x".repeat(2_000) } }),
+      envelopeLine(completedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), { wait: true });
+
+  expect((result.events[0]?.details as { traceback: string }).traceback).toHaveLength(2_000);
+});
+
+test("the event list is capped, and says so, rather than mirroring a long run", async () => {
+  // Measured before this bound existed: a 400-step run plus one prompt_preview
+  // produced 107KB of result JSON, all of it destined for an MCP response.
+  const chatty = Array.from({ length: 900 }, (_, i) =>
+    event("progress", { node: "3", completed: i, total: 900, prompt_id: PROMPT_ID }),
+  );
+  serveStream(`${[...chatty, envelopeLine(completedPayload())].join("\n")}\n`);
+
+  const result = await runWorkflow(await prepare(), { wait: true });
+
+  expect(result.eventsTruncated).toBe(true);
+  expect(result.events.length).toBeLessThanOrEqual(200);
+  // The LAST events are kept. `execution_error` carries the server's traceback
+  // and arrives at the end of the run it explains, where the early events are
+  // recoverable from the envelope's own payload.
+  expect(result.events.at(-1)?.completed).toBe(899);
+  expect(JSON.stringify(result).length).toBeLessThan(60_000);
+});
+
+test("a short run is not marked truncated", async () => {
+  serveStream(completedStream());
+  const result = await runWorkflow(await prepare(), { wait: true });
+  expect(result.eventsTruncated).toBe(false);
+  expect(result.events).toHaveLength(6);
+});
+
+test("a truncated run can still be found, because the handle is kept before the cap", async () => {
+  // The `queued` event names the job and arrives first, so a naive cap would
+  // throw away the one thing a caller needs to recover a run this server can no
+  // longer report on.
+  const chatty = Array.from({ length: 900 }, () => event("progress", { node: "3" }));
+  serveStream(`${[event("queued", { prompt_id: PROMPT_ID }), ...chatty].join("\n")}\n`, {
+    exit: 1,
+  });
+
+  const err = await rejection(runWorkflow(await prepare(), { wait: true }));
+
+  expect(err).toBeInstanceOf(RunContractError);
+  expect((err as Error).message).toContain(PROMPT_ID);
 });
 
 // --- outputs -------------------------------------------------------------
@@ -398,6 +523,20 @@ test("a run with no outputs reports two empty lists, not a missing field", async
 });
 
 // --- the two modes -------------------------------------------------------
+
+test("a run says whether it is over, using the same rule a later poll will", async () => {
+  // `get_job` derives `terminal` from `comfy`'s own TERMINAL_STATUSES. A run
+  // and a poll of the same job disagreeing about whether it had finished would
+  // be a difference nothing could explain.
+  serveStream(completedStream());
+  expect((await runWorkflow(await prepare(), { wait: true })).terminal).toBe(true);
+
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  expect((await runWorkflow(await prepare())).terminal).toBe(false);
+
+  serveStream(`${envelopeLine(completedPayload({ status: "cancelled" }))}\n`);
+  expect((await runWorkflow(await prepare(), { wait: true })).terminal).toBe(true);
+});
 
 test("the default async submit returns the prompt id as the job handle", async () => {
   serveStream(`${[event("queued", { prompt_id: PROMPT_ID }), envelopeLine(queuedPayload())].join("\n")}\n`);
@@ -472,7 +611,15 @@ test("a run with no warnings reports an empty list", async () => {
 test("a failure envelope becomes a ComfyCliError carrying the CLI's own code", async () => {
   serveStream(
     `${[
-      event("execution_error", { prompt_id: PROMPT_ID, details: { node_id: "3" } }),
+      event("execution_error", {
+        prompt_id: PROMPT_ID,
+        details: {
+          node_id: "3",
+          exception_message: "Allocation on device 0 would exceed allowed memory",
+          exception_type: "torch.OutOfMemoryError",
+          traceback: ['  File "nodes.py", line 1461, in sample\n'],
+        },
+      }),
       failureLine({
         code: "execution_error",
         message: "Node 3 (KSampler) raised: CUDA out of memory",
@@ -484,11 +631,24 @@ test("a failure envelope becomes a ComfyCliError carrying the CLI's own code", a
 
   const err = await rejection(runWorkflow(await prepare(), { wait: true }));
 
-  expect(err).toBeInstanceOf(ComfyCliError);
-  const cli = err as ComfyCliError;
+  expect(err).toBeInstanceOf(RunFailedError);
+  expect(err).toBeInstanceOf(ComfyCliError); // callers still branch on `.code`
+  const cli = err as RunFailedError;
   expect(cli.code).toBe("execution_error");
   expect(cli.hint).toBe("lower the batch size");
   expect(cli.message).toContain("CUDA out of memory");
+
+  // The half of the diagnosis the envelope does not carry. Upstream is explicit
+  // that the event keeps the full server payload while the envelope carries the
+  // classified one-line verdict, so decoding the events and then dropping them
+  // would leave the caller with the line they could already guess.
+  expect(cli.events).toHaveLength(1);
+  expect(cli.events[0]?.type).toBe("execution_error");
+  expect(cli.events[0]?.details).toMatchObject({
+    node_id: "3",
+    exception_message: "Allocation on device 0 would exceed allowed memory",
+    traceback: ["  File \"nodes.py\", line 1461, in sample\n"],
+  });
 });
 
 test("a cancelled run surfaces as the CLI's cancelled code, not as exit 130", async () => {
@@ -586,6 +746,44 @@ test("stderr noise alongside a good stream changes nothing", async () => {
 
   expect(result.status).toBe("completed");
   expect(result.outputs.urls).toEqual([OUTPUT_URL]);
+});
+
+test("a timeout names the job it started, instead of ending the trail", async () => {
+  // The likeliest failure of this tool: a `--wait` run outlasting its budget.
+  // The CLI is killed and ComfyUI is not, so the run goes on — and the handle
+  // needed to follow it is already in the partial stdout that was read.
+  serveStream(`${[event("queued", { prompt_id: PROMPT_ID }), event("executing", { node: "3" })].join("\n")}\n`);
+  process.env.FAKE_COMFY_HANG = "1";
+
+  const err = await rejection(runWorkflow(await prepare(), { wait: true, timeoutMs: 400 }));
+
+  expect(err).toBeInstanceOf(ComfyTimeoutError);
+  const message = (err as Error).message;
+  expect(message).toContain("400ms"); // still says what it always said
+  expect(message).toContain(PROMPT_ID); // ...and now says where the run went
+  expect(message).toContain("get_job"); // named for a model, which cannot use a shell
+  expect(message).toContain("comfy jobs status"); // and for an operator, who can
+});
+
+test("a timeout with nothing decodable still explains itself", async () => {
+  serveStream("not ndjson at all\n");
+  process.env.FAKE_COMFY_HANG = "1";
+
+  const err = await rejection(runWorkflow(await prepare(), { wait: true, timeoutMs: 400 }));
+
+  expect(err).toBeInstanceOf(ComfyTimeoutError);
+  expect((err as Error).message).toContain("comfy jobs ls");
+});
+
+test("a timeout still disposes the prepared copy", async () => {
+  serveStream("");
+  process.env.FAKE_COMFY_HANG = "1";
+  const prepared = await prepare();
+
+  await rejection(runWorkflow(prepared, { wait: true, timeoutMs: 400 }));
+
+  expect(existsSync(prepared.path)).toBe(false);
+  expect(leakedTempDirs()).toEqual([]);
 });
 
 // --- contract violations in the stream -----------------------------------
