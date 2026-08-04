@@ -1,0 +1,111 @@
+{
+ "workflow": "/Users/lawls/ComfyUI-Shared/user/default/workflows/default_image_gen.json",
+ "id": "default_image_gen",
+ "count": 13,
+ "slots": [
+  {
+   "address": "9.filename_prefix",
+   "name": "filename_prefix",
+   "type": "STRING",
+   "current_value": "ComfyUI",
+   "instance_id": "9",
+   "node_type": "SaveImage"
+  },
+  {
+   "address": "4.ckpt_name",
+   "name": "ckpt_name",
+   "type": "COMBO",
+   "current_value": "v1-5-pruned-emaonly-fp16.safetensors",
+   "instance_id": "4",
+   "node_type": "CheckpointLoaderSimple"
+  },
+  {
+   "address": "6.text",
+   "name": "text",
+   "type": "STRING",
+   "current_value": "Empty card slot placeholder, Art Deco style, ornate gold borders, deep purple and black color scheme, geometric corner decorations, subtle radial pattern in center indicating empty space, Art Nouveau flourishes, golden linework, elegant frame design, card game placeholder, mystical aesthetic, star field pattern background, vintage luxury style, symmetrical border design, Foundation universe inspired, psychohistory motif, empty playing card outline, sophisticated game board element",
+   "instance_id": "6",
+   "node_type": "CLIPTextEncode"
+  },
+  {
+   "address": "3.seed",
+   "name": "seed",
+   "type": "INT",
+   "current_value": 94109865029533,
+   "instance_id": "3",
+   "node_type": "KSampler"
+  },
+  {
+   "address": "3.steps",
+   "name": "steps",
+   "type": "INT",
+   "current_value": 20,
+   "instance_id": "3",
+   "node_type": "KSampler"
+  },
+  {
+   "address": "3.cfg",
+   "name": "cfg",
+   "type": "FLOAT",
+   "current_value": 3.5,
+   "instance_id": "3",
+   "node_type": "KSampler"
+  },
+  {
+   "address": "3.sampler_name",
+   "name": "sampler_name",
+   "type": "COMBO",
+   "current_value": "euler",
+   "instance_id": "3",
+   "node_type": "KSampler"
+  },
+  {
+   "address": "3.scheduler",
+   "name": "scheduler",
+   "type": "COMBO",
+   "current_value": "normal",
+   "instance_id": "3",
+   "node_type": "KSampler"
+  },
+  {
+   "address": "3.denoise",
+   "name": "denoise",
+   "type": "FLOAT",
+   "current_value": 1,
+   "instance_id": "3",
+   "node_type": "KSampler"
+  },
+  {
+   "address": "5.width",
+   "name": "width",
+   "type": "INT",
+   "current_value": 736,
+   "instance_id": "5",
+   "node_type": "EmptyLatentImage"
+  },
+  {
+   "address": "5.height",
+   "name": "height",
+   "type": "INT",
+   "current_value": 1024,
+   "instance_id": "5",
+   "node_type": "EmptyLatentImage"
+  },
+  {
+   "address": "5.batch_size",
+   "name": "batch_size",
+   "type": "INT",
+   "current_value": 1,
+   "instance_id": "5",
+   "node_type": "EmptyLatentImage"
+  },
+  {
+   "address": "7.text",
+   "name": "text",
+   "type": "STRING",
+   "current_value": "filled card, text, numbers, character art, portraits, busy center composition, cluttered design, modern UI elements, bright colors, neon, photographs, realistic textures, 3D rendering, blur, low quality, watermark, signature, card content, game pieces, multiple cards, overlapping elements, asymmetric design, cartoon style, anime style, medieval fantasy, playing card suits (hearts, spades, clubs, diamonds)",
+   "instance_id": "7",
+   "node_type": "CLIPTextEncode"
+  }
+ ]
+}
