@@ -295,7 +295,7 @@ Test with fixtures covering: frontend, API-format, `.app.json` with `definitions
 
 **Goal**: `run_workflow(name, inputs)` executes and returns output paths.
 **Success Criteria**: A real 4-step run against the live Desktop instance produces an image on disk.
-**Status**: Not Started
+**Status**: Code complete — 319 tests, 42 mutants killed. **The success criterion above is NOT met and remains outstanding.** No end-to-end run has been executed: ComfyUI Desktop was stopped partway through the stage, and the only installed checkpoint is `stable_audio_3_medium.safetensors`, so none of the image workflows can load a model. `applySlots` *was* verified end to end against the real CLI (a 2^64−1 seed survives byte-exact). `runWorkflow` and the job wrappers are tested only against the fake CLI and comfy-cli's own published schemas. **Before Stage 5 ships, run one real workflow** — an `EmptyImage` → `SaveImage` graph needs no checkpoint and would exercise the whole path.
 
 ### Task 3.1: Apply inputs
 

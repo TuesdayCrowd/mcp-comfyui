@@ -16,6 +16,18 @@
 #                              data.applied instead of echoing what arrived
 #   $FAKE_COMFY_WARNINGS       set_slot: literal JSON array for data.warnings
 #   $FAKE_COMFY_WROTE_NULL     set_slot: report data.wrote as null, as --stdout does
+#   $FAKE_COMFY_STREAM_FILE    run_stream: file whose bytes become stdout verbatim
+#   $FAKE_COMFY_STDERR         run_stream: one line of human chatter for stderr
+#   $FAKE_COMFY_EXIT           run_stream: exit code to end with (default 0)
+#   $FAKE_COMFY_ARGV_LOG       jobs: file each invocation's argv is APPENDED to,
+#                              because one cancel makes two calls and
+#                              $FAKE_COMFY_ARGV_OUT only ever holds the last
+#   $FAKE_COMFY_JOBS_STATUS_FILE   jobs status: JSON file served as data
+#   $FAKE_COMFY_JOBS_STATUS_ERROR  jobs status: error code to fail with instead
+#   $FAKE_COMFY_JOBS_LS_FILE       jobs ls: JSON file served as data
+#   $FAKE_COMFY_JOBS_LS_ERROR      jobs ls: error code to fail with instead
+#   $FAKE_COMFY_JOBS_CANCEL_FILE   jobs cancel: JSON file served as data
+#   $FAKE_COMFY_JOBS_CANCEL_ERROR  jobs cancel: error code to fail with instead
 
 [ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
 
@@ -119,6 +131,58 @@ case "$FAKE_COMFY_MODE" in
     if [ -n "$FAKE_COMFY_WROTE_NULL" ]; then wrote='null'; else wrote="\"$target\""; fi
     printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"workflow set-slot","version":"0.0.0","where":null,"data":{"workflow":"%s","applied":%s,"warnings":%s,"wrote":%s},"error":null,"changed":true}\n' \
       "$target" "$applied" "${FAKE_COMFY_WARNINGS:-[]}" "$wrote"
+    exit 0 ;;
+  run_stream)
+    # `comfy run --json`, whose stdout is NDJSON rather than one envelope: zero
+    # or more `event/1` lines and then a final `envelope/1`.
+    #
+    # The bytes come from a file the test wrote, on the same reasoning as
+    # data_file above — one mode instead of one per stream shape, and the test
+    # that asserts on a stream is the thing that spells it. Nothing here reads
+    # or validates them, so a deliberately malformed stream stays malformed all
+    # the way to the parser under test.
+    #
+    # stdout and stderr are separate pipes drained concurrently, so the order
+    # of these two lines carries no meaning; stderr exists to prove it is never
+    # parsed as data. The exit code is the caller's to choose because upstream
+    # overloads 1 across every failure and returns 130 for a cancellation, so a
+    # parser must never infer the outcome from it.
+    [ -n "$FAKE_COMFY_STREAM_FILE" ] && cat "$FAKE_COMFY_STREAM_FILE"
+    [ -n "$FAKE_COMFY_STDERR" ] && printf '%s\n' "$FAKE_COMFY_STDERR" >&2
+    exit "${FAKE_COMFY_EXIT:-0}" ;;
+  jobs)
+    # `comfy jobs`, dispatching on the subcommand: one cancel makes two calls
+    # (a status probe, then the cancel), so a mode that served one fixed payload
+    # could not stand in for it. The subcommand is the argument after `jobs`.
+    #
+    # $FAKE_COMFY_ARGV_OUT is written by the shared line at the top of this
+    # file and holds only the LAST invocation, so an append-only log is offered
+    # alongside it rather than changing that line for every other mode.
+    [ -n "$FAKE_COMFY_ARGV_LOG" ] && printf '%s\n' "$*" >> "$FAKE_COMFY_ARGV_LOG"
+    sub=""
+    take=0
+    for arg in "$@"; do
+      if [ "$take" = 1 ]; then take=0; sub="$arg"; continue; fi
+      [ "$arg" = "jobs" ] && take=1
+    done
+    case "$sub" in
+      status) file="$FAKE_COMFY_JOBS_STATUS_FILE"; err="$FAKE_COMFY_JOBS_STATUS_ERROR" ;;
+      ls)     file="$FAKE_COMFY_JOBS_LS_FILE";     err="$FAKE_COMFY_JOBS_LS_ERROR" ;;
+      cancel) file="$FAKE_COMFY_JOBS_CANCEL_FILE"; err="$FAKE_COMFY_JOBS_CANCEL_ERROR" ;;
+      *)      file=""; err="unknown_subcommand" ;;
+    esac
+    # A subcommand the test never armed is a fault in the test, not a payload:
+    # say so in a failure envelope rather than emitting `"data":` with nothing
+    # after it and blaming the parser under test.
+    [ -z "$err" ] && [ -z "$file" ] && err="fixture_missing"
+    if [ -n "$err" ]; then
+      printf '{"schema":"envelope/1","type":"envelope","ok":false,"command":"jobs %s","version":"0.0.0","where":null,"data":null,"error":{"code":"%s","message":"fake comfy jobs %s: %s","hint":null,"details":null}}\n' \
+        "$sub" "$err" "$sub" "$err"
+      exit 1
+    fi
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"jobs %s","version":"0.0.0","where":null,"data":' "$sub"
+    cat "$file"
+    printf ',"error":null}\n'
     exit 0 ;;
   *)
     echo "$OK"
