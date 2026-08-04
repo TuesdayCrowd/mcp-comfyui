@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFileSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { z } from "zod";
@@ -35,11 +35,14 @@ import { DEFAULT_PORT, resolveHost } from "../comfy/target.ts";
 
 /**
  * What a caller may set an input to. These are exactly the JSON scalars a
- * ComfyUI widget holds, and each one is spelled as its JSON literal on the
- * command line — a number unquoted, a string raw.
+ * ComfyUI widget holds. A number and a boolean are always spelled as their
+ * JSON literal, unquoted; a string is spelled raw **unless** the target
+ * slot's type is known and is not numeric, in which case it is JSON-quoted —
+ * see {@link encodeString} for why (finding 1).
  *
  * A string of digits is not a workaround: it is the documented way to set a
- * value above 2^53 exactly. See {@link SlotValueError}.
+ * value above 2^53 exactly, for a slot known to be numeric. See
+ * {@link SlotValueError}.
  */
 export type SlotValue = string | number | boolean;
 
@@ -123,6 +126,23 @@ export interface ApplySlotsOptions {
   objectInfoPath?: string;
   /** Budget for the CLI call. Defaults to `runComfy`'s 120 seconds. */
   timeoutMs?: number;
+  /**
+   * The type of every slot the caller might set, keyed by address — the same
+   * `STRING` / `INT` / `FLOAT` / `BOOLEAN` / `COMBO` (or custom node widget
+   * type) that `listSlots`/`describe_workflow` report. Used only to decide, in
+   * {@link encodeString}, whether a **string** value is JSON-quoted before
+   * being sent — see finding 1's fix there for why that matters.
+   *
+   * An address absent from this map — including every address when this
+   * option is omitted entirely — is treated as unknown: its string values
+   * pass through exactly as this module always sent them, which is what keeps
+   * a caller with no type info able to use the digit-string escape hatch
+   * documented on {@link SlotValue}. `tools.ts`'s `run_workflow` populates
+   * this from the same `workflow slots` listing it validates addresses
+   * against, which is what closes finding 1 for the one call site a model can
+   * actually reach.
+   */
+  slotTypes?: Record<string, string>;
 }
 
 /**
@@ -161,7 +181,7 @@ export class WorkflowFileError extends Error {
   readonly code: string | null;
 
   constructor(workflowPath: string, cause: unknown) {
-    const code = errorCode(cause);
+    const code = errorCode(workflowPath, cause);
     super(
       // The OS reason is deliberately NOT quoted for a code we recognise:
       // `copyfile`'s own message names the destination as well as the source,
@@ -190,10 +210,40 @@ const KNOWN_FILE_ERRORS: Record<string, string> = {
   EISDIR: "that path is a directory, not a workflow file",
 };
 
-function errorCode(cause: unknown): string | null {
+/**
+ * The code this error should be filed under.
+ *
+ * A stat of `workflowPath` is checked **before** the OS's own errno, and
+ * overrides it: finding 3 is that the errno for "the source is a directory"
+ * is not stable across platforms. Linux's `copyfile` reports `EISDIR`, which
+ * {@link KNOWN_FILE_ERRORS} already covered — but Bun's on this macOS reports
+ * `ENOTSUP` instead, measured directly: `copyFileSync(aDirectory, tmp)`
+ * throws `ENOTSUP: operation not supported on socket, copyfile '<dir>' ->
+ * '<tmp>'`. `ENOTSUP` is not a code this map recognises, so it used to fall
+ * through to that raw fs message — which quotes the destination as well as
+ * the source, i.e. exactly the UUID temp path this class's own doc comment
+ * says it exists to hide. A direct stat sidesteps the question of which
+ * errno a given platform happens to choose for the same underlying fact, so
+ * the directory case is clean regardless of it.
+ */
+function errorCode(workflowPath: string, cause: unknown): string | null {
+  if (isDirectory(workflowPath)) return "EISDIR";
   if (typeof cause !== "object" || cause === null) return null;
   const code = (cause as { code?: unknown }).code;
   return typeof code === "string" ? code : null;
+}
+
+/**
+ * Whether `path` is a directory right now. Never throws: a path that has
+ * gone missing, or was never reachable at all, is not this function's
+ * question to answer — the raw `cause` from the failed copy already does.
+ */
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function describeCause(cause: unknown): string {
@@ -275,12 +325,89 @@ function encodeNumber(address: string, value: number): string {
   return String(value);
 }
 
+/**
+ * The slot types whose widget accepts a bare, unquoted digit string as the
+ * number it spells — which is what preserves the exact-integer escape hatch
+ * above 2^53 (landmine #11: `comfy` reads argv text with Python's arbitrary-
+ * precision `int`, so a digit string round-trips exactly where a JS number
+ * cannot). Verified live against ComfyUI 0.29.0: an unquoted
+ * `18446744073709551615` against an INT slot (`3.seed`) applies exactly, and
+ * the same unquoted text against a FLOAT slot (`3.cfg=3.5`) applies too.
+ *
+ * Every other type — `STRING`, `COMBO`, `BOOLEAN`, and any custom node's own
+ * widget type this server does not recognise — has its string values
+ * JSON-quoted by {@link encodeString} instead. That is finding 1's fix:
+ * comfy-cli JSON-decodes the right-hand side of `ADDR=VALUE` before
+ * typechecking it (`comfy_cli/command/workflow.py:145-150`), so an unquoted
+ * `true`, `42`, `null` or `["a","b"]` silently stops being the string the
+ * caller wrote the moment it happens to parse as a JSON literal. STRING's own
+ * check is strict (`isinstance(value, str)`, so it at least fails loud) but
+ * COMBO accepts `str | int | float` and would silently retype instead —
+ * verified live: an unquoted `123` against a COMBO slot is applied as the
+ * Python **int** `123` (the warning names it bare, `123 not in ...`), while
+ * the quoted form is applied as the **string** `"123"` (the warning quotes
+ * it, `'123' not in ...`).
+ */
+const NUMERIC_SLOT_TYPES = new Set(["INT", "FLOAT"]);
+
+/**
+ * A string value as command-line text — quoted or raw depending on what the
+ * target slot's own type is known to be.
+ *
+ * `slotType` is `undefined` whenever the caller has not said what the slot
+ * holds — {@link ApplySlotsOptions.slotTypes} was not supplied, or this
+ * address is not in it — and in that case the value is sent exactly as this
+ * module always sent it: raw, unquoted, unescaped. Quoting cannot simply
+ * happen unconditionally: a digit string is the documented escape hatch for
+ * an exact integer above 2^53, and quoting it would turn `json.loads` back
+ * into a Python `str`, breaking the one case landmine #11 exists to keep
+ * working.
+ *
+ * When the type *is* known and is not one of {@link NUMERIC_SLOT_TYPES},
+ * quoting is unconditional — not gated on whether this particular value
+ * happens to look like JSON — because an ordinary sentence quotes to the same
+ * string it already was (verified live: `6.text="a plain sentence"` and
+ * `6.text=a plain sentence` both applied identically). There is no case where
+ * knowing the type produces a worse encoding than not knowing it, only cases
+ * where it fixes one that was silently wrong.
+ */
+function encodeString(value: string, slotType: string | undefined): string {
+  if (slotType !== undefined && !NUMERIC_SLOT_TYPES.has(slotType)) {
+    // JSON-quoted, not shell-quoted: this is one argv entry, not a shell
+    // command line, and `JSON.stringify` is exactly the inverse of the
+    // `json.loads` comfy-cli applies to it, so it is the one encoding
+    // guaranteed to decode back to this exact string.
+    return JSON.stringify(value);
+  }
+  return value;
+}
+
 /** One `ADDR=VALUE` positional, exactly as the CLI will receive it in argv. */
-function encodePair(address: string, value: SlotValue): string {
+function encodePair(address: string, value: SlotValue, slotType: string | undefined): string {
   if (address.trim() === "") {
     throw new SlotValueError(
       JSON.stringify(address),
       "a slot address is required; run describe_workflow to list them",
+    );
+  }
+  if (address.startsWith("-")) {
+    // Finding 2. `ADDR=VALUE` is one positional, but a token beginning with
+    // `-` is not read as one: the CLI's argument parser (Click, like any
+    // getopt-family parser) reads it as another flag instead. Verified live,
+    // twice: the address `--input` turned the pair `--input=<path>` into the
+    // CLI's own `--input <path>` option, replacing the live server as the
+    // schema source with a file of the caller's choosing — set-slot then
+    // validated (and would have applied) against attacker-controlled node
+    // definitions instead of the real ones. A real slot address is
+    // `<instance_id>.<name>` (e.g. "3.seed") and never starts with `-`, so
+    // this is refused before anything is spawned, the same way `=` already is.
+    throw new SlotValueError(
+      address,
+      "a slot address cannot start with `-`: the CLI's argument parser reads a token " +
+        "beginning with `-` as another flag rather than a positional ADDR=VALUE pair — verified " +
+        "live, an address of \"--input\" smuggled in a caller-chosen --input file that replaced " +
+        "the live server as the schema source. A real slot address is `<instance_id>.<name>` " +
+        "(e.g. \"3.seed\") and never starts with `-`.",
     );
   }
   if (address.includes("=")) {
@@ -293,11 +420,7 @@ function encodePair(address: string, value: SlotValue): string {
 
   switch (typeof value) {
     case "string":
-      // Raw, unquoted and unescaped. These are argv entries, not a shell
-      // command line, so quoting would put the quotes into the value — and
-      // JSON-quoting would break the string-of-digits escape hatch above by
-      // turning an exact integer into a string the node then rejects.
-      return `${address}=${value}`;
+      return `${address}=${encodeString(value, slotType)}`;
     case "number":
       return `${address}=${encodeNumber(address, value)}`;
     case "boolean":
@@ -412,7 +535,9 @@ export async function applySlots(
   // Encoded first, before a directory exists or a process is spawned, so a
   // caller's typo costs nothing and leaves nothing behind.
   const requested = Object.keys(inputs);
-  const pairs = requested.map((address) => encodePair(address, inputs[address] as SlotValue));
+  const pairs = requested.map((address) =>
+    encodePair(address, inputs[address] as SlotValue, opts.slotTypes?.[address]),
+  );
 
   const temp = makeTempDir();
   try {

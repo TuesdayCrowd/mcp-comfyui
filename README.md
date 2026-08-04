@@ -115,7 +115,7 @@ The same problem recurs on the way back: `comfy run --json` echoes the whole gra
 ## Development
 
 ```bash
-bun test                       # 371 tests
+bun test                       # full suite
 bun test tests/describe.test.ts
 bun run typecheck
 bun run build

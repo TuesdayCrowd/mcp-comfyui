@@ -37,8 +37,11 @@ src/workflows/
   describe.ts       slots × object_info -> JSON Schema   ← the value-add
   setSlots.ts       byte-copy + set-slot in place
   run.ts            comfy run --json, NDJSON decoded line by line
-src/config.ts       workflow roots
-src/server.ts       MCP tool registration (stdio)
+src/config.ts       workflow roots and env-var vocabulary
+src/index.ts        stdio entrypoint — the ONLY place that touches stdio
+src/server.ts       assembles the McpServer; delegates registration to tools.ts
+src/tools.ts        the MCP surface: every tool's schema, description, annotations
+src/toolResult.ts   throw -> classified tool result; the error-mapping table
 ```
 
 Dependency direction is one-way: `workflows/` may import `comfy/`, never the reverse.
@@ -86,7 +89,9 @@ A real run also confirmed three things previously known only from source: `conve
 ## Known gaps
 
 - **A detection probe that times out reads as `running: false`**, so a ComfyUI wedged mid-sampling could pass the launch guard onto a different port. Deliberate: treating timeouts as "refuse" would block every launch behind a flaky probe.
-- **One unreproduced transient test failure** was observed once at verified-pristine checksums and has not recurred across many runs.
+- **The oversized-message failure is mitigated, not eliminated.** The stdin buffer is raised to a measured 16 MiB and a transport error now reaches stderr, but the SDK closes the connection on overflow and that is not recoverable from `src/` without reimplementing its buffered line reader.
+
+**Fixed, recorded so it is not reintroduced:** the "unreproducible transient test failure" was a shared-temp-directory collision. `tmpdir()` is shared, bun runs test files concurrently, and three files swept every `mcp-comfyui-apply-*` directory — deleting siblings' live fixtures, and failing `setSlots.test.ts`'s six emptiness assertions. It never reproduced in isolation because running one file removes the other party. All three now diff against a `beforeEach` snapshot. **Never broaden one of those sweeps back to the whole prefix.**
 
 ## Artifact paths
 

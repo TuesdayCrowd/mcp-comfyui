@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -41,6 +42,31 @@ let workdir: string;
 let argvOut: string;
 let source: string;
 
+/**
+ * `tmpdir()` is shared across every concurrently-running test **file**, and
+ * `TEMP_PREFIX` names only which module made a directory (`setSlots.ts`), not
+ * which test run made it. Scanning the whole of `tmpdir()` for that prefix —
+ * as this file, `tests/run.test.ts` and `tests/server.test.ts` all did —
+ * therefore does not scope to "what this test leaked": it also matches a
+ * prepared copy a *sibling file* is using at that exact instant, under a
+ * concurrent `bun test`. Each file's own `afterEach` then deleted every
+ * match, reaping a directory another file was still reading mid-CLI-call —
+ * measured as the intermittent, previously-unreproducible failure this
+ * comment exists to explain. `run.test.ts` and `server.test.ts` are already
+ * scoped; this is the third and last.
+ *
+ * The fix is a snapshot: `preexistingTempDirs` is taken at the end of every
+ * `beforeEach`, so it holds whatever the rest of the suite already has in
+ * flight the moment this test starts, and {@link leakedTempDirs} reports only
+ * what is new since then — this test's own directories, and nothing a
+ * sibling file made before or during it.
+ */
+let preexistingTempDirs = new Set<string>();
+
+function snapshotTempDirs(): Set<string> {
+  return new Set(readdirSync(tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX)));
+}
+
 beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), "mcp-comfyui-setslots-"));
   argvOut = join(workdir, "argv");
@@ -52,6 +78,10 @@ beforeEach(() => {
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
   process.env.FAKE_COMFY_MODE = "set_slot";
+  // Last, so it captures anything a sibling file created while this file's
+  // own fixtures above were being set up, not just what existed before
+  // `beforeEach` began.
+  preexistingTempDirs = snapshotTempDirs();
 });
 
 afterEach(() => {
@@ -70,9 +100,14 @@ afterEach(() => {
   }
 });
 
-/** Temp directories this module created and did not clean up. */
+/**
+ * Temp directories THIS TEST created and did not clean up — never a sibling
+ * file's. See {@link preexistingTempDirs} for why the scoping matters.
+ */
 function leakedTempDirs(): string[] {
-  return readdirSync(tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX));
+  return readdirSync(tmpdir()).filter(
+    (name) => name.startsWith(TEMP_PREFIX) && !preexistingTempDirs.has(name),
+  );
 }
 
 /** The argv the fake was invoked with, flattened as the slots suite does. */
@@ -214,6 +249,29 @@ test("an unreadable workflow file is reported without guessing why", async () =>
   expect(err).toBeInstanceOf(WorkflowFileError);
   expect((err as WorkflowFileError).code).toBe("EACCES");
   expect((err as Error).message).toContain(unreadable);
+  expect(leakedTempDirs()).toEqual([]);
+});
+
+test("finding 3: a workflow path that is a directory is reported cleanly, whatever errno the platform used", async () => {
+  // Measured on this machine: Bun's copyFileSync throws ENOTSUP for a
+  // directory source (`ENOTSUP: operation not supported on socket, copyfile
+  // '<dir>' -> '<temp path>'`), not the EISDIR this class already mapped —
+  // and the raw message quotes the destination, i.e. exactly the UUID temp
+  // path WorkflowFileError exists to hide. The fix checks the filesystem fact
+  // directly rather than the OS's own errno spelling for it, so this holds
+  // regardless of which errno this platform happens to report.
+  const dir = join(workdir, "adir.json");
+  mkdirSync(dir);
+
+  const err = await rejection(applySlots(dir, { "3.steps": 7 }));
+
+  expect(err).toBeInstanceOf(WorkflowFileError);
+  expect((err as WorkflowFileError).code).toBe("EISDIR");
+  const message = (err as Error).message;
+  expect(message).toContain(dir); // the caller's own path
+  expect(message).toContain("directory");
+  expect(message).not.toContain(TEMP_PREFIX); // never the UUID temp path
+  expect(existsSync(argvOut)).toBe(false);
   expect(leakedTempDirs()).toEqual([]);
 });
 
@@ -373,6 +431,150 @@ test("a value that is not a string, number or boolean is refused", async () => {
   expect(existsSync(argvOut)).toBe(false);
 });
 
+// --- finding 1: a JSON-literal-shaped string stops being a string --------
+//
+// comfy-cli JSON-decodes the right-hand side of ADDR=VALUE before
+// typechecking it, so an unquoted "true"/"42"/"null"/"[...]" silently stops
+// being the string the caller wrote the moment it happens to parse as a JSON
+// literal. Every case below was verified against the live CLI on a copy of
+// default_image_gen.json before being written as a test — see the design
+// note above `NUMERIC_SLOT_TYPES` and `encodeString`.
+
+test("a STRING-typed slot quotes a value that looks like a JSON boolean", async () => {
+  const prepared = await applySlots(
+    source,
+    { "9.filename_prefix": "true" },
+    { slotTypes: { "9.filename_prefix": "STRING" } },
+  );
+  // Live: unquoted, this was rejected `expected STRING (string), got bool`.
+  expect(pairsSent(prepared)).toEqual(['9.filename_prefix="true"']);
+  prepared.dispose();
+});
+
+test("a STRING-typed slot quotes a value that looks like a JSON integer", async () => {
+  const prepared = await applySlots(
+    source,
+    { "9.filename_prefix": "42" },
+    { slotTypes: { "9.filename_prefix": "STRING" } },
+  );
+  // Live: unquoted, this was rejected `expected STRING (string), got int`.
+  expect(pairsSent(prepared)).toEqual(['9.filename_prefix="42"']);
+  prepared.dispose();
+});
+
+test("a STRING-typed slot quotes a value that looks like JSON null", async () => {
+  const prepared = await applySlots(
+    source,
+    { "9.filename_prefix": "null" },
+    { slotTypes: { "9.filename_prefix": "STRING" } },
+  );
+  // Live: unquoted, this was rejected `expected STRING (string), got NoneType`.
+  expect(pairsSent(prepared)).toEqual(['9.filename_prefix="null"']);
+  prepared.dispose();
+});
+
+test("a STRING-typed slot quotes a value that looks like a JSON array", async () => {
+  const prepared = await applySlots(
+    source,
+    { "9.filename_prefix": '["a","b"]' },
+    { slotTypes: { "9.filename_prefix": "STRING" } },
+  );
+  // Live: unquoted, this was rejected `expected STRING (string), got list`.
+  expect(pairsSent(prepared)).toEqual(['9.filename_prefix="[\\"a\\",\\"b\\"]"']);
+  prepared.dispose();
+});
+
+test("a STRING-typed slot quotes ordinary prose too, unconditionally", async () => {
+  // Quoting is decided by the type alone, not by whether this particular
+  // value happens to look like JSON: a plain sentence quotes to the same
+  // string it already was (verified live), so there is no ambiguity-gating
+  // inside `encodeString` itself — only in the caller that decides whether to
+  // spend the round trip to learn the type at all (see `tools.ts`).
+  const prepared = await applySlots(
+    source,
+    { "6.text": "a plain sentence" },
+    { slotTypes: { "6.text": "STRING" } },
+  );
+  expect(pairsSent(prepared)).toEqual(['6.text="a plain sentence"']);
+  prepared.dispose();
+});
+
+test("a COMBO-typed slot quotes a digit string, closing the silent-retype gap", async () => {
+  // The worse of the two bugs: COMBO accepts str|int|float, so an unquoted
+  // numeric-looking enum value is not rejected, it is silently retyped.
+  // Verified live: unquoted, the CLI's own warning named the value bare
+  // (`123 not in ...`, an int); quoted, it named it in quotes (`'123' not in
+  // ...`, a string) — proof the type actually changed.
+  const prepared = await applySlots(
+    source,
+    { "4.ckpt_name": "123" },
+    { slotTypes: { "4.ckpt_name": "COMBO" } },
+  );
+  expect(pairsSent(prepared)).toEqual(['4.ckpt_name="123"']);
+  prepared.dispose();
+});
+
+test("a BOOLEAN-typed slot quotes a string value rather than letting it become a bool", async () => {
+  const prepared = await applySlots(
+    source,
+    { "2.add_noise": "true" },
+    { slotTypes: { "2.add_noise": "BOOLEAN" } },
+  );
+  expect(pairsSent(prepared)).toEqual(['2.add_noise="true"']);
+  prepared.dispose();
+});
+
+test("an unrecognised custom widget type is treated as non-numeric and quoted", async () => {
+  // `type` is an open string (custom nodes declare their own); the only types
+  // exempted from quoting are the two enumerated numeric ones.
+  const prepared = await applySlots(
+    source,
+    { "9.filename_prefix": "42" },
+    { slotTypes: { "9.filename_prefix": "SOME_CUSTOM_WIDGET" } },
+  );
+  expect(pairsSent(prepared)).toEqual(['9.filename_prefix="42"']);
+  prepared.dispose();
+});
+
+test("an INT-typed slot leaves a digit string raw, preserving the seed escape hatch", async () => {
+  // The tension finding 1 names explicitly: this must keep working even
+  // though the STRING/COMBO cases above now quote. Verified live: unquoted
+  // `18446744073709551615` against an INT slot applies exactly.
+  const prepared = await applySlots(
+    source,
+    { "3.seed": HUGE_SEED },
+    { slotTypes: { "3.seed": "INT" } },
+  );
+  expect(pairsSent(prepared)).toEqual([`3.seed=${HUGE_SEED}`]);
+  prepared.dispose();
+});
+
+test("a FLOAT-typed slot leaves a digit string raw too", async () => {
+  // Verified live: unquoted `3.5` against a FLOAT slot (3.cfg) applies as the
+  // Python float it spells.
+  const prepared = await applySlots(source, { "3.cfg": "3.5" }, { slotTypes: { "3.cfg": "FLOAT" } });
+  expect(pairsSent(prepared)).toEqual(["3.cfg=3.5"]);
+  prepared.dispose();
+});
+
+test("an address absent from slotTypes falls back to the legacy unquoted behaviour", async () => {
+  // slotTypes is supplied, but does not mention this address — distinct from
+  // the option being omitted entirely, and must behave the same way: raw.
+  const prepared = await applySlots(
+    source,
+    { "9.filename_prefix": "true" },
+    { slotTypes: { "3.seed": "INT" } }, // a different address
+  );
+  expect(pairsSent(prepared)).toEqual(["9.filename_prefix=true"]);
+  prepared.dispose();
+});
+
+test("no slotTypes option at all is the same as an empty one: raw, as this module always sent it", async () => {
+  const prepared = await applySlots(source, { "9.filename_prefix": "true" });
+  expect(pairsSent(prepared)).toEqual(["9.filename_prefix=true"]);
+  prepared.dispose();
+});
+
 // --- address encoding ----------------------------------------------------
 
 test("an address containing = is refused, because the CLI would mis-split it", async () => {
@@ -391,6 +593,45 @@ test("a blank address is refused", async () => {
   const err = await rejection(applySlots(source, { "   ": 5 }));
   expect(err).toBeInstanceOf(SlotValueError);
   expect(existsSync(argvOut)).toBe(false);
+});
+
+// --- finding 2: leading-dash argument injection --------------------------
+
+test("an address starting with - is refused, mirroring the = guard", async () => {
+  // Reproduced live against the real CLI: applySlots(wf, {"97.ckpt_name":"x",
+  // "--input":"/tmp/evil_object_info.json"}) had the injected --input HONOURED
+  // — set-slot used the attacker's object_info instead of the live server's.
+  // `--input=<path>` is one ADDR=VALUE token, but a token beginning with `-`
+  // is read by the CLI's argument parser as another flag, not a positional.
+  const err = await rejection(
+    applySlots(source, { "97.ckpt_name": "x", "--input": "/tmp/evil_object_info.json" }),
+  );
+
+  expect(err).toBeInstanceOf(SlotValueError);
+  expect((err as Error).message).toContain("--input");
+  expect(existsSync(argvOut)).toBe(false); // refused before anything was spawned
+  expect(leakedTempDirs()).toEqual([]); // and before anything was created
+});
+
+test("a single-dash address is refused too", async () => {
+  const err = await rejection(applySlots(source, { "-x": 5 }));
+  expect(err).toBeInstanceOf(SlotValueError);
+  expect((err as Error).message).toContain("-x");
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("one poisoned address among otherwise-valid ones still refuses the whole call", async () => {
+  // Every pair is encoded before anything is spawned (see the comment above
+  // `applySlots`), so a caller cannot smuggle one bad address past a batch of
+  // good ones by hoping only the good ones get sent.
+  const err = await rejection(
+    applySlots(source, { "3.steps": 7, "6.text": "a cat", "--host": "evil.example" }),
+  );
+
+  expect(err).toBeInstanceOf(SlotValueError);
+  expect((err as Error).message).toContain("--host");
+  expect(existsSync(argvOut)).toBe(false);
+  expect(leakedTempDirs()).toEqual([]);
 });
 
 // --- what the CLI reported back -----------------------------------------

@@ -397,6 +397,76 @@ async function withObjectInfo(
   }
 }
 
+/**
+ * Whether a string value is one comfy-cli's own `_parse_value` could
+ * reinterpret as something other than a string (finding 1). `_parse_value`
+ * is `json.loads(raw)` with a fallback to the raw text on failure
+ * (`comfy_cli/command/workflow.py:145-150`), so exactly the values that
+ * `JSON.parse` here also accepts are the ones at risk: `"true"`, `"42"`,
+ * `"null"`, a JSON array or object spelled as text. Ordinary prose like `"a
+ * photo of a cat"` is not valid JSON on its own, so `JSON.parse` throws and
+ * this reports it as unambiguous — matching the CLI's own fallback exactly.
+ *
+ * This is a **gate**, not the fix itself: it decides whether it is worth
+ * asking the CLI what type the target slot actually is (see
+ * {@link resolveSlotTypes}) before spending that round trip. An ordinary
+ * caller passing ordinary values never pays for it.
+ */
+function looksLikeJsonLiteral(value: string): boolean {
+  try {
+    JSON.parse(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The type of every slot named in `inputs`, keyed by address — what
+ * `applySlots` needs to decide, per finding 1, whether a string value has to
+ * be JSON-quoted before it reaches `set-slot`. See
+ * `workflows/setSlots.ts`'s `ApplySlotsOptions.slotTypes` for what this
+ * changes and why it is safe to leave unresolved.
+ *
+ * Two things keep this cheap on the ordinary path, where it changes nothing
+ * observable about a call that was already correct:
+ *
+ * - **Skipped unless some value could actually be misread.** Fetching a
+ *   listing costs a live round trip nobody asked for when nothing in
+ *   `inputs` is ambiguous — see {@link looksLikeJsonLiteral} — which is the
+ *   overwhelmingly common case (a prompt's prose, a plain number, a native
+ *   boolean).
+ * - **Best-effort.** If the listing cannot be fetched or read, this falls
+ *   back to `{}` rather than failing the run: `applySlots` treats an address
+ *   missing from the map exactly as it always treated every address before
+ *   finding 1 was fixed, which is not a new failure mode, only a missed
+ *   improvement for this one call. The `set-slot` call right after this is
+ *   talking to the same server over the same file, so a listing failure here
+ *   is rarely survivable there either — the caller finds out regardless, from
+ *   the call that was always going to tell them.
+ *
+ * Exported for `tests/tools.test.ts`, which is the only place this module has
+ * unit tests below the level of a full tool call.
+ */
+export async function resolveSlotTypes(
+  workflowPath: string,
+  inputs: SlotInputs | undefined,
+  config: ToolConfig,
+): Promise<Record<string, string>> {
+  const values = Object.values(inputs ?? {});
+  const ambiguous = values.some((value) => typeof value === "string" && looksLikeJsonLiteral(value));
+  if (!ambiguous) return {};
+
+  try {
+    const listing = await listSlots(workflowPath, target(config));
+    const types: Record<string, string> = {};
+    for (const slot of listing.slots) types[slot.address] = slot.type;
+    return types;
+  } catch {
+    return {};
+  }
+}
+
 // --- input schemas -------------------------------------------------------
 
 const workflowArgument = z
@@ -410,6 +480,16 @@ const workflowArgument = z
 const promptIdArgument = z
   .string()
   .min(1)
+  // Finding 2. A prompt_id travels to `comfy jobs status`/`jobs cancel` as a
+  // bare positional, ahead of this server's own --host/--port; a value
+  // starting with `-` is read by the CLI's argument parser as another flag
+  // instead — verified live, it can override --host/--port outright (see
+  // `comfy/jobs.ts`'s `InvalidPromptIdError`, which is the guarantee this
+  // repeats here only to turn it into a clean schema error instead of a
+  // thrown one). A real prompt_id is a UUID and never starts with `-`.
+  .refine((id) => !id.startsWith("-"), {
+    message: "a prompt_id cannot start with `-`; it is a UUID returned by run_workflow or jobs ls",
+  })
   .describe("The `prompt_id` a run_workflow call returned.");
 
 /**
@@ -429,6 +509,17 @@ const promptIdArgument = z
  */
 const inputsArgument = z
   .record(z.string(), z.union([z.string(), z.number(), z.boolean()]))
+  // Finding 2. Each key becomes one ADDR=VALUE positional to `set-slot`;
+  // `workflows/setSlots.ts`'s `encodePair` refuses one starting with `-` for
+  // the same reason `promptIdArgument` above does — verified live, an
+  // address of "--input" smuggled in a caller-chosen --input file. Repeated
+  // here so a model gets a schema-validation error before anything is
+  // spawned, rather than the tool's own thrown one; `encodePair` remains the
+  // guarantee, since a direct caller of `applySlots` never goes through this
+  // schema at all.
+  .refine((record) => Object.keys(record).every((address) => !address.startsWith("-")), {
+    message: "a slot address cannot start with `-`; a real address is `<instance_id>.<name>`, e.g. \"3.seed\"",
+  })
   .describe(
     "Values to set, keyed by slot address — e.g. {\"3.seed\": 42, \"6.text\": \"a photo of a cat\"}. " +
       "Get the addresses and their constraints from describe_workflow; an address that workflow " +
@@ -627,11 +718,22 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // from the one that did the work.
         const { instance } = await ensureRunning(config);
 
+        // Finding 1. Resolved against the same server `set-slot` is about to
+        // use, not the offline `/object_info` cache: a run already requires a
+        // live one (see the comment above), and `type` comes from the
+        // workflow's own widget layout, which `workflow slots` reports no
+        // matter which schema source resolved it. See `resolveSlotTypes` for
+        // why this is skipped on the ordinary path.
+        const slotTypes = await resolveSlotTypes(resolved.path, inputs as SlotInputs | undefined, config);
+
         // A run needs a live server whatever happens, so `set-slot` is pointed
         // at the same server rather than at the offline cache: making the edit
         // work with ComfyUI down would buy a graph nothing could then submit.
         // describe_workflow is the opposite case, and does the opposite.
-        const prepared = await applySlots(resolved.path, (inputs ?? {}) as SlotInputs, target(config));
+        const prepared = await applySlots(resolved.path, (inputs ?? {}) as SlotInputs, {
+          ...target(config),
+          slotTypes,
+        });
         // Nothing may go between here and the call below. `runWorkflow` takes
         // ownership of the prepared copy and removes it in a `finally` on every
         // path, so it is the only owner — but only from the moment it is

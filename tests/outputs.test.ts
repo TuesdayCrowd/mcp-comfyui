@@ -128,6 +128,26 @@ test("a subfolder that climbs out of the root is refused even though the file ex
   ).toBeNull();
 });
 
+test("a subfolder resolving into a sibling directory that shares the root's name as a prefix is refused", async () => {
+  // Pins the `+ sep` half of `candidate.startsWith(base + sep)`. A root of
+  // `.../output` and a real sibling `.../output-secret` are a prefix match
+  // without it: `"output-secret".startsWith("output")` is true even though the
+  // directory is not inside `output` at all. Both `root` and the sibling are
+  // real, existing directories (the auditor's own trap: a relative or
+  // nonexistent root would fail on the existence check and never reach the
+  // containment check this test exists to pin).
+  const sibling = `${outputDir}-secret`;
+  mkdirSync(sibling, { recursive: true });
+  writeFileSync(join(sibling, "leak.png"), "not really a png");
+
+  expect(
+    resolveArtifactPath(
+      viewUrl({ filename: "leak.png", subfolder: "../output-secret", type: "output" }),
+      instance,
+    ),
+  ).toBeNull();
+});
+
 test("a type the instance has no root for resolves to nothing", async () => {
   // `temp` is a real ComfyUI directory that `/system_stats` never names, and an
   // unknown type is whatever a later ComfyUI adds. Both must decline rather

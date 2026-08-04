@@ -280,6 +280,43 @@ export interface JobError {
   details: unknown;
 }
 
+/**
+ * A `prompt_id` could not be used as one: it starts with `-`.
+ *
+ * Thrown before anything is spawned. A `prompt_id` travels as a bare CLI
+ * positional (`jobs status <prompt_id>`, `jobs cancel <prompt_id>`), placed by
+ * {@link jobsArgs} ahead of this module's own `--host`/`--port` — and a token
+ * beginning with `-` is not read as a positional by the CLI's argument
+ * parser, it is read as another flag. Verified live, twice: `jobs status
+ * --host` (this module's own construction for `getJobStatus("--host", {host:
+ * "127.0.0.1", port: 9})`) reported `"ComfyUI not running on --host:9"` — the
+ * caller's `"--host"` consumed this module's real `--host 127.0.0.1` as that
+ * flag's own value, and the real host and port never took effect. A real
+ * `prompt_id` is a UUID and never starts with `-`.
+ */
+export class InvalidPromptIdError extends Error {
+  override readonly name = "InvalidPromptIdError";
+  readonly promptId: string;
+
+  constructor(promptId: string) {
+    super(
+      `cannot use ${JSON.stringify(promptId)} as a prompt_id: it starts with \`-\`, which the ` +
+        `CLI's argument parser reads as another flag rather than the job id — verified live, this ` +
+        `can override --host/--port instead of naming a job. A real prompt_id is a UUID and never ` +
+        `starts with \`-\`; get one from run_workflow or jobs ls.`,
+    );
+    this.promptId = promptId;
+  }
+}
+
+/**
+ * Refuse a `prompt_id` before it is spawned as a CLI positional. See
+ * {@link InvalidPromptIdError}.
+ */
+function validatePromptId(promptId: string): void {
+  if (promptId.startsWith("-")) throw new InvalidPromptIdError(promptId);
+}
+
 /** Flatten a thrown CLI error into something that survives serialisation. */
 function toJobError(err: ComfyCliError): JobError {
   return {
@@ -375,8 +412,11 @@ function usableWorkflowPath(path: string | null | undefined): string | null {
  * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
  * @throws {TypeError} `host` was given as an empty string, which would build
  * `http://:8188/` and be reported as an unreachable server.
+ * @throws {InvalidPromptIdError} `promptId` starts with `-` and would be read
+ * as a flag rather than a positional — see {@link InvalidPromptIdError}.
  */
 export async function getJobStatus(promptId: string, opts: JobsOptions = {}): Promise<JobStatus> {
+  validatePromptId(promptId);
   const data = await runComfy(jobsArgs("status", [promptId], opts), { timeoutMs: opts.timeoutMs });
 
   const result = JobStatusPayloadSchema.safeParse(data);
@@ -485,8 +525,14 @@ async function probeStatus(promptId: string, opts: JobsOptions): Promise<JobStat
  * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
  * @throws {TypeError} `host` was given as an empty string, which would build
  * `http://:8188/` and be reported as an unreachable server.
+ * @throws {InvalidPromptIdError} `promptId` starts with `-` and would be read
+ * as a flag rather than a positional — see {@link InvalidPromptIdError}.
+ * Checked here too, not only transitively through {@link getJobStatus}: this
+ * function's own second CLI call (`jobs cancel`) takes the same positional,
+ * and the guard must not depend on the probe running first.
  */
 export async function cancelJob(promptId: string, opts: JobsOptions = {}): Promise<CancelResult> {
+  validatePromptId(promptId);
   const observed = await probeStatus(promptId, opts);
   if (observed !== null && observed.terminal) {
     return { outcome: "already_finished", promptId, previousStatus: observed.status };

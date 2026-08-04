@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -34,6 +34,30 @@ const FIXTURES = join(import.meta.dir, "fixtures");
 const FAKE_COMFY = join(FIXTURES, "fake-comfy-dispatch");
 const OBJECT_INFO_SAMPLE = join(FIXTURES, "object_info.sample.json");
 const SLOTS_SAMPLE = join(FIXTURES, "slots.default_image_gen.json");
+
+const REPO_ROOT = join(import.meta.dir, "..");
+/** The compiled, standalone executable a real MCP client actually runs. */
+const DIST_BINARY = join(REPO_ROOT, "dist", "mcp-comfyui");
+
+/**
+ * Build the real `dist/mcp-comfyui` fresh, so Finding 1's tests exercise the
+ * exact artifact a user runs rather than `bun src/index.ts` — this is the
+ * binary the original repro (an ~11.5MB `tools/call` line over real stdio)
+ * was driven against, and `bun build --compile` is fast enough (roughly
+ * 100ms for this project) that rebuilding it here costs nothing meaningful.
+ */
+async function buildDist(): Promise<void> {
+  const build = Bun.spawn(["bun", "build", "src/index.ts", "--compile", "--outfile", "dist/mcp-comfyui"], {
+    cwd: REPO_ROOT,
+    env: process.env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const exitCode = await build.exited;
+  if (exitCode !== 0) {
+    throw new Error(`bun build failed with exit code ${exitCode}: ${await new Response(build.stderr).text()}`);
+  }
+}
 
 /** How `workflows/setSlots.ts` names the temp directories it creates. */
 const TEMP_PREFIX = "mcp-comfyui-apply-";
@@ -116,6 +140,7 @@ beforeEach(() => {
   // `nothingRunning()`; tests about starting one turn auto-launch back on.
   serveInstance();
   process.env.MCP_COMFYUI_AUTO_LAUNCH = "0";
+  preexistingTempDirs = prepareTempDirs();
 });
 
 afterEach(async () => {
@@ -126,9 +151,26 @@ afterEach(async () => {
   for (const name of leakedTempDirs()) rmSync(join(tmpdir(), name), { recursive: true, force: true });
 });
 
-/** Temp directories the prepare step created and nobody cleaned up. */
+/** Prepare-step temp directories that existed before this test began. */
+let preexistingTempDirs = new Set<string>();
+
+function prepareTempDirs(): Set<string> {
+  return new Set(readdirSync(tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX)));
+}
+
+/**
+ * Temp directories THIS test created and nobody cleaned up.
+ *
+ * Scoped to the difference against a snapshot taken in `beforeEach`, never the
+ * whole prefix: `tmpdir()` is shared, bun runs test files concurrently, and
+ * `tests/setSlots.test.ts` creates directories under the same prefix. Reaping
+ * every match deleted another file's live fixtures mid-test, which showed up as
+ * a transient ENOENT that never reproduced when either file was run alone.
+ */
 function leakedTempDirs(): string[] {
-  return readdirSync(tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX));
+  return readdirSync(tmpdir()).filter(
+    (name) => name.startsWith(TEMP_PREFIX) && !preexistingTempDirs.has(name),
+  );
 }
 
 function portOf(bound: TestServer): number {
@@ -1345,6 +1387,210 @@ async function readUntil(
   }
   return text;
 }
+
+/**
+ * Like {@link readUntil}, but never blocks past `timeoutMs` even when a
+ * single `reader.read()` call itself would hang forever — which is exactly
+ * what "no response ever arrives" (Finding 1's overflow case) looks like from
+ * this side. `readUntil` only re-checks its deadline *between* reads, so it
+ * cannot be used to prove a negative; this races every read against the
+ * remaining budget instead.
+ */
+async function readUntilSafely(
+  stream: ReadableStream<Uint8Array>,
+  count: number,
+  timeoutMs: number,
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+  const timedOut = Symbol("timed-out");
+  let text = "";
+  try {
+    while (text.split("\n").filter((line) => line.trim() !== "").length < count) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(`the server produced only ${JSON.stringify(text)} within ${timeoutMs}ms`);
+      }
+      const outcome = await Promise.race([reader.read(), Bun.sleep(remaining).then(() => timedOut)]);
+      if (typeof outcome === "symbol") continue; // let the loop re-check the deadline
+      const { done, value } = outcome;
+      if (done) {
+        // The stream closed with fewer than `count` lines produced: no more
+        // are coming, ever, which is exactly what a transport that died
+        // mid-response looks like from this side. That is a failure to
+        // report, not a silent partial success.
+        throw new Error(`the stream closed after only ${JSON.stringify(text)} (wanted ${count} lines)`);
+      }
+      if (value) text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return text;
+}
+
+/** Whatever a stream produces within `timeoutMs`. Never throws, on a timeout or on closing. */
+async function readFor(stream: ReadableStream<Uint8Array>, timeoutMs: number): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const deadline = Date.now() + timeoutMs;
+  const timedOut = Symbol("timed-out");
+  let text = "";
+  try {
+    while (true) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const outcome = await Promise.race([reader.read(), Bun.sleep(remaining).then(() => timedOut)]);
+      if (typeof outcome === "symbol") break;
+      const { done, value } = outcome;
+      if (done) break;
+      if (value) text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return text;
+}
+
+/**
+ * A `tools/call` line, padded with a `prompt_id` filler so its total byte
+ * length (line + trailing newline) is exactly `totalBytes`. `get_job`'s
+ * `prompt_id` is schema-checked only for "non-empty string", so an oversized
+ * one is a well-formed, schema-valid request — the payload is *large*, not
+ * malformed, which is exactly Finding 1's "(a) legitimate" case.
+ */
+function paddedToolCallLine(id: number, totalBytes: number): string {
+  const skeleton = {
+    jsonrpc: "2.0",
+    id,
+    method: "tools/call",
+    params: { name: "get_job", arguments: { prompt_id: "" } },
+  };
+  const overhead = Buffer.byteLength(JSON.stringify(skeleton), "utf8") + 1; // +1 for the trailing \n
+  const padding = "x".repeat(Math.max(0, totalBytes - overhead));
+  skeleton.params.arguments.prompt_id = padding;
+  return `${JSON.stringify(skeleton)}\n`;
+}
+
+const INITIALIZE_LINE = `${JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "initialize",
+  params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "raw", version: "0.0.0" } },
+})}\n${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`;
+
+// --- Finding 1: an oversized message must not kill the server silently ----
+
+beforeAll(async () => {
+  await buildDist();
+});
+
+test("a legitimate large payload does not kill the server", async () => {
+  // The original repro was ~11.5MB and the SDK's own default buffer is 10MB;
+  // this line is deliberately sized in between, and well under this server's
+  // own MAX_BUFFER_SIZE. Driven against the real compiled binary, since that
+  // is what was actually observed dying silently.
+  process.env.FAKE_COMFY_MODE = "fail_code";
+  process.env.FAKE_COMFY_JOBS_MODE = "fail_code";
+  process.env.FAKE_COMFY_ERROR_CODE = "server_not_running";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "no server";
+
+  const child = Bun.spawn([DIST_BINARY], { env: process.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const followUp = `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} })}\n`;
+
+  child.stdin.write(INITIALIZE_LINE);
+  child.stdin.write(paddedToolCallLine(2, 11_500_000));
+  child.stdin.write(followUp);
+  await child.stdin.flush();
+
+  const stdout = await readUntilSafely(child.stdout, 3, 20_000);
+  child.kill("SIGKILL");
+  child.stdout.cancel();
+  child.stderr.cancel();
+  await child.exited;
+
+  const lines = stdout.split("\n").filter((line) => line.trim() !== "");
+  const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  const byId = new Map(messages.filter((m) => m["id"] !== undefined).map((m) => [m["id"], m]));
+
+  expect(byId.get(1)).toHaveProperty("result"); // initialize succeeded
+  expect(byId.get(2)).toBeDefined(); // the 11.5MB request got a real response
+  expect(byId.get(3)).toHaveProperty("result"); // and the connection survived to serve a follow-up
+});
+
+test("a payload beyond the buffer limit is reported on stderr rather than dying silently", async () => {
+  // Sized comfortably above MAX_BUFFER_SIZE. The SDK's own ReadBuffer.append()
+  // (dist/esm/shared/stdio.js) still throws and closes the transport on
+  // overflow — that part cannot be made recoverable without wrapping the
+  // transport (see the report) — but the failure must now be visible.
+  const child = Bun.spawn([DIST_BINARY], {
+    env: { ...process.env, COMFY_BIN: FAKE_COMFY },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  child.stdin.write(INITIALIZE_LINE);
+  await child.stdin.flush();
+  await readUntilSafely(child.stdout, 1, 5_000); // the initialize response
+
+  child.stdin.write(paddedToolCallLine(2, 20_000_000));
+  await child.stdin.flush();
+
+  // No response for the oversized request ever arrives.
+  await expect(readUntilSafely(child.stdout, 2, 4_000)).rejects.toThrow();
+
+  const stderr = await readFor(child.stderr, 1_000);
+  child.kill("SIGKILL");
+  child.stdout.cancel();
+  child.stderr.cancel();
+  await child.exited;
+
+  expect(stderr.trim()).not.toBe("");
+});
+
+// --- Finding 2: a malformed tools/call must not read as a server bug ------
+
+test("a malformed tools/call is refused as an invalid request, not reported as an internal error", async () => {
+  const child = Bun.spawn([DIST_BINARY], {
+    env: { ...process.env, COMFY_BIN: FAKE_COMFY },
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const malformed = [
+    { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_workflows", arguments: null } },
+    { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_workflows", arguments: [] } },
+    { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "list_workflows", arguments: 42 } },
+    { jsonrpc: "2.0", id: 5, method: "tools/call", params: { arguments: {} } }, // missing name
+    { jsonrpc: "2.0", id: 6, method: "tools/call" }, // omitted params
+  ];
+  child.stdin.write(INITIALIZE_LINE);
+  child.stdin.write(malformed.map((request) => `${JSON.stringify(request)}\n`).join(""));
+  await child.stdin.flush();
+
+  const stdout = await readUntilSafely(child.stdout, 1 + malformed.length, 10_000);
+  child.kill("SIGKILL");
+  child.stdout.cancel();
+  child.stderr.cancel();
+  await child.exited;
+
+  const lines = stdout.split("\n").filter((line) => line.trim() !== "");
+  const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  const byId = new Map(messages.filter((m) => m["id"] !== undefined).map((m) => [m["id"], m]));
+
+  for (const { id } of malformed) {
+    const response = byId.get(id) as { error?: { code: number; message: string } } | undefined;
+    expect(response?.error).toBeDefined();
+    // -32602 (Invalid params): the caller's request was wrong. Not -32603
+    // (Internal error), which is a claim that this server has a bug.
+    expect(response?.error?.code).toBe(-32602);
+    expect(response?.error?.message).not.toContain('"code": "invalid_type"');
+    expect(response?.error?.message.length ?? 0).toBeGreaterThan(0);
+  }
+});
 
 // --- auto-launch ---------------------------------------------------------
 

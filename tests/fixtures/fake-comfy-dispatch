@@ -9,6 +9,10 @@
 #   $FAKE_COMFY_SET_SLOT_MODE  mode for a `workflow set-slot` call (default: set_slot)
 #   $FAKE_COMFY_RUN_MODE       mode for a `run` call (default: run_stream)
 #   $FAKE_COMFY_JOBS_MODE      mode for a `jobs` call (default: jobs)
+#   $FAKE_COMFY_SLOTS_MODE     mode for a `workflow slots` call (default: none —
+#                              see below, this one is opt-in rather than
+#                              defaulted, to keep every test written before
+#                              `run_workflow` could make this call unchanged)
 #   $FAKE_COMFY_DISPATCH_LOG   file every invocation's argv is APPENDED to. The
 #                              fixture's own $FAKE_COMFY_ARGV_OUT is overwritten
 #                              per call and so only ever holds the last of the
@@ -24,6 +28,15 @@ for arg in "$@"; do
     set-slot) FAKE_COMFY_MODE="${FAKE_COMFY_SET_SLOT_MODE:-set_slot}"; break ;;
     run)      FAKE_COMFY_MODE="${FAKE_COMFY_RUN_MODE:-run_stream}"; break ;;
     jobs)     FAKE_COMFY_MODE="${FAKE_COMFY_JOBS_MODE:-jobs}"; break ;;
+    # `run_workflow` (finding 1) can make a `workflow slots` call ahead of its
+    # `set-slot` one. Unlike the three above, this has no default mode of its
+    # own: every test written before that call existed relies on "slots" NOT
+    # matching here, so that it falls through to whatever $FAKE_COMFY_MODE the
+    # test already armed (typically `data_file` via `serveSlots()`). Only a
+    # test that explicitly sets $FAKE_COMFY_SLOTS_MODE gets a distinct answer
+    # for it; every other test's behaviour is exactly what it was before this
+    # case existed.
+    slots) [ -n "$FAKE_COMFY_SLOTS_MODE" ] && FAKE_COMFY_MODE="$FAKE_COMFY_SLOTS_MODE"; break ;;
   esac
 done
 export FAKE_COMFY_MODE

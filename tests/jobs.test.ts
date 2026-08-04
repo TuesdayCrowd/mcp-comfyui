@@ -3,7 +3,13 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ComfyCliError } from "../src/comfy/exec";
-import { JobPayloadError, cancelJob, getJobStatus, listJobs } from "../src/comfy/jobs";
+import {
+  InvalidPromptIdError,
+  JobPayloadError,
+  cancelJob,
+  getJobStatus,
+  listJobs,
+} from "../src/comfy/jobs";
 
 /**
  * No test in this file may invoke a real `comfy`, reach a real ComfyUI, or
@@ -259,6 +265,28 @@ test("a payload that is not a job status is refused with the payload quoted", as
   expect(message).toContain(`{"host":"127.0.0.1","port":8188}`);
 });
 
+// --- finding 2: leading-dash argument injection ---------------------------
+
+test("a prompt_id starting with - is refused before anything is spawned", async () => {
+  // Reproduced live against the real CLI: getJobStatus("--host", {host:
+  // "127.0.0.1", port: 9}) answered `"ComfyUI not running on --host:9"` — the
+  // caller's own "--host" positional was read by the CLI's argument parser as
+  // the --host FLAG, consuming this module's real `--host 127.0.0.1` as that
+  // flag's value, so our intended target never took effect.
+  const err = await rejection(getJobStatus("--host", { host: "127.0.0.1", port: 9 }));
+
+  expect(err).toBeInstanceOf(InvalidPromptIdError);
+  expect((err as InvalidPromptIdError).promptId).toBe("--host");
+  expect((err as Error).message).toContain("--host");
+  expect(existsSync(argvOut)).toBe(false); // refused before anything was spawned
+});
+
+test("a single-dash prompt_id is refused too", async () => {
+  const err = await rejection(getJobStatus("-x"));
+  expect(err).toBeInstanceOf(InvalidPromptIdError);
+  expect(existsSync(argvOut)).toBe(false);
+});
+
 // --- the status registry is append-only ----------------------------------
 
 test("a status nobody has published parses, and counts as still running", async () => {
@@ -505,6 +533,20 @@ test("a cancel payload that is not a cancel payload is refused", async () => {
 
   expect(err).toBeInstanceOf(JobPayloadError);
   expect((err as Error).message).toContain("prompt_id");
+});
+
+test("cancelJob refuses a leading-dash prompt_id before the probe or the cancel run", async () => {
+  // Checked independently of getJobStatus's own guard: cancelJob makes a
+  // SECOND call (`jobs cancel <prompt_id>`) with the same positional, and the
+  // guard must not depend on the probe running first.
+  serve("status", runningStatus());
+  serve("cancel", cancelled());
+
+  const err = await rejection(cancelJob("--port"));
+
+  expect(err).toBeInstanceOf(InvalidPromptIdError);
+  expect(existsSync(argvOut)).toBe(false);
+  expect(subcommands()).toEqual([]); // neither the probe nor the cancel ran
 });
 
 // --- the invocation -------------------------------------------------------

@@ -47,6 +47,7 @@ beforeEach(() => {
   writeFileSync(source, `{"nodes":[{"id":3,"type":"KSampler"}],"links":[]}`);
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
+  preexistingTempDirs = snapshotTempDirs();
 });
 
 afterEach(() => {
@@ -63,9 +64,26 @@ afterEach(() => {
   }
 });
 
-/** Temp directories the prepare step created and nobody cleaned up. */
+/** Prepare-step temp directories that existed before this test began. */
+let preexistingTempDirs = new Set<string>();
+
+function snapshotTempDirs(): Set<string> {
+  return new Set(readdirSync(tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX)));
+}
+
+/**
+ * Temp directories THIS test created and nobody cleaned up.
+ *
+ * Scoped against a `beforeEach` snapshot rather than sweeping the whole prefix:
+ * `tmpdir()` is shared, bun runs test files concurrently, and two other test
+ * files create directories under this same prefix. An unscoped sweep deletes a
+ * sibling file's live fixtures mid-test, which surfaces as a transient ENOENT
+ * that never reproduces when either file is run alone.
+ */
 function leakedTempDirs(): string[] {
-  return readdirSync(tmpdir()).filter((name) => name.startsWith(TEMP_PREFIX));
+  return readdirSync(tmpdir()).filter(
+    (name) => name.startsWith(TEMP_PREFIX) && !preexistingTempDirs.has(name),
+  );
 }
 
 /** The argv the fake was invoked with, flattened as the sibling suites do. */
