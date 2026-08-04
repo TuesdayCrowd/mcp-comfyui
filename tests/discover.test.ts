@@ -65,6 +65,31 @@ function names(listing: WorkflowListing): string[] {
   return listing.workflows.map((w) => w.name);
 }
 
+test("a JSON Schema that describes class_type is not a workflow", async () => {
+  // Found in live use: comfy-cli's own published run_event.json has
+  // `properties.class_type = {"type": ["string","null"]}`, and a rule that only
+  // checked the key's presence classified it `api` with one node — offering a
+  // schema document to a caller as something runnable. In a real API node
+  // `class_type` is the node's class NAME, so it is always a string.
+  const root = mkdtempSync(join(tmpdir(), "mcp-comfyui-discover-schema-"));
+  try {
+    writeFileSync(
+      join(root, "schema.json"),
+      JSON.stringify({
+        $schema: "https://json-schema.org/draft/2020-12/schema",
+        type: "object",
+        properties: { class_type: { type: ["string", "null"] } },
+      }),
+    );
+    const listing = await discoverWorkflows({ roots: [root] });
+    expect(listing.workflows).toHaveLength(1);
+    expect(listing.workflows[0]?.format).toBe("invalid");
+    expect(listing.workflows[0]?.node_count).toBeNull();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function byName(listing: WorkflowListing, name: string): WorkflowFile {
   const found = listing.workflows.find((w) => w.name === name);
   if (found === undefined) throw new Error(`no workflow named ${name} in ${names(listing)}`);

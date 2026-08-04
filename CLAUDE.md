@@ -59,7 +59,7 @@ These are not style preferences. Each was measured, and each has a test pinning 
 
 **6. Never launch a second ComfyUI.** Detect first, on both the detection target and the address the startup args name.
 
-The full list of 14 verified landmines — each with the measurement behind it — is in `IMPLEMENTATION_PLAN.md` under "Verified Ground Truth". **Read it before changing anything that touches the CLI.**
+The full list of 14 verified landmines — each with the measurement behind it — is in [`docs/comfy-cli-ground-truth.md`](docs/comfy-cli-ground-truth.md). **Read it before changing anything that touches the CLI.** Several were found only after the bug they caused; none is inferred.
 
 ## Testing
 

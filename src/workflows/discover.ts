@@ -208,12 +208,18 @@ function invalid(problem: string): Classification {
  * Counts only the values that actually carry `class_type`, because an API export
  * may hold non-node keys beside the graph — reporting those as nodes would
  * inflate the count with metadata.
+ *
+ * `class_type` must be a **string**: in a real API node it is the node's class
+ * name. Merely testing that the key exists misreads any JSON Schema that
+ * *describes* a `class_type` property as a workflow — comfy-cli's own published
+ * `run_event.json` has `properties.class_type = {"type": ["string","null"]}` and
+ * was classified `api` with one node until this check was tightened.
  */
 function apiNodeCount(graph: Record<string, unknown>): number | undefined {
   let count = 0;
   for (const value of Object.values(graph)) {
     const node = asRecord(value);
-    if (node !== undefined && Object.hasOwn(node, "class_type")) count += 1;
+    if (node !== undefined && typeof node["class_type"] === "string") count += 1;
   }
   return count > 0 ? count : undefined;
 }

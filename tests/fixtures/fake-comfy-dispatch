@@ -1,0 +1,31 @@
+#!/bin/sh
+# A front end for `fake-comfy` that picks the mode from the subcommand.
+#
+# `run_workflow` makes two CLI calls for one tool call — `workflow set-slot` and
+# then `run` — and $FAKE_COMFY_MODE can only name one of them. Rather than teach
+# the fixture a mode that dispatches, this wrapper chooses the mode and execs it,
+# so every existing mode keeps behaving exactly as it did.
+#
+#   $FAKE_COMFY_SET_SLOT_MODE  mode for a `workflow set-slot` call (default: set_slot)
+#   $FAKE_COMFY_RUN_MODE       mode for a `run` call (default: run_stream)
+#   $FAKE_COMFY_JOBS_MODE      mode for a `jobs` call (default: jobs)
+#   $FAKE_COMFY_DISPATCH_LOG   file every invocation's argv is APPENDED to. The
+#                              fixture's own $FAKE_COMFY_ARGV_OUT is overwritten
+#                              per call and so only ever holds the last of the
+#                              two, which is never the `set-slot` one.
+#
+# Anything else falls through to whatever $FAKE_COMFY_MODE already said, so a
+# test that only exercises one command can still arm the fixture directly.
+
+[ -n "$FAKE_COMFY_DISPATCH_LOG" ] && printf '%s\n' "$*" >> "$FAKE_COMFY_DISPATCH_LOG"
+
+for arg in "$@"; do
+  case "$arg" in
+    set-slot) FAKE_COMFY_MODE="${FAKE_COMFY_SET_SLOT_MODE:-set_slot}"; break ;;
+    run)      FAKE_COMFY_MODE="${FAKE_COMFY_RUN_MODE:-run_stream}"; break ;;
+    jobs)     FAKE_COMFY_MODE="${FAKE_COMFY_JOBS_MODE:-jobs}"; break ;;
+  esac
+done
+export FAKE_COMFY_MODE
+
+exec "$(dirname "$0")/fake-comfy" "$@"
