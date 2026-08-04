@@ -85,6 +85,13 @@ A real run also confirmed three things previously known only from source: `conve
 
 ## Known gaps
 
-- **Outputs come back as `/view?…` URLs rather than filesystem paths** when comfy has no resolvable workspace, which is the default state on a Desktop-only machine. The file is on disk; comfy just can't name it. `classifyOutputs` returns both forms distinctly, so callers can tell. Setting `MCP_COMFYUI_WORKSPACE` likely changes this — untested.
 - **A detection probe that times out reads as `running: false`**, so a ComfyUI wedged mid-sampling could pass the launch guard onto a different port. Deliberate: treating timeouts as "refuse" would block every launch behind a flaky probe.
 - **One unreproduced transient test failure** was observed once at verified-pristine checksums and has not recurred across many runs.
+
+## Artifact paths
+
+`comfy run` reports artifacts as `/view?…` URLs, and **`MCP_COMFYUI_WORKSPACE` does not change that** — tested: `comfy --workspace <install> run … --wait --json` still returns URLs. `execution.py:352-371` emits a path only when the file sits under the *workspace's own* `output/` dir, and a Desktop instance writes to its own configured directory instead. Two genuinely different places; no workspace setting fixes it. Anything documenting otherwise is wrong.
+
+`src/comfy/outputs.ts` resolves them instead, using the running instance's actual `outputDirectory` (which `detectInstance` parses from `system.argv`) — better than comfy-cli's workspace guess, because it uses the configuration of the instance that really ran the job. Wired in at the tool layer, since `run.ts`/`jobs.ts` have no instance.
+
+The wire shape is `outputs: {files, urls, local_paths}`. Every artifact appears exactly once in `files` or `urls`; `local_paths` maps a URL to an absolute path **that existed when the answer was built**, and a missing key means there is no local path. Absence is structural, not inferred. Resolution requires the file to exist and refuses a `subfolder` that climbs out of its root — a fabricated path is worse than none.

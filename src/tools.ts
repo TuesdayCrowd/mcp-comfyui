@@ -10,6 +10,11 @@ import {
 } from "./comfy/instance.ts";
 import { cancelJob, getJobStatus, type CancelResult, type JobStatus } from "./comfy/jobs.ts";
 import {
+  resolveArtifactPaths,
+  type ArtifactLocation,
+  type ClassifiedOutputs,
+} from "./comfy/outputs.ts";
+import {
   getObjectInfo,
   objectInfoCachePath,
   ObjectInfoFetchError,
@@ -231,14 +236,78 @@ function instanceBody(instance: RunningInstance): Record<string, unknown> {
   };
 }
 
-function jobBody(job: JobStatus): Record<string, unknown> {
+/**
+ * A run's artifacts, in the three ways a caller can reach them.
+ *
+ * ```json
+ * "outputs": {
+ *   "files": ["/Users/me/ComfyUI-Shared/output/a.png"],
+ *   "urls":  ["http://127.0.0.1:8188/view?filename=b.png&subfolder=&type=output"],
+ *   "local_paths": {
+ *     "http://127.0.0.1:8188/view?filename=b.png&subfolder=&type=output":
+ *       "/Users/me/ComfyUI-Shared/output/b.png"
+ *   }
+ * }
+ * ```
+ *
+ * **What to read.** Every artifact appears exactly once in `files` or in
+ * `urls`. `files` are already local. For a URL, look it up in `local_paths`:
+ * the value is an absolute path to a file that existed when this answer was
+ * built, and **no key means there is no local path** — the URL has to be
+ * fetched. There is no third state to infer.
+ *
+ * **Why a map beside the two lists rather than a merged one.** The resolved
+ * path is a *second name* for an artifact already listed in `urls`, not another
+ * artifact. Appending it to `files` would make the same image appear twice, so
+ * a caller counting artifacts would over-count and a caller asking "is there a
+ * local path for *this* URL" would be left matching basenames — guessing.
+ * Replacing the URL would be worse: this server may answer a client on another
+ * machine, for which the path is useless and the URL was the only way in.
+ * Keeping `files`/`urls` exactly as they were also keeps one vocabulary between
+ * this wire shape and `ClassifiedOutputs`, which `workflows/run.ts` and
+ * `comfy/jobs.ts` both return and which no caller should have to translate.
+ *
+ * `local_paths` is always present, empty when nothing resolved: an absent key
+ * would be indistinguishable from a server too old to have looked.
+ */
+function outputsBody(
+  outputs: ClassifiedOutputs,
+  instance: ArtifactLocation | null,
+): Record<string, unknown> {
+  return {
+    files: outputs.files,
+    urls: outputs.urls,
+    local_paths: instance === null ? {} : resolveArtifactPaths(outputs.urls, instance),
+  };
+}
+
+/**
+ * The instance whose directories can turn a job's `/view` URLs into paths, or
+ * `null` if there is none to ask.
+ *
+ * A **probe**, never a launch, and only when there is something to resolve.
+ * `get_job` must not start a ComfyUI — see {@link ensureRunning} — and a freshly
+ * started one would be the wrong instance anyway: it neither knows the job nor
+ * wrote the file. An unreachable server therefore costs the caller nothing but
+ * the paths it could not have had.
+ */
+async function resolvingInstance(
+  urls: readonly string[],
+  config: ToolConfig,
+): Promise<ArtifactLocation | null> {
+  if (urls.length === 0) return null;
+  const detection = await detectInstance(target(config));
+  return detection.running ? detection : null;
+}
+
+function jobBody(job: JobStatus, instance: ArtifactLocation | null): Record<string, unknown> {
   return {
     prompt_id: job.promptId,
     status: job.status,
     terminal: job.terminal,
     queue_position: job.queuePosition,
     workflow_size: job.workflowSize,
-    outputs: job.outputs,
+    outputs: outputsBody(job.outputs, instance),
     error: job.error,
     host: job.host,
     port: job.port,
@@ -273,6 +342,7 @@ function runBody(
   applied: string[],
   setSlotWarnings: Array<Record<string, unknown>>,
   run: WorkflowRun,
+  instance: ArtifactLocation,
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
     workflow: { name: workflow.name, path: workflow.path },
@@ -280,7 +350,7 @@ function runBody(
     terminal: run.terminal,
     prompt_id: run.promptId,
     applied,
-    outputs: run.outputs,
+    outputs: outputsBody(run.outputs, instance),
     warnings: [
       ...setSlotWarnings.map((warning) => ({ source: "set_slot", ...warning })),
       ...run.warnings.map((warning) => ({ source: "run", ...warning })),
@@ -496,7 +566,11 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "`wait: true` to block until the run finishes and get the output paths back directly, " +
         "which suits a short image render and not a long video one. A `wait: true` run that " +
         "outlasts its budget is not lost — the error names the `prompt_id`, and the run carries " +
-        "on inside ComfyUI." +
+        "on inside ComfyUI. " +
+        "To open a finished artifact: `outputs.files` are already paths on this machine, and " +
+        "`outputs.local_paths` maps each URL in `outputs.urls` to the file it names here, where " +
+        "that file exists. A URL missing from `local_paths` has no local path and must be " +
+        "fetched." +
         (config.autoLaunch
           ? " If ComfyUI is not running this will start ComfyUI first, so the first call after a " +
             "cold machine can take a minute or two before the run is even submitted; later calls " +
@@ -545,7 +619,13 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // schemas and `run` submits to it, so both steps below need one. Doing
         // this first also means the wait for a cold start is not counted
         // against the CLI budgets computed above.
-        await ensureRunning(config);
+        //
+        // The instance is kept: it is the one that will run this workflow, so
+        // its own output directory is the authority on where the artifacts land
+        // (see `comfy/outputs.ts`'s resolveArtifactPath). Nothing is re-probed
+        // afterwards — a second probe could answer with a different instance
+        // from the one that did the work.
+        const { instance } = await ensureRunning(config);
 
         // A run needs a live server whatever happens, so `set-slot` is pointed
         // at the same server rather than at the offline cache: making the edit
@@ -558,7 +638,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // entered, and anything that threw first would leak the temp directory.
         const run = await runWorkflow(prepared, { ...target(config), wait, timeoutMs });
 
-        return runBody(resolved, prepared.applied, prepared.warnings, run);
+        return runBody(resolved, prepared.applied, prepared.warnings, run, instance);
       }),
   );
 
@@ -571,13 +651,19 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "`prompt_id` run_workflow returned. `terminal: true` means the job is over and `status` " +
         "says how it ended — `completed`, `error` or `cancelled`; anything else means it is still " +
         "queued or executing and is worth polling again. `outputs.files` are paths on this " +
-        "machine and can be opened directly; `outputs.urls` have to be fetched. A job started in " +
-        "the ComfyUI web interface can be polled here too.",
+        "machine and can be opened directly; `outputs.urls` have to be fetched — but first look " +
+        "each URL up in `outputs.local_paths`, which maps a URL to the file it names on this " +
+        "machine when that file is really there. A URL missing from `local_paths` has no local " +
+        "path and must be fetched. A job started in the ComfyUI web interface can be polled here " +
+        "too.",
       inputSchema: { prompt_id: promptIdArgument },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
     async ({ prompt_id }) =>
-      toolAnswer(async () => jobBody(await getJobStatus(prompt_id, target(config)))),
+      toolAnswer(async () => {
+        const job = await getJobStatus(prompt_id, target(config));
+        return jobBody(job, await resolvingInstance(job.outputs.urls, config));
+      }),
   );
 
   server.registerTool(

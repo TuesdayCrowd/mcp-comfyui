@@ -65,6 +65,25 @@ MCP_COMFYUI_WORKSPACE=/path/to/ComfyUI     # the directory containing main.py
 
 There is deliberately no auto-discovery. Picking between several installs by name is exactly how you end up launching the wrong ComfyUI against the right models.
 
+This setting affects **launching only**. It does not change how artifacts are reported — see below.
+
+## Where your images are
+
+`comfy run` reports artifacts as `/view?…` URLs, never filesystem paths, unless the file happens to sit under a resolvable comfy-cli workspace's own `output/` directory — which it does not on a Desktop install. So the server resolves them itself, using the output directory the running instance actually reported:
+
+```json
+"outputs": {
+  "files": [],
+  "urls":  ["http://127.0.0.1:8188/view?filename=out_00001_.png&subfolder=&type=output"],
+  "local_paths": {
+    "http://127.0.0.1:8188/view?filename=out_00001_.png&subfolder=&type=output":
+      "/Users/you/ComfyUI-Shared/output/out_00001_.png"
+  }
+}
+```
+
+Every artifact appears exactly once in `files` or `urls`. For a URL, look it up in `local_paths`: the value is an absolute path to a file that existed when the answer was built, and **no key means there is no local path** — fetch the URL instead. The path is never guessed; the file must exist and must lie inside its output root.
+
 ## Tools
 
 | Tool | Read-only | What it does |

@@ -171,6 +171,30 @@ function serveInstance(body: unknown = SYSTEM_STATS): number {
   return port;
 }
 
+/**
+ * A ComfyUI whose `argv` names directories this test owns, so a `/view` URL it
+ * emits can be resolved back to a real file without touching this machine's own
+ * ComfyUI-Shared directory.
+ */
+function serveInstanceWritingTo(directories: { output?: string; input?: string }): number {
+  const argv = ["ComfyUI/main.py"];
+  if (directories.output !== undefined) argv.push("--output-directory", directories.output);
+  if (directories.input !== undefined) argv.push("--input-directory", directories.input);
+  return serveInstance({ ...SYSTEM_STATS, system: { ...SYSTEM_STATS.system, argv } });
+}
+
+/** A `/view` URL of the kind a completed run reports, on a given instance. */
+function viewUrl(port: number, query: Record<string, string>): string {
+  return `http://127.0.0.1:${port}/view?${new URLSearchParams(query).toString()}`;
+}
+
+/** A directory under the test's workdir, created. */
+function makeDir(name: string): string {
+  const path = join(workdir, name);
+  mkdirSync(path, { recursive: true });
+  return path;
+}
+
 /** Point the server's target at an address nothing answers on. */
 function nothingRunning(): number {
   process.env.MCP_COMFYUI_PORT = String(deadPort);
@@ -721,6 +745,8 @@ test("run_workflow blocks and reports classified outputs when asked to wait", as
   expect(body["outputs"]).toEqual({
     files: ["/Users/lawls/ComfyUI/output/banana_00001_.png"],
     urls: ["http://127.0.0.1:8188/view?filename=b.png"],
+    // Port 8188 is not the instance these tests talk to, so nothing resolves.
+    local_paths: {},
   });
 });
 
@@ -1002,7 +1028,121 @@ test("get_job reports a job's status and its classified outputs", async () => {
   expect(body["outputs"]).toEqual({
     files: ["/out/a.png"],
     urls: ["http://127.0.0.1:8188/view?filename=b.png"],
+    local_paths: {},
   });
+});
+
+// --- the local path behind a /view URL -----------------------------------
+
+test("run_workflow reports the local file a /view URL names", async () => {
+  // The point of the whole feature: a model that has just rendered an image can
+  // look at it, instead of holding a URL it would have to fetch.
+  writeWorkflow("flow");
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "mcp-e2e_00001_.png"), "png bytes");
+  const port = serveInstanceWritingTo({ output: outputDir });
+  const url = viewUrl(port, { filename: "mcp-e2e_00001_.png", subfolder: "", type: "output" });
+  serveStream(`${envelopeLine(completedPayload({ outputs: [url] }))}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "flow", wait: true });
+
+  expect(body["outputs"]).toEqual({
+    files: [],
+    urls: [url],
+    local_paths: { [url]: join(outputDir, "mcp-e2e_00001_.png") },
+  });
+});
+
+test("the URL stays even once its local path is known", async () => {
+  // Resolving is additive. A caller that fetches the URL — a different machine's
+  // MCP client, say — must not find the artifact has become a path it cannot
+  // reach, so the URL is never replaced.
+  writeWorkflow("flow");
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "kept.png"), "png bytes");
+  const port = serveInstanceWritingTo({ output: outputDir });
+  const url = viewUrl(port, { filename: "kept.png", subfolder: "", type: "output" });
+  serveStream(`${envelopeLine(completedPayload({ outputs: [url] }))}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "flow", wait: true });
+
+  expect((body["outputs"] as Record<string, unknown>)["urls"]).toEqual([url]);
+});
+
+test("get_job reports the local file too, from the same instance's directories", async () => {
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "polled_00007_.png"), "png bytes");
+  const port = serveInstanceWritingTo({ output: outputDir });
+  const url = viewUrl(port, { filename: "polled_00007_.png", subfolder: "", type: "output" });
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: [url] }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect(body["outputs"]).toEqual({
+    files: [],
+    urls: [url],
+    local_paths: { [url]: join(outputDir, "polled_00007_.png") },
+  });
+});
+
+test("a URL whose file is not on disk comes back as a URL and nothing more", async () => {
+  // Never fabricate: a path a caller would open and fail on is worse than the
+  // URL it replaced.
+  const outputDir = makeDir("comfy-output");
+  const port = serveInstanceWritingTo({ output: outputDir });
+  const url = viewUrl(port, { filename: "never_rendered.png", subfolder: "", type: "output" });
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: [url] }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect(body["outputs"]).toEqual({ files: [], urls: [url], local_paths: {} });
+});
+
+test("resolving a job's outputs never starts a ComfyUI", async () => {
+  // get_job stays a probe. The instance it needs is the one that ran the job,
+  // and a freshly launched one would neither know the job nor have written the
+  // file — so an unreachable server is answered, not started.
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({
+      prompt_id: PROMPT_ID,
+      status: "completed",
+      outputs: ["http://127.0.0.1:8188/view?filename=b.png&type=output"],
+    }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+  nothingRunning();
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect((body["outputs"] as Record<string, unknown>)["local_paths"]).toEqual({});
+  expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+test("get_job's description says where the local path is and that it may be absent", async () => {
+  const description = toolNamed(await tools(await connect()), "get_job").description ?? "";
+  expect(description).toContain("local_paths");
+});
+
+test("run_workflow's description says where the local path is", async () => {
+  const description = toolNamed(await tools(await connect()), "run_workflow").description ?? "";
+  expect(description).toContain("local_paths");
 });
 
 test("cancel_job says which of the three things it did", async () => {
