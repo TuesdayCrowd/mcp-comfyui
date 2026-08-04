@@ -55,7 +55,7 @@ export type ParsedEnvelope =
 /** How much of an offending payload to quote back in an error message. */
 const SNIPPET_LIMIT = 200;
 
-function snippet(raw: string): string {
+export function snippet(raw: string): string {
   return raw.length <= SNIPPET_LIMIT ? raw : `${raw.slice(0, SNIPPET_LIMIT)}…`;
 }
 
@@ -100,7 +100,10 @@ function decode(value: unknown, raw: string): ParsedEnvelope {
   if (env.ok) return { ok: true, command: env.command, data: env.data };
   if (!env.error) {
     throw new EnvelopeParseError(
-      `envelope ok:false with no error object (command: ${env.command})`,
+      // Quotes `raw` like every sibling message: without it this is the one
+      // EnvelopeParseError whose text never shows what arrived.
+      `envelope ok:false with no error object (command: ${env.command}) ` +
+        `(received: ${snippet(raw)})`,
       raw,
     );
   }

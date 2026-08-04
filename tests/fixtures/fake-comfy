@@ -1,0 +1,72 @@
+#!/bin/sh
+# A fake `comfy` for tests: no ComfyUI, no network, no Python, no dependencies
+# beyond POSIX sh builtins.
+#
+#   $FAKE_COMFY_MODE       selects the canned response (default: a success envelope)
+#   $FAKE_COMFY_ARGV_OUT   file to record this invocation's argv in, so tests can
+#                          assert that global flags precede the subcommand
+#   $FAKE_COMFY_PID_OUT    file to record this process's pid in, so tests can
+#                          prove a timed-out child was actually killed
+#   $FAKE_COMFY_ORPHAN_OUT file to record a surviving descendant's pid in
+#   $FAKE_COMFY_PROBE      value echoed back by the echo_env mode
+
+[ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
+
+OK='{"schema":"envelope/1","type":"envelope","ok":true,"command":"workflow slots","version":"0.0.0","where":null,"data":{"slots":[]},"error":null}'
+
+case "$FAKE_COMFY_MODE" in
+  fail)
+    echo '{"schema":"envelope/1","type":"envelope","ok":false,"command":"run","version":"0.0.0","where":null,"data":null,"error":{"code":"server_unreachable","message":"connection refused","hint":"is ComfyUI running?","details":null}}'
+    exit 1 ;;
+  fail_rich)
+    # Same failure shape, but with the routing target and details populated.
+    echo '{"schema":"envelope/1","type":"envelope","ok":false,"command":"run","version":"0.0.0","where":"cloud","data":null,"error":{"code":"workflow_not_found","message":"no such file","hint":"check the path","details":{"tried":["a.json","b.json"]}}}'
+    exit 1 ;;
+  garbage)
+    echo 'Traceback (most recent call last):' >&2
+    echo 'RuntimeError: boom' >&2
+    echo 'not json at all'
+    exit 1 ;;
+  stderr_noise)
+    # Human-readable chatter on stderr, including something envelope-shaped.
+    # Anything that parses stderr instead of stdout fails loudly here.
+    echo 'WARNING: torch not compiled with CUDA enabled' >&2
+    echo '{"schema":"envelope/1","type":"envelope","ok":false,"command":"workflow slots","version":"0.0.0","where":null,"data":null,"error":{"code":"stderr_was_parsed","message":"stderr must never be parsed","hint":null,"details":null}}' >&2
+    echo "$OK"
+    exit 0 ;;
+  exit1_ok)
+    # Exit code 1 is overloaded upstream; the envelope is the real signal.
+    echo "$OK"
+    exit 1 ;;
+  hang)
+    # The easy case: one process, still running, killable by pid.
+    echo 'loading model checkpoint...' >&2
+    [ -n "$FAKE_COMFY_PID_OUT" ] && printf '%s\n' "$$" > "$FAKE_COMFY_PID_OUT"
+    # exec so the sleeper keeps this pid: the test asserts on this exact pid.
+    exec sleep 30 ;;
+  orphan)
+    # The hard case, and the one `comfy launch` will really produce: the child
+    # exits immediately but leaves a descendant holding the stdout write end,
+    # so the pipe never reaches EOF no matter what happens to the child's pid.
+    echo 'starting server in the background' >&2
+    sleep 30 &
+    [ -n "$FAKE_COMFY_ORPHAN_OUT" ] && printf '%s\n' "$!" > "$FAKE_COMFY_ORPHAN_OUT"
+    exit 0 ;;
+  echo_env)
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"x","version":"0.0.0","where":null,"data":{"probe":"%s"},"error":null}\n' "$FAKE_COMFY_PROBE"
+    exit 0 ;;
+  flood)
+    i=0
+    while [ $i -lt 200 ]; do
+      printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'
+      printf 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy' >&2
+      i=$((i + 1))
+    done
+    exit 1 ;;
+  cwd)
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"pwd","version":"0.0.0","where":null,"data":{"cwd":"%s"},"error":null}\n' "$(pwd -P)"
+    exit 0 ;;
+  *)
+    echo "$OK"
+    exit 0 ;;
+esac
