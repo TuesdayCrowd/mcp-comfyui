@@ -52,6 +52,25 @@ function customSlot(over: Partial<Slot> = {}): Slot {
   };
 }
 
+/**
+ * An `object_info` with a single node and a single input, for the degenerate
+ * shapes two healthy captures cannot reach. Every rule this module states is
+ * about data like this, so the rules have to be pinned against data like this.
+ */
+function oneNode(spec: unknown, bucket: "required" | "optional" = "required"): ObjectInfo {
+  return { SomeCustomNode: { input: { [bucket]: { foo: spec } } } };
+}
+
+/**
+ * A node entry that is not a node. The cast is the point: this module is
+ * documented as pure over caller-supplied data, the cache file it is normally
+ * fed from is public and hand-editable, and a truncated or hand-built one is
+ * exactly what must not take the process down.
+ */
+function brokenObjectInfo(entry: unknown): ObjectInfo {
+  return { SomeCustomNode: entry } as ObjectInfo;
+}
+
 /** The schema for one address, failing loudly rather than yielding `undefined`. */
 function propertyAt(described: WorkflowDescription, address: string): InputSchema {
   const schema = described.schema.properties[address];
@@ -135,7 +154,32 @@ test("cfg's step of 0.1 never yields a multipleOf that rejects its own default",
   // grid a validator computes: 149 of cfg's own legal values fail JSON Schema's
   // division rule, and the node's default of 8.0 fails the modulo rule.
   expect(cfg).not.toHaveProperty("multipleOf");
-  expect(cfg.multipleOf === undefined || !rejects(8.0, cfg.multipleOf)).toBe(true);
+});
+
+test("a workflow value off the node's step grid is kept beside multipleOf", () => {
+  // The node's own anchors (16, 16384, 512) prove multipleOf 8, so the keyword
+  // is sound. The workflow holds 740, which ComfyUI silently floors to 736 —
+  // and saying so is the point: the caller learns the stored value will be
+  // adjusted. This is the disagreement `enum` already tolerates in 36 of the
+  // 6key capture's 210 properties, and `default` is an annotation either way.
+  const grid = oneNode(["INT", { min: 16, max: 16384, step: 8, default: 512 }]);
+  const offGrid = customSlot({ type: "INT", current_value: 740 });
+
+  const property = propertyAt(describeSlots([offGrid], grid), "99.foo");
+
+  expect(property.multipleOf).toBe(8);
+  expect(property.default).toBe(740);
+  expect(rejects(740, 8)).toBe(true); // the two really do disagree
+});
+
+test("a step of 1 on an integer is not emitted as a vacuous multipleOf", () => {
+  const slot = customSlot({ type: "INT", current_value: 5 });
+  const property = propertyAt(
+    describeSlots([slot], oneNode(["INT", { min: 0, max: 10, step: 1 }])),
+    "99.foo",
+  );
+
+  expect(property).not.toHaveProperty("multipleOf");
 });
 
 test("an integer step that is anchored at zero becomes multipleOf", () => {
@@ -201,11 +245,36 @@ test("object_info's default fills in where the workflow leaves the widget unset"
 });
 
 test("a null current value emits no default at all", () => {
-  // CreateVideo.bit_depth is unset in this workflow. `default: null` would tell
-  // a caller that null is a legal value for an integer input.
-  const unset = customSlot({ node_type: "SomeCustomNode", current_value: null });
+  // `default: null` would tell a caller that null is a legal value for an
+  // integer input. Resolved against a real node so this runs the joined path
+  // rather than the degraded one.
+  const unset = customSlot({ type: "INT", current_value: null });
+
+  const property = propertyAt(describeSlots([unset], oneNode(["INT", { min: 1 }])), "99.foo");
+
+  expect(property).not.toHaveProperty("default");
+  expect(property.minimum).toBe(1); // it really did resolve
+});
+
+test("a null current value emits no default on the degraded path either", () => {
+  const unset = customSlot({ current_value: null });
 
   expect(describeSlots([unset], {}).schema.properties["99.foo"]).not.toHaveProperty("default");
+});
+
+test("a node default that is not a scalar is not emitted", () => {
+  // `default: null`, `default: {}` and `default: []` all appear in the wild on
+  // multiselect and dynamic widgets. None of them is something `set-slot` can
+  // carry on a command line.
+  const unset = customSlot({ current_value: null });
+
+  for (const declared of [null, {}, [], ["a"]]) {
+    const described = describeSlots([unset], oneNode(["STRING", { default: declared }]));
+
+    expect(described.schema.properties["99.foo"], JSON.stringify(declared)).not.toHaveProperty(
+      "default",
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -286,6 +355,58 @@ test("an input name in neither map is reported against the node that lacks it", 
   ]);
 });
 
+test("a node entry that is not an object reports the node, not the input", () => {
+  // `null` used to reach `node["input"]` and throw, against this module's own
+  // never-throw contract. A string or an array entry misreported the *input*
+  // name when the node definition is what is broken.
+  for (const entry of [null, [], "STRING", 42, ["INT", {}]]) {
+    const described = describeSlots([customSlot()], brokenObjectInfo(entry));
+
+    expect(described.unresolved, JSON.stringify(entry)).toEqual([
+      { address: "99.foo", name: "foo", node_type: "SomeCustomNode", reason: "unknown_node_type" },
+    ]);
+    expect(propertyAt(described, "99.foo").type).toBe("string");
+  }
+});
+
+test("an input declared as null reads as unreadable, not as absent", () => {
+  // Present-but-unreadable and not-declared are different answers, and only the
+  // first stops the search: falling through to `optional` here would resolve the
+  // slot against a spec the node did not mean for it.
+  const both: ObjectInfo = {
+    SomeCustomNode: {
+      input: { required: { foo: null }, optional: { foo: ["INT", { min: 1, max: 9 }] } },
+    },
+  };
+
+  const described = describeSlots([customSlot()], both);
+
+  expect(described.unresolved[0]).toMatchObject({ reason: "unreadable_spec" });
+  expect(propertyAt(described, "99.foo")).not.toHaveProperty("minimum");
+});
+
+test("required wins over optional when both declare the same name", () => {
+  const both: ObjectInfo = {
+    SomeCustomNode: {
+      input: {
+        required: { foo: ["INT", { min: 1, max: 9 }] },
+        optional: { foo: ["STRING", { tooltip: "the optional one" }] },
+      },
+    },
+  };
+
+  const property = propertyAt(describeSlots([customSlot({ type: "INT" })], both), "99.foo");
+
+  expect(property.type).toBe("integer");
+  expect(property).not.toHaveProperty("description");
+});
+
+test("an empty tuple is unreadable rather than an unconstrained resolve", () => {
+  const described = describeSlots([customSlot()], oneNode([]));
+
+  expect(described.unresolved[0]).toMatchObject({ reason: "unreadable_spec" });
+});
+
 test("a spec that is not a tuple degrades instead of throwing", () => {
   const broken: ObjectInfo = { Odd: { input: { required: { foo: "STRING" } } } };
   const slot = customSlot({ node_type: "Odd" });
@@ -308,13 +429,197 @@ test("an unresolved COMBO falls back to the type of the value it holds", () => {
 test("a slot with nothing left to say about it gets no type", () => {
   const opaque = customSlot({ type: "WEIRD_CUSTOM_WIDGET", current_value: null });
 
-  expect(describeSlots([opaque], {}).schema.properties["99.foo"]).toEqual({});
+  expect(describeSlots([opaque], {}).schema.properties["99.foo"]).toEqual({
+    title: "SomeCustomNode.foo",
+  });
 });
 
 test("one unknown node does not stop the others from resolving", () => {
   const described = describeSlots([...imageGen, customSlot()], objectInfo);
 
   expect(propertyAt(described, "3.steps").maximum).toBe(10000);
+  expect(described.unresolved).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------------------
+// Titles
+// ---------------------------------------------------------------------------
+
+test("a property body identifies its node type and input without the key", () => {
+  // Only 18 of the 6key capture's 210 properties carry a description, and the
+  // bodies collapse to a handful of distinct shapes: `140/67.length` through
+  // `144/67.length` are byte-identical without this, and so are the high-noise
+  // and low-noise UNET loaders. A body a model cannot attribute is a body it
+  // cannot plan from.
+  const described = describeSlots(sixKey, objectInfo);
+
+  for (const slot of sixKey) {
+    expect(propertyAt(described, slot.address).title).toBe(`${slot.node_type}.${slot.name}`);
+  }
+});
+
+test("a degraded property is titled too", () => {
+  expect(describeSlots([customSlot()], {}).schema.properties["99.foo"]?.title).toBe(
+    "SomeCustomNode.foo",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// A COMBO that resolves to nothing
+// ---------------------------------------------------------------------------
+
+test("a COMBO that resolves without allowed values is reported", () => {
+  // `SaveVideo.codec`'s shape: the options are widget descriptors, not values,
+  // so the join succeeds and still yields nothing a caller could send. This is
+  // exactly where a model guesses `Euler` for `euler`.
+  const dynamic = oneNode(["COMFY_DYNAMICCOMBO_V3", { options: [{ key: "auto" }, { key: "h264" }] }]);
+
+  const described = describeSlots([customSlot({ type: "COMBO" })], dynamic);
+
+  expect(described.unresolved).toEqual([
+    { address: "99.foo", name: "foo", node_type: "SomeCustomNode", reason: "no_values" },
+  ]);
+  expect(propertyAt(described, "99.foo")).not.toHaveProperty("enum");
+});
+
+test("an empty combo is reported as having no values", () => {
+  // An install with no LoRAs reports exactly this, and the operator's fix is to
+  // install one — which is what `unresolved` is for.
+  const described = describeSlots([customSlot({ type: "COMBO" })], oneNode([[]]));
+
+  expect(described.unresolved[0]?.reason).toBe("no_values");
+  expect(propertyAt(described, "99.foo")).not.toHaveProperty("enum");
+});
+
+test("an input declared as [null] is reported rather than silently unconstrained", () => {
+  const described = describeSlots([customSlot({ type: "COMBO" })], oneNode([null]));
+
+  expect(described.unresolved[0]?.reason).toBe("no_values");
+});
+
+test("a non-COMBO with no enum is not reported", () => {
+  // A STRING is unconstrained by nature. Only a COMBO promises a list, so only
+  // a COMBO can fail to deliver one.
+  expect(describeSlots([customSlot()], oneNode(["STRING", {}])).unresolved).toEqual([]);
+});
+
+test("a join failure outranks no_values for a COMBO", () => {
+  // The operator's fix differs — install the node, not the models — so the more
+  // specific reason is the one worth reporting.
+  const described = describeSlots([customSlot({ type: "COMBO" })], {});
+
+  expect(described.unresolved[0]?.reason).toBe("unknown_node_type");
+});
+
+// ---------------------------------------------------------------------------
+// Constraints that would contradict each other
+// ---------------------------------------------------------------------------
+
+test("bounds that contradict each other are both dropped", () => {
+  // min > max proves one of the two wrong without saying which, so neither is
+  // proven. Emitting both yields a schema no value satisfies — including the
+  // one the workflow already runs with.
+  const impossible = oneNode(["INT", { min: 100, max: 1, default: 5 }]);
+
+  const property = propertyAt(
+    describeSlots([customSlot({ type: "INT", current_value: 5 })], impossible),
+    "99.foo",
+  );
+
+  expect(property).not.toHaveProperty("minimum");
+  expect(property).not.toHaveProperty("maximum");
+  expect(property.default).toBe(5);
+});
+
+test("a bound below f64's integer range is clamped too", () => {
+  const slot = customSlot({ type: "INT", current_value: 5 });
+  const property = propertyAt(
+    describeSlots([slot], oneNode(["INT", { min: -1e21, max: 10 }])),
+    "99.foo",
+  );
+
+  expect(property.minimum).toBe(Number.MIN_SAFE_INTEGER);
+});
+
+test("a non-finite bound is dropped rather than serialised as null", () => {
+  // JSON cannot express these, but this module's input is whatever the caller
+  // hands it, and `JSON.stringify` turns each into `null` — a bound that reads
+  // as deliberate and means nothing.
+  //
+  // One at a time, and never NaN against a finite bound: `NaN <= max` is false,
+  // so a pair would be dropped by the contradictory-bounds guard instead and
+  // this would pass while proving nothing.
+  const slot = customSlot({ type: "INT", current_value: 5 });
+
+  for (const config of [{ min: NaN }, { max: NaN }, { min: -Infinity }, { max: Infinity }]) {
+    const described = describeSlots([slot], oneNode(["INT", config]));
+    const property = propertyAt(described, "99.foo");
+    const label = JSON.stringify(config); // NaN and Infinity both print as null
+
+    expect(property, label).not.toHaveProperty("minimum");
+    expect(property, label).not.toHaveProperty("maximum");
+    expect(JSON.parse(JSON.stringify(property)), label).toEqual(property);
+  }
+});
+
+test("an empty tooltip is not emitted as an empty description", () => {
+  const property = propertyAt(
+    describeSlots([customSlot()], oneNode(["STRING", { tooltip: "" }])),
+    "99.foo",
+  );
+
+  expect(property).not.toHaveProperty("description");
+});
+
+// ---------------------------------------------------------------------------
+// Enum values
+// ---------------------------------------------------------------------------
+
+test("an enum carries no redundant type keyword", () => {
+  // The members already carry their own types, and a wrong one would narrow the
+  // enum rather than describe it.
+  expect(describeAt(imageGen, "3.sampler_name")).not.toHaveProperty("type");
+});
+
+test("values a caller could not send are filtered out of an enum", () => {
+  const mixed = oneNode([["euler", { key: "widget" }, "heun", null]]);
+
+  expect(propertyAt(describeSlots([customSlot({ type: "COMBO" })], mixed), "99.foo").enum).toEqual([
+    "euler",
+    "heun",
+  ]);
+});
+
+test("the emitted enum does not alias the shared object_info", () => {
+  // One `object_info` describes every workflow on the instance. A caller who
+  // edits the enum it was handed must not corrupt the next description.
+  const values = ["a", "b"];
+  const shared: ObjectInfo = { SomeCustomNode: { input: { required: { foo: [values] } } } };
+
+  const property = propertyAt(describeSlots([customSlot({ type: "COMBO" })], shared), "99.foo");
+  property.enum?.push("c");
+
+  expect(values).toEqual(["a", "b"]);
+});
+
+// ---------------------------------------------------------------------------
+// Keys that are not ordinary keys
+// ---------------------------------------------------------------------------
+
+test("an address of __proto__ becomes an own property", () => {
+  // Assignment would set the prototype instead: `Object.keys` empty, the
+  // serialised `properties` `{}`, and an `unresolved` entry pointing at a
+  // property that is not there.
+  const { schema } = describeSlots([customSlot({ address: "__proto__" })], {});
+
+  expect(Object.keys(schema.properties)).toEqual(["__proto__"]);
+  expect(JSON.parse(JSON.stringify(schema)).properties).toHaveProperty("__proto__");
+});
+
+test("a repeated address yields one property and one report", () => {
+  const described = describeSlots([customSlot(), customSlot()], {});
+
+  expect(Object.keys(described.schema.properties)).toHaveLength(1);
   expect(described.unresolved).toHaveLength(1);
 });
 
@@ -359,13 +664,25 @@ test("nothing in the 210-slot workflow is left unresolved", () => {
   expect(describeSlots(sixKey, objectInfo).unresolved).toEqual([]);
 });
 
-test("the 210-slot workflow's 97 COMBOs all become enums", () => {
+test("the 210-slot workflow's COMBOs are exactly the properties that get enums", () => {
+  // A relation between input and output rather than a count of the fixture:
+  // every COMBO gets values, and nothing else acquires them.
   const described = describeSlots(sixKey, objectInfo);
-  const combos = sixKey.filter((s) => s.type === "COMBO");
+  const withEnum = Object.entries(described.schema.properties)
+    .filter(([, property]) => property.enum !== undefined)
+    .map(([address]) => address);
 
-  expect(combos).toHaveLength(97);
-  for (const slot of combos) {
-    expect(propertyAt(described, slot.address).enum).toBeArray();
+  expect(withEnum).toEqual(sixKey.filter((s) => s.type === "COMBO").map((s) => s.address));
+  expect(withEnum.length).toBeGreaterThan(90); // 97 in this capture
+
+  for (const address of withEnum) {
+    const values = propertyAt(described, address).enum ?? [];
+    expect(values.length, address).toBeGreaterThan(0);
+    for (const value of values) {
+      expect(["string", "number", "boolean"], `${address} member ${String(value)}`).toContain(
+        typeof value,
+      );
+    }
   }
 });
 
@@ -397,6 +714,7 @@ function assertValidJsonSchema(described: WorkflowDescription): void {
   expect(JSON.parse(JSON.stringify(schema))).toEqual(schema);
 
   const allowed = new Set([
+    "title",
     "type",
     "enum",
     "description",
@@ -437,19 +755,17 @@ function assertValidJsonSchema(described: WorkflowDescription): void {
     }
     if (property.multipleOf !== undefined) {
       expect(property.multipleOf, `${where} multipleOf is not positive`).toBeGreaterThan(0);
-      // Every value the schema itself names must survive the constraint, or the
-      // constraint is provably rejecting legal input.
-      for (const value of [property.minimum, property.maximum, property.default]) {
+      // The bounds are the node's own anchors, and they are what prove the
+      // constraint sound. `default` is deliberately excluded: it comes from the
+      // workflow, not the node, and it is allowed to disagree — the same
+      // disagreement `enum` tolerates in 36 of these 210 properties. Asserting
+      // agreement here would encode a rule the design rejects.
+      for (const value of [property.minimum, property.maximum]) {
         if (typeof value !== "number") continue;
         expect(rejects(value, property.multipleOf), `${where} multipleOf rejects ${value}`).toBe(
           false,
         );
       }
-    }
-    if (property.type === "integer" && typeof property.default === "number") {
-      expect(Number.isInteger(property.default), `${where} integer default is fractional`).toBe(
-        true,
-      );
     }
     if (property.description !== undefined) {
       expect(typeof property.description, `${where} description is not a string`).toBe("string");

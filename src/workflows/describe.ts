@@ -34,6 +34,16 @@ export type JsonSchemaType = "integer" | "number" | "string" | "boolean";
 
 /** One settable input, as JSON Schema. Absent keywords are unknown, not false. */
 export interface InputSchema {
+  /**
+   * `<node_type>.<name>`, so a property body says what it describes without
+   * being joined back to its key. Measured on the 210-slot capture: only 18
+   * properties carry a `description`, and the bodies collapse to 45 distinct
+   * shapes — `140/67.length` through `144/67.length` are byte-identical, as are
+   * the high-noise and low-noise UNET loaders. The key alone is a
+   * subgraph-qualified id that appears nowhere else in the document, so a model
+   * asked to change "the second sampler" has nothing to join against.
+   */
+  title?: string;
   type?: JsonSchemaType;
   /**
    * Carried from `/object_info` verbatim. Typed as `unknown[]` because the
@@ -65,14 +75,29 @@ export interface WorkflowInputSchema {
   additionalProperties: false;
 }
 
-/** Why a slot could not be joined against `/object_info`. */
+/**
+ * Why a slot's constraints could not be recovered.
+ *
+ * The first three are join failures. The fourth is not: the join succeeded and
+ * produced nothing usable, which widens this list from "the join failed" to
+ * "the join produced no allowed values" — deliberately, because both leave the
+ * caller in the same place and both are things the operator can fix.
+ */
 export type UnresolvedReason =
-  /** No such node type. Almost always a custom node this instance lacks. */
+  /** No such node type, or an entry that is not a node. Usually a custom node. */
   | "unknown_node_type"
   /** The node exists but declares no input by that name, in either map. */
   | "unknown_input"
   /** The input exists but its spec is not the `[type, config?]` tuple. */
-  | "unreadable_spec";
+  | "unreadable_spec"
+  /**
+   * A `COMBO` that resolved to no allowed values — an empty list, or options
+   * that are widget descriptors rather than values (`SaveVideo.codec`). A COMBO
+   * is the one widget type that promises a list, and a caller who does not get
+   * one guesses `Euler` for `euler`. The operator's fix is usually to install
+   * the models the list would have been drawn from.
+   */
+  | "no_values";
 
 /** A slot that still has a schema entry, but an unconstrained one. */
 export interface UnresolvedSlot {
@@ -130,7 +155,14 @@ function isScalar(value: unknown): boolean {
   return typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 }
 
-/** The spec for one input, or `undefined` if the name is in neither map. */
+/**
+ * The spec for one input, or `undefined` if the name is in neither map.
+ *
+ * The `{spec}` wrapper is load-bearing here, unlike the one on
+ * {@link defaultValue}: an input declared as a literal `undefined` has to read
+ * as present-but-unreadable, and a bare `unknown` return could not tell that
+ * apart from "not declared".
+ */
 function findInputSpec(node: NodeSchema, name: string): { spec: unknown } | undefined {
   const input = asRecord(node["input"]);
   if (input === undefined) return undefined;
@@ -160,18 +192,28 @@ function readTuple(spec: unknown): { type: unknown; config: Config } | undefined
  *
  * An empty list is treated as no list. `enum: []` rejects every value including
  * the one the workflow already holds, and an empty combo is a routine state — a
- * ComfyUI install with no LoRAs reports exactly that.
+ * ComfyUI install with no LoRAs reports exactly that. Either way the slot is
+ * reported as {@link UnresolvedReason} `no_values` rather than passing for
+ * unconstrained.
  *
- * The type position is carried verbatim; `options` is taken only when every
- * member is a scalar, because `COMFY_DYNAMICCOMBO_V3` puts `{key, inputs}`
- * objects there and those describe a widget, not a set of values.
+ * Both shapes are filtered to scalars, and identically. `COMFY_DYNAMICCOMBO_V3`
+ * puts `{key, inputs}` objects under `options`, and an object is not something
+ * `set-slot` could carry on a command line from either position — listing one
+ * would offer the caller a value it cannot send.
  */
+function scalarValues(candidates: unknown[]): unknown[] | undefined {
+  // `filter` also copies, which matters: one `/object_info` describes every
+  // workflow on the instance, and an emitted enum that aliased it would let a
+  // caller's edit corrupt the next description.
+  const values = candidates.filter(isScalar);
+  return values.length > 0 ? values : undefined;
+}
+
 function enumValues(type: unknown, config: Config): unknown[] | undefined {
-  if (Array.isArray(type)) return type.length > 0 ? [...type] : undefined;
+  if (Array.isArray(type)) return scalarValues(type);
 
   const options = config["options"];
-  if (Array.isArray(options) && options.length > 0 && options.every(isScalar)) return [...options];
-  return undefined;
+  return Array.isArray(options) ? scalarValues(options) : undefined;
 }
 
 /**
@@ -248,10 +290,16 @@ function bound(config: Config, key: "min" | "max", type: JsonSchemaType | undefi
  * Float steps are dropped outright. `KSampler.cfg` declares `step: 0.1`, and
  * 0.1 has no exact binary representation: 149 of cfg's own legal values fail
  * JSON Schema's division rule under f64, and its default of 8.0 fails the
- * modulo rule that other validators use instead. Beyond the arithmetic, ComfyUI
- * validates `min` and `max` server-side but never `step`, so on a `FLOAT` the
- * step is a UI increment and 29.97 fps is a value the backend accepts —
- * `multipleOf: 1` there would be this server inventing a rejection.
+ * modulo rule that other validators use instead.
+ *
+ * The asymmetry between `INT` and `FLOAT` is not merely that ComfyUI validates
+ * `min` and `max` server-side but never `step` — that argues equally against
+ * both. It is that an off-grid *integer* is silently **rounded**:
+ * `EmptyLatentImage` floors to the 8-pixel latent grid, so `width: 740` renders
+ * 736 and nothing says so. On an integer, `multipleOf` warns the caller that a
+ * value will be adjusted underneath them, which is precisely what this schema
+ * exists to prevent. A `FLOAT` has no such grid — `fps: 29.97` is used exactly
+ * — so `multipleOf: 1` there would be this server inventing a rejection.
  *
  * A step of 1 on an integer is dropped as vacuous: it is true of every integer,
  * and a keyword that excludes nothing is noise in a prompt.
@@ -307,6 +355,9 @@ function multipleOf(config: Config, type: JsonSchemaType | undefined): number | 
  * no-input run will try to load, missing or not. Hiding it would leave the
  * caller unable to see why the run is about to fail.
  */
+// The `{value}` wrapper is only for readability — `undefined` is not a value
+// this can return, so a bare `unknown` would do. Contrast `findInputSpec`,
+// where the wrapper carries information a bare return could not.
 function defaultValue(config: Config, slot: Slot): { value: unknown } | undefined {
   if (slot.current_value !== null) return { value: slot.current_value };
   const declared = config["default"];
@@ -319,17 +370,23 @@ function description(config: Config): string | undefined {
   return typeof tooltip === "string" && tooltip.length > 0 ? tooltip : undefined;
 }
 
-/** The unconstrained answer: everything that can be said from the slot alone. */
+/**
+ * The unconstrained answer: everything that can be said from the slot alone.
+ *
+ * Expressed as the degenerate case of {@link fromSpec} rather than restated,
+ * because it is exactly that — a spec with no type and no config leaves every
+ * config-driven rule a no-op and falls through to the slot. Restating it would
+ * mean maintaining the `default` and `title` rules in two places, and the two
+ * would drift the first time either changed.
+ */
 function fromSlotAlone(slot: Slot): InputSchema {
-  const schema: InputSchema = {};
-  const type = bareType(slot);
-  if (type !== undefined) schema.type = type;
-  if (slot.current_value !== null) schema.default = slot.current_value;
-  return schema;
+  return fromSpec(slot, undefined, {});
 }
 
 function fromSpec(slot: Slot, type: unknown, config: Config): InputSchema {
-  const schema: InputSchema = {};
+  // Named before anything else: a body a reader cannot attribute to a node is
+  // a body they cannot act on, and 210 of these arrive at once.
+  const schema: InputSchema = { title: `${slot.node_type}.${slot.name}` };
 
   const values = enumValues(type, config);
   if (values !== undefined) {
@@ -349,9 +406,15 @@ function fromSpec(slot: Slot, type: unknown, config: Config): InputSchema {
   if (text !== undefined) schema.description = text;
 
   const minimum = bound(config, "min", schema.type);
-  if (minimum !== undefined) schema.minimum = minimum;
   const maximum = bound(config, "max", schema.type);
-  if (maximum !== undefined) schema.maximum = maximum;
+  // A node declaring min > max has proved one of the two wrong without saying
+  // which, so neither is proven. Emitting both would produce a schema no value
+  // satisfies — including the value the workflow already runs with, which is
+  // the one thing this document must never call illegal.
+  if (minimum === undefined || maximum === undefined || minimum <= maximum) {
+    if (minimum !== undefined) schema.minimum = minimum;
+    if (maximum !== undefined) schema.maximum = maximum;
+  }
 
   const step = multipleOf(config, schema.type);
   if (step !== undefined) schema.multipleOf = step;
@@ -367,7 +430,11 @@ function describeSlot(
   slot: Slot,
   objectInfo: ObjectInfo,
 ): { schema: InputSchema; reason?: UnresolvedReason } {
-  const node = objectInfo[slot.node_type];
+  // `asRecord`, not `!== undefined`: an entry that is null, a string or an array
+  // is not a node definition, and letting one through both breaks the never-throw
+  // contract (`null["input"]`) and misreports the *input* name when the node
+  // definition is what is broken.
+  const node = asRecord(objectInfo[slot.node_type]);
   // Custom nodes are normal, and an instance that has since dropped one is
   // normal too. Neither may cost the caller the other 209 slots.
   if (node === undefined) return { schema: fromSlotAlone(slot), reason: "unknown_node_type" };
@@ -378,7 +445,13 @@ function describeSlot(
   const tuple = readTuple(found.spec);
   if (tuple === undefined) return { schema: fromSlotAlone(slot), reason: "unreadable_spec" };
 
-  return { schema: fromSpec(slot, tuple.type, tuple.config) };
+  const schema = fromSpec(slot, tuple.type, tuple.config);
+  // A resolved COMBO with nothing to choose from is no more usable than an
+  // unresolved one, and the operator can act on it. Ranked below the join
+  // failures above because their fixes differ: install the node, not the models.
+  if (slot.type === "COMBO" && schema.enum === undefined) return { schema, reason: "no_values" };
+
+  return { schema };
 }
 
 /**
@@ -394,14 +467,23 @@ function describeSlot(
  * from. Passing `{}` is legal and yields the fully degraded description.
  */
 export function describeSlots(slots: Slot[], objectInfo: ObjectInfo): WorkflowDescription {
-  const properties: Record<string, InputSchema> = {};
+  // A Map, then `Object.fromEntries`: assigning `properties[slot.address]` sets
+  // the prototype rather than an own property when the address is `__proto__`,
+  // which would leave `Object.keys` empty and the serialised `properties` `{}`
+  // while `unresolved` still described an entry that was not there.
+  const properties = new Map<string, InputSchema>();
   const unresolved: UnresolvedSlot[] = [];
 
   for (const slot of slots) {
-    const { schema, reason } = describeSlot(slot, objectInfo);
     // Addresses are unique within a listing — they are the keys `set-slot`
-    // takes, so the CLI could not accept a duplicate either.
-    properties[slot.address] = schema;
+    // takes, so the CLI could not accept a duplicate either. If one arrives
+    // anyway, the first wins for both outputs; last-wins on `properties` while
+    // `unresolved` collected every slot would let the two disagree about what
+    // the document contains.
+    if (properties.has(slot.address)) continue;
+
+    const { schema, reason } = describeSlot(slot, objectInfo);
+    properties.set(slot.address, schema);
     if (reason !== undefined) {
       unresolved.push({
         address: slot.address,
@@ -412,5 +494,12 @@ export function describeSlots(slots: Slot[], objectInfo: ObjectInfo): WorkflowDe
     }
   }
 
-  return { schema: { type: "object", properties, additionalProperties: false }, unresolved };
+  return {
+    schema: {
+      type: "object",
+      properties: Object.fromEntries(properties),
+      additionalProperties: false,
+    },
+    unresolved,
+  };
 }

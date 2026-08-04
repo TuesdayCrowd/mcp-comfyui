@@ -49,7 +49,7 @@ On failure `ok:false` and `error:{code,message,hint,details}`.
 8. **Never `comfy launch` when something is already reachable.** Desktop owns port 8188; a second instance fights over VRAM and the shared model dir.
 9. **`comfy launch --background` readiness is a log scrape** for the literal string `"To see the GUI go to:"`. Fragile — prefer polling `/system_stats`.
 10. **Host `0.0.0.0` must be rewritten to `127.0.0.1`** before use as a connect address.
-11. **A ComfyUI seed cannot round-trip through JSON as an f64.** `KSampler.seed` declares `max: 18446744073709552000` — which is itself already the lossy f64 rendering of 2^64−1. Anything that reaches us via `JSON.parse` (every envelope, every slot listing) has already lost precision above 2^53. **Task 3.1 must not re-emit a large seed it read back through `set-slot`**, or the value silently changes. Either round-trip the raw text or refuse to rewrite a seed the caller did not explicitly set.
+11. **A ComfyUI seed cannot round-trip through JSON as an f64.** `KSampler.seed` declares `max: 18446744073709552000` — which is itself already the lossy f64 rendering of 2^64−1. Anything that reaches us via `JSON.parse` (every envelope, every slot listing) has already lost precision above 2^53. The fix is architectural and is specified in Task 3.1: **never let our JS parse or re-serialise the graph.** Copy the workflow file and let `comfy` edit the copy in place. Measured proof that the alternative fails: `set-slot 5.width=512 --stdout` on a file holding seed `18446744073709551615` returns the exact digits in the envelope, and our `JSON.parse` corrupts that untouched seed to `18446744073709552000`. Scanned all 22 of this user's workflows losslessly: zero true integer literals above 2^53 today, so this is latent rather than active — but it is silent when it fires.
 12. **Killing a child does NOT end a pipe read.** EOF requires every holder of the pipe's write end to close it, and `Bun.spawn` hands that write end to the child *and every descendant*. `proc.kill()` signals one pid, so a surviving grandchild pins the read open indefinitely — measured at 30s against an 800ms timeout. A timeout must cancel the **read side** (hold the reader, call `reader.cancel()`), not merely signal the child. `Bun.spawn({timeout, killSignal})` does not fix this, and `proc.stdout.cancel()` throws because `new Response(stream)` locks the stream. Do **not** fix it with `detached` + process-group kill: that would also kill the intentional long-lived server in Task 4.2.
 13. **`Bun.spawn` does not give the child runtime mutations of `process.env`.** It hands over the environment as captured at process start unless `env` is passed explicitly. Verified directly: with `process.env.PROBE` set at runtime, the child sees `default=[]` but `explicit=[hello]` when spawned with `env: process.env`. This is not cosmetic — during Task 1.3 it caused a test fixture to be bypassed and the **real `comfy` binary to be invoked** by the suite. Every spawn in this project must pass `env: process.env`.
 
@@ -301,9 +301,19 @@ Test with fixtures covering: frontend, API-format, `.app.json` with `definitions
 
 **Files:** Create `src/workflows/setSlots.ts`; Test `tests/setSlots.test.ts`
 
-`applySlots(file, inputs)` → `comfy workflow set-slot <file> ADDR=VAL... --stdout` → return `data.workflow_json`, surfacing `data.warnings`.
+**Copy the workflow to a temp path, then `set-slot` it IN PLACE.** Do NOT use `--stdout`.
 
-**Never pass `--in-place`** — the user's workflow files are inputs, not scratch space. Write the returned graph to a temp file under the scratch dir.
+```
+cp <workflow> <temp>                              # byte copy, never parsed
+comfy workflow set-slot <temp> ADDR=VAL...        # in place, the default
+comfy run --workflow <temp>
+```
+
+**This is not a style preference — `--stdout` silently corrupts the graph.** Measured: with a seed of `18446744073709551615` in the file, setting an unrelated slot (`5.width`) via `--stdout` returned the correct digits in the envelope text, but `JSON.parse` in `exec.ts` turned the untouched seed into `18446744073709552000` on the way past, and re-serialising to a temp file persisted the corruption. Every integer above 2^53 anywhere in the graph is affected, including ones the caller never mentioned. Python's `int` is arbitrary-precision so `comfy` itself is exact; the loss is entirely ours and vanishes once our JS stops handling the graph JSON.
+
+The user's own workflow files are still never modified — the temp copy is what gets edited. Surface `data.warnings` from the set-slot envelope.
+
+**Caller-supplied values:** reject an integer that is not `Number.isSafeInteger` with an actionable message, and accept a **string of digits** as the exact escape hatch (verified: `ADDR=VALUE` travels as command-line text and never becomes a JS number). The schema already clamps integer `maximum` to `MAX_SAFE_INTEGER`, so a model planning from it will not propose an unsafe value unprompted.
 
 Value encoding matters: numbers unquoted, strings raw (`6.text=a photo of a cat`). Test that a value containing `=` survives (split on the **first** `=` only) and that a multiline prompt round-trips.
 
