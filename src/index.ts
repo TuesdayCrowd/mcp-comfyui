@@ -207,6 +207,12 @@ async function main(): Promise<void> {
  * to resolve in that case; the two virtual paths already match textually.
  */
 function isMainModule(): boolean {
+  // A remote specifier — `deno run jsr:@scope/pkg` or an https: URL. There is
+  // no filesystem path to compare against, and `fileURLToPath` THROWS on any
+  // non-file scheme, which crashed the module before `main()` was ever reached.
+  // A remote entry is the entry: nothing here imports this module remotely.
+  if (!import.meta.url.startsWith("file:")) return true;
+
   if (process.argv[1] === undefined) return false;
   const here = fileURLToPath(import.meta.url);
   try {
