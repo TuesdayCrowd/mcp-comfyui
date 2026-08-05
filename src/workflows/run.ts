@@ -238,6 +238,13 @@ export interface WorkflowRun {
    * dropping them silently would hide the drift that produced them.
    */
   unrecognisedLines: string[];
+  /**
+   * What actually took, for each address the caller set — see
+   * {@link EffectiveParameter}. Empty when
+   * {@link RunWorkflowOptions.requestedValues} was omitted or empty; nothing
+   * is scanned for in that case.
+   */
+  effectiveParameters: EffectiveParameter[];
 }
 
 export interface RunWorkflowOptions {
@@ -256,6 +263,16 @@ export interface RunWorkflowOptions {
    * `--wait` run needs a budget matching the workflow; a submit does not.
    */
   timeoutMs?: number;
+  /**
+   * The values the caller asked to set, keyed by address — exactly what
+   * `applySlots` was given. Used only to build
+   * {@link WorkflowRun.effectiveParameters}: for each key here, `runWorkflow`
+   * checks what the submitted graph's own `prompt_preview` report of itself
+   * actually holds at that address, and says so — `applied` (from
+   * `set-slot`) is only an echo of what was ASKED, never proof of what took.
+   * Omitted or `{}` skips the check entirely; nothing is scanned for.
+   */
+  requestedValues?: Record<string, string | number | boolean>;
 }
 
 /**
@@ -398,6 +415,262 @@ function sanitiseEvent(event: RunEvent): RunEvent {
   return clean as RunEvent;
 }
 
+/**
+ * Effective parameters: what the submitted graph actually holds, for each
+ * address the caller asked to set.
+ *
+ * `applied` — `set-slot`'s own answer — is only an echo of the addresses it
+ * was HANDED, not a record of what changed (`workflow.py:313` is literally
+ * `list(overrides_dict.keys())`). This is the check that catches the gap:
+ * landmine #15 is exactly a case where `set-slot` reported an address
+ * `applied` while the graph `comfy run` actually submitted never carried it
+ * at all — a caller who trusted `applied` alone would never know.
+ *
+ * ## Reading the graph without landmine #14 recurring
+ *
+ * `comfy run --json` hands the whole submitted graph back on the
+ * `prompt_preview` event, unconditionally — see {@link GRAPH_FIELD} — and the
+ * ordinary decode in {@link decodeStream} already runs every line through
+ * `JSON.parse`, which rounds any integer past 2^53 before this module ever
+ * sees a value. That parse has ALREADY happened by the time an event reaches
+ * {@link sanitiseEvent}, which is why the field is dropped outright rather
+ * than repaired after the fact — the damage is done.
+ *
+ * So this is a SEPARATE, second parse of the SAME raw line text — never the
+ * value `decodeStream`'s own `JSON.parse` produced — guarded by
+ * {@link guardLargeIntegers} first: every bare integer literal outside a
+ * string that would lose precision through `JSON.parse` is rewritten as a
+ * JSON string of its own exact digits before parsing, so it survives as
+ * text rather than becoming a rounded `number`. The guarded parse is used
+ * once, to pull out the handful of addresses the caller asked about, and is
+ * then discarded — the full parsed object never leaves
+ * {@link extractEffectiveParameters}, and neither does the raw graph text.
+ */
+
+/** What one requested address turned out to hold in the submitted graph. */
+export type EffectiveParameterStatus =
+  /** The submitted graph carries this address with the exact value requested. */
+  | "confirmed"
+  /** The submitted graph carries this address, but with a different value. */
+  | "mismatch"
+  /**
+   * The address does not appear in the submitted graph at all — landmine
+   * #15's actual failure mode: `set-slot` can report an address `applied`
+   * that the submit never carried.
+   */
+  | "missing"
+  /**
+   * The submitted graph's own report of itself never arrived (no
+   * `prompt_preview` line), or this address could not even be parsed into a
+   * node id and field name. Not the same claim as `missing`: this is
+   * "could not be checked", not "checked and it is not there".
+   */
+  | "unconfirmed";
+
+/** One requested address, and what the submitted graph actually holds for it. */
+export interface EffectiveParameter {
+  address: string;
+  status: EffectiveParameterStatus;
+  /** What the caller asked to set. */
+  requested: string | number | boolean;
+  /**
+   * What the submitted graph holds for this address, exactly — an integer at
+   * or above 2^53 arrives as a string of its own exact digits, never a
+   * rounded JS number (see {@link guardLargeIntegers}). Absent when `status`
+   * is `missing` or `unconfirmed`, where there is nothing to report.
+   */
+  submitted?: string | number | boolean | null;
+}
+
+/**
+ * `text`, with every bare JSON integer literal that would lose precision
+ * through `JSON.parse` rewritten as a JSON STRING of its own exact digits.
+ *
+ * Tracks exactly one piece of state — "am I inside a JSON string right now"
+ * — which is enough: a bare (unquoted) number can only ever appear outside a
+ * string in valid JSON, so nothing inside a string literal is ever touched,
+ * whatever digits it happens to contain. Floats and exponent forms are left
+ * alone too — `sys.float_info.max`-style values are ordinary f64s that
+ * round-trip well enough between JS and Python; only a bare INTEGER past
+ * 2^53 is the landmine (a ComfyUI seed goes to 2^64−1).
+ *
+ * The result is used once, by {@link extractEffectiveParameters}, to pull a
+ * handful of values out via ordinary property access, and is discarded
+ * immediately after — see that function's own doc comment for why rewriting
+ * the graph this way does not make it safe to hand back whole.
+ */
+function guardLargeIntegers(text: string): string {
+  let out = "";
+  let inString = false;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i]!;
+    if (inString) {
+      out += ch;
+      if (ch === "\\" && i + 1 < text.length) {
+        out += text[i + 1];
+        i += 2;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      i++;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      i++;
+      continue;
+    }
+    if (ch === "-" || (ch >= "0" && ch <= "9")) {
+      const start = i;
+      let j = ch === "-" ? i + 1 : i;
+      while (j < text.length && text[j]! >= "0" && text[j]! <= "9") j++;
+      let isInteger = true;
+      if (text[j] === ".") {
+        isInteger = false;
+        j++;
+        while (j < text.length && text[j]! >= "0" && text[j]! <= "9") j++;
+      }
+      if (text[j] === "e" || text[j] === "E") {
+        isInteger = false;
+        j++;
+        if (text[j] === "+" || text[j] === "-") j++;
+        while (j < text.length && text[j]! >= "0" && text[j]! <= "9") j++;
+      }
+      const token = text.slice(start, j);
+      out += isInteger && unsafeIntegerLiteral(token) ? `"${token}"` : token;
+      i = j;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/** Whether a bare JSON integer literal (optionally signed, digits only) falls outside f64's exact range. */
+function unsafeIntegerLiteral(token: string): boolean {
+  try {
+    const value = BigInt(token);
+    return value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER);
+  } catch {
+    // Not reachable for a token this function's own caller constructs (an
+    // optional leading `-` and digits only), but a token this cannot read as
+    // an integer is by definition not one whose precision needs guarding.
+    return false;
+  }
+}
+
+/**
+ * An address split at its first `.` into `[nodeId, field]` — the shape every
+ * address `applySlots` accepts takes: `<instance_id>.<name>`. `undefined` for
+ * anything else (no dot, or a dot as the first or last character), reported
+ * as `unconfirmed` rather than guessed at.
+ */
+function splitAddress(address: string): { nodeId: string; field: string } | undefined {
+  const dot = address.indexOf(".");
+  if (dot <= 0 || dot === address.length - 1) return undefined;
+  return { nodeId: address.slice(0, dot), field: address.slice(dot + 1) };
+}
+
+/**
+ * The submitted API-format prompt's value for one address, from an object
+ * already produced by {@link guardLargeIntegers} + `JSON.parse` — never from
+ * the ordinary, precision-lossy parse {@link decodeStream} performs for its
+ * own event decode.
+ */
+function submittedValueOf(
+  prompt: unknown,
+  nodeId: string,
+  field: string,
+): { found: true; value: string | number | boolean | null } | { found: false } {
+  if (!isRecord(prompt)) return { found: false };
+  const node = prompt[nodeId];
+  if (!isRecord(node)) return { found: false };
+  const inputs = node["inputs"];
+  if (!isRecord(inputs) || !Object.hasOwn(inputs, field)) return { found: false };
+  const value = inputs[field];
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return { found: true, value };
+  }
+  return { found: false };
+}
+
+/**
+ * Whether a requested value and a submitted one are the same value.
+ *
+ * Same JS type: direct equality. Different type: compared as text, which is
+ * exact either way a caller can legally have sent a number as a string —
+ * finding 1's escape hatch for an integer above 2^53 (never turned into a JS
+ * number by this module at all, so its string form IS its only form), or an
+ * ordinary numeric string for a slot `applySlots` knows is numeric (sent
+ * unquoted, so the graph holds it as a plain number). A boolean never
+ * matches a string or number this way — `String(true)` is `"true"`, which
+ * cannot equal a numeric token — so this cannot manufacture a false match
+ * across genuinely different kinds of value.
+ */
+function valuesMatch(
+  requested: string | number | boolean,
+  submitted: string | number | boolean | null,
+): boolean {
+  if (submitted === null) return false;
+  if (typeof requested === typeof submitted) return requested === submitted;
+  const requestedIsTextual = typeof requested === "string" || typeof requested === "number";
+  const submittedIsTextual = typeof submitted === "string" || typeof submitted === "number";
+  return requestedIsTextual && submittedIsTextual && String(requested) === String(submitted);
+}
+
+/**
+ * Effective parameters for every address in `requested`, checked against the
+ * raw text of the `prompt_preview` line — see this section's own top-level
+ * doc comment for why a second, guarded parse of that SAME line is used
+ * rather than the value {@link decodeStream}'s ordinary decode already
+ * produced.
+ *
+ * `rawGraphLine` is `undefined` both when no such line ever arrived and when
+ * `decodeStream` did not bother looking (nothing was requested) — either way
+ * every requested address is `unconfirmed`, correctly: this function was
+ * never given evidence to say otherwise.
+ */
+function extractEffectiveParameters(
+  rawGraphLine: string | undefined,
+  requested: Record<string, string | number | boolean>,
+): EffectiveParameter[] {
+  const addresses = Object.keys(requested);
+  if (addresses.length === 0) return [];
+
+  let prompt: unknown;
+  if (rawGraphLine !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(guardLargeIntegers(rawGraphLine));
+      prompt = isRecord(parsed) ? parsed[GRAPH_FIELD] : undefined;
+    } catch {
+      prompt = undefined;
+    }
+  }
+
+  return addresses.map((address) => {
+    // Every value in `requested` came from `Object.keys` of the same object,
+    // so this lookup cannot miss.
+    const requestedValue = requested[address]!;
+    const parts = splitAddress(address);
+    if (prompt === undefined || parts === undefined) {
+      return { address, status: "unconfirmed", requested: requestedValue };
+    }
+
+    const found = submittedValueOf(prompt, parts.nodeId, parts.field);
+    if (!found.found) return { address, status: "missing", requested: requestedValue };
+
+    return {
+      address,
+      status: valuesMatch(requestedValue, found.value) ? "confirmed" : "mismatch",
+      requested: requestedValue,
+      submitted: found.value,
+    };
+  });
+}
+
 /** The exit code and a bounded look at both streams. */
 function streamDiagnostics(run: ComfyRun): string {
   return (
@@ -444,6 +717,15 @@ interface DecodedStream {
    * that a run chatty enough to lose its `queued` event can still be found.
    */
   promptId: string | null;
+  /**
+   * The raw, UNPARSED text of the first line whose event carried the
+   * submitted graph (a top-level {@link GRAPH_FIELD} key) — for
+   * {@link extractEffectiveParameters}, which parses it a second time, under
+   * its own guard. Never the parsed value itself: that parse has already
+   * happened by the time this is captured, and has already rounded whatever
+   * this field exists to read exactly. `null` when no such line appeared.
+   */
+  rawGraphLine: string | null;
 }
 
 /**
@@ -463,6 +745,7 @@ function decodeStream(workflowPath: string, stdout: string): DecodedStream {
   const unrecognised: string[] = [];
   let envelope: ParsedEnvelope | null = null;
   let promptId: string | null = null;
+  let rawGraphLine: string | null = null;
 
   const remember = (line: string): void => {
     if (unrecognised.length < MAX_UNRECOGNISED_LINES) unrecognised.push(snippet(line));
@@ -516,6 +799,14 @@ function decodeStream(workflowPath: string, stdout: string): DecodedStream {
     if (promptId === null && typeof event.data.prompt_id === "string") {
       promptId = event.data.prompt_id;
     }
+    // Captured from `value` — the parse this loop already performed — never
+    // re-parsed here: the point is only to remember WHICH raw line carried a
+    // `prompt` key, so `extractEffectiveParameters` can re-read that exact
+    // text later, under its own guard. The first such line is kept; the
+    // submitted graph does not change mid-run.
+    if (rawGraphLine === null && isRecord(value) && isRecord(value[GRAPH_FIELD])) {
+      rawGraphLine = line;
+    }
     all.push(sanitiseEvent(event.data));
   }
 
@@ -526,6 +817,7 @@ function decodeStream(workflowPath: string, stdout: string): DecodedStream {
     envelope,
     unrecognised,
     promptId,
+    rawGraphLine,
   };
 }
 
@@ -651,6 +943,10 @@ export async function runWorkflow(
       events: stream.events,
       eventsTruncated: stream.eventsTruncated,
       unrecognisedLines: stream.unrecognised,
+      effectiveParameters: extractEffectiveParameters(
+        stream.rawGraphLine ?? undefined,
+        opts.requestedValues ?? {},
+      ),
     };
   } finally {
     prepared.dispose();

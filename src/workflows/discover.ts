@@ -109,6 +109,24 @@ export interface WorkflowFile {
   /** ISO 8601, from the file's mtime. */
   modified: string;
   /**
+   * Whether the file's own JSON declares a subgraph — `definitions.subgraphs`
+   * non-empty — or `null` when the file could not be read or parsed, on the
+   * same reasoning as {@link node_count}: this is a claim about a graph that
+   * was successfully read.
+   *
+   * Informational only. An earlier diagnosis of this workflow shape concluded
+   * a subgraph's controls could not be parameterised through comfy-cli at all
+   * and this field was meant to drive a hard refusal in `describe_workflow`/
+   * `run_workflow`. That diagnosis was wrong — measured directly against a
+   * live run, `convert_ui_to_api` resolves a subgraph's own inputs correctly.
+   * What it gets wrong is narrower, is not specific to subgraphs, and is
+   * reported per-slot instead: see {@link inertInputsOf}. This field survives
+   * only as a cheap heads-up for a human scanning `list_workflows` — "this one
+   * has a subgraph, its settable addresses may run deeper than two segments" —
+   * and must never gate whether a workflow can be described or run.
+   */
+  has_subgraphs: boolean | null;
+  /**
    * Why an `invalid` file is invalid — absent on everything else. Both a corrupt
    * file and an unreadable one are `invalid`, but their fixes are not the same
    * (repair the file versus fix a permission bit), and the enum has no room to
@@ -196,10 +214,23 @@ function isMissing(cause: unknown): boolean {
   return (cause as NodeJS.ErrnoException | null)?.code === "ENOENT";
 }
 
-type Classification = Pick<WorkflowFile, "format" | "node_count" | "problem">;
+type Classification = Pick<WorkflowFile, "format" | "node_count" | "has_subgraphs" | "problem">;
 
 function invalid(problem: string): Classification {
-  return { format: "invalid", node_count: null, problem };
+  return { format: "invalid", node_count: null, has_subgraphs: null, problem };
+}
+
+/**
+ * Whether a parsed workflow's own JSON declares a non-empty
+ * `definitions.subgraphs` array. An empty `definitions` object, or an empty
+ * `subgraphs` array, does not count — both are the ordinary shape of a
+ * workflow with no subgraph in it at all.
+ */
+function declaresSubgraphs(graph: Record<string, unknown>): boolean {
+  const definitions = asRecord(graph["definitions"]);
+  if (definitions === undefined) return false;
+  const subgraphs = definitions["subgraphs"];
+  return Array.isArray(subgraphs) && subgraphs.length > 0;
 }
 
 /**
@@ -249,13 +280,15 @@ function classify(text: string): Classification {
     return invalid("not a JSON object, so it holds neither a frontend graph nor an API prompt");
   }
 
+  const hasSubgraphs = declaresSubgraphs(graph);
+
   const nodes = graph["nodes"];
   if (Array.isArray(nodes) && Array.isArray(graph["links"])) {
-    return { format: "frontend", node_count: nodes.length };
+    return { format: "frontend", node_count: nodes.length, has_subgraphs: hasSubgraphs };
   }
 
   const apiNodes = apiNodeCount(graph);
-  if (apiNodes !== undefined) return { format: "api", node_count: apiNodes };
+  if (apiNodes !== undefined) return { format: "api", node_count: apiNodes, has_subgraphs: hasSubgraphs };
 
   return invalid(
     "no `nodes` and `links` arrays (frontend format) and no values carrying `class_type` (API format)",
@@ -404,4 +437,323 @@ export async function discoverWorkflows(opts: DiscoverOptions = {}): Promise<Wor
   workflows.sort((a, b) => compare(a.name, b.name));
 
   return { workflows, unreadable };
+}
+
+/**
+ * Inert inputs: a widget-backed slot whose stored value ComfyUI's own graph
+ * execution overrides from a link to another node.
+ *
+ * ## The bug this replaces
+ *
+ * The original diagnosis of `audio_stable_audio_3_medium.json` concluded that
+ * a subgraph's own controls could not be parameterised through comfy-cli at
+ * all, because setting the addresses `comfy workflow slots` listed for it
+ * produced no change in the output. That diagnosis was wrong. Measured
+ * directly: `convert_ui_to_api` resolves a subgraph's own exposed inputs
+ * correctly — setting `52/31.value`, `52/36.value` and `52/3.seed` (the
+ * addresses this module identifies as effective, below) produced exactly the
+ * requested 60 seconds of black metal. What actually happened is that two
+ * *specific* addresses among the ones listed — `52/6.text` and
+ * `52/11.seconds` — are decoys: their nodes' widgets are wired to links from
+ * other real nodes inside the subgraph, so whatever value `set-slot` writes
+ * there is never read once the graph executes.
+ *
+ * ## The rule, and why it is not about subgraphs at all
+ *
+ * A ComfyUI node input can be widget-backed (editable directly) and linked
+ * (connected to another node's output) at the same time — the UI keeps the
+ * widget as a fallback for when the link is removed. When both are present,
+ * execution always uses the link, never the widget. That is completely
+ * ordinary graph semantics and has nothing to do with subgraphs: ANY
+ * workflow where a widget was converted to an input and then wired to a real
+ * producing node has this exact shape, at any nesting depth including zero.
+ * So this function is keyed on link topology, never on
+ * `definitions.subgraphs` — see the top-level generalisation test in
+ * `discover.test.ts`.
+ *
+ * The one link origin that does NOT make an input a decoy is the subgraph's
+ * own input boundary — a synthetic pseudo-node ComfyUI gives a negative id
+ * (`-10`, measured; see {@link isBoundaryOrigin}). A link from there means
+ * "this widget's value is the subgraph instance's own exposed input, passed
+ * straight through," which is exactly the case that already works.
+ *
+ * ## What is reported
+ *
+ * For each decoy address, the immediate upstream node (one hop, never chased
+ * further — see {@link cleanCandidatesOf}) and, when that upstream node has
+ * its own clean (non-decoy) widget input(s), the address(es) a caller might
+ * want to set instead. Both `describe_workflow` (which excludes a decoy from
+ * its schema and lists it separately) and `run_workflow` (which refuses a
+ * call that sets one) are built on this.
+ */
+
+/** `52/6.text`-shaped: prefixed by every enclosing subgraph instance's own id, slash-joined. */
+export interface InertUpstream {
+  node_id: string;
+  node_type: string;
+  /**
+   * Addresses on the upstream node whose own widget is authoritative — found
+   * exactly one hop away, never chased through a further decoy (see
+   * {@link cleanCandidatesOf}). Empty when none could be identified; never
+   * invented.
+   */
+  candidate_addresses: string[];
+}
+
+/** One decoy address, and what actually supplies its value instead. */
+export interface InertInput {
+  address: string;
+  /** `null` when the link's origin node could not be resolved at all. */
+  upstream: InertUpstream | null;
+}
+
+function isNodeRecord(value: unknown): value is Record<string, unknown> {
+  return asRecord(value) !== undefined;
+}
+
+/** The `id` field of a node or a subgraph, as the string every address segment uses. */
+function idOf(record: Record<string, unknown>): string | undefined {
+  const id = record["id"];
+  if (typeof id === "number" || typeof id === "string") return String(id);
+  return undefined;
+}
+
+function typeOf(record: Record<string, unknown>): string {
+  const type = record["type"];
+  return typeof type === "string" ? type : "";
+}
+
+/**
+ * `link_id -> origin_id`, from either shape this codebase has measured: the
+ * top-level frontend format's array-of-arrays
+ * `[id, origin_id, origin_slot, target_id, target_slot, type]`, or a
+ * subgraph's own `links`, an array of `{id, origin_id, ...}` objects.
+ * `discover.ts` already carries prior art for exactly this kind of format
+ * variance (`classify`'s frontend/API split); this is the same shape of
+ * problem one level down, inside `definitions.subgraphs`.
+ */
+function linkOriginsOf(raw: unknown): Map<number, number> {
+  const origins = new Map<number, number>();
+  if (!Array.isArray(raw)) return origins;
+  for (const entry of raw) {
+    if (Array.isArray(entry)) {
+      const [id, originId] = entry as unknown[];
+      if (typeof id === "number" && typeof originId === "number") origins.set(id, originId);
+      continue;
+    }
+    const record = asRecord(entry);
+    if (record === undefined) continue;
+    const id = record["id"];
+    const originId = record["origin_id"];
+    if (typeof id === "number" && typeof originId === "number") origins.set(id, originId);
+  }
+  return origins;
+}
+
+/**
+ * Whether a link origin id is the subgraph input boundary rather than a real,
+ * computing node. Only `-10` has actually been measured. Every other
+ * negative id is still treated as the boundary — the safe direction, per this
+ * module's doc comment: a false decoy label hides a working control, which is
+ * worse than this function occasionally missing one. A non-negative id is
+ * always a real node.
+ */
+function isBoundaryOrigin(originId: number): boolean {
+  return originId < 0;
+}
+
+/** One widget-backed input, with the raw `link` field ComfyUI stored for it. */
+interface WidgetInput {
+  name: string;
+  link: number | null;
+}
+
+/**
+ * The widget-backed inputs of one node — the only inputs `comfy workflow
+ * slots` ever addresses. An input with no `widget` marker is a pure graph
+ * connection with no stored value of its own, so it is never a candidate
+ * here at all, decoy or otherwise.
+ */
+function widgetInputsOf(node: Record<string, unknown>): WidgetInput[] {
+  const inputs = node["inputs"];
+  if (!Array.isArray(inputs)) return [];
+  const found: WidgetInput[] = [];
+  for (const entry of inputs) {
+    const input = asRecord(entry);
+    if (input === undefined || asRecord(input["widget"]) === undefined) continue;
+    const name = input["name"];
+    if (typeof name !== "string") continue;
+    const link = input["link"];
+    found.push({ name, link: typeof link === "number" ? link : null });
+  }
+  return found;
+}
+
+type InputStatus =
+  | { kind: "effective" }
+  | { kind: "decoy"; originId: number };
+
+/** Effective (no link, or a link from the subgraph boundary) or a decoy (a link from a real node). */
+function classifyInput(input: WidgetInput, links: Map<number, number>): InputStatus {
+  if (input.link === null) return { kind: "effective" };
+  const originId = links.get(input.link);
+  // Unresolvable — a link id `links` has no entry for — is treated the same
+  // safe direction as an unrecognised negative origin: this function must
+  // never manufacture a decoy label from data it could not actually read.
+  if (originId === undefined || isBoundaryOrigin(originId)) return { kind: "effective" };
+  return { kind: "decoy", originId };
+}
+
+/**
+ * Addresses on `origin` whose own widget is authoritative — found by
+ * classifying `origin`'s own widget inputs against the SAME scope's `links`,
+ * exactly once. Deliberately not recursive: chasing a decoy's decoy back to
+ * whatever eventually IS authoritative is an unbounded graph walk for a
+ * feature that exists to answer one question ("what do I set instead") with
+ * one hop's worth of evidence. Where that hop lands on another decoy, this
+ * returns no candidates rather than a wrong one, and the caller still has the
+ * upstream node's identity to keep tracing by hand.
+ */
+function cleanCandidatesOf(
+  origin: Record<string, unknown>,
+  originId: string,
+  prefix: string,
+  links: Map<number, number>,
+): string[] {
+  const candidates: string[] = [];
+  for (const input of widgetInputsOf(origin)) {
+    if (classifyInput(input, links).kind === "decoy") continue;
+    candidates.push(`${prefix}${originId}.${input.name}`);
+  }
+  return candidates;
+}
+
+/** One subgraph definition, indexed and normalised for {@link analyseScope}. */
+interface SubgraphDef {
+  nodes: Record<string, unknown>[];
+  links: Map<number, number>;
+}
+
+/** `definitions.subgraphs`, keyed by the subgraph's own `id` — the string a referencing node's `type` carries. */
+function indexSubgraphs(root: Record<string, unknown>): Map<string, SubgraphDef> {
+  const index = new Map<string, SubgraphDef>();
+  const definitions = asRecord(root["definitions"]);
+  const subgraphs = definitions?.["subgraphs"];
+  if (!Array.isArray(subgraphs)) return index;
+  for (const entry of subgraphs) {
+    const subgraph = asRecord(entry);
+    if (subgraph === undefined) continue;
+    const id = subgraph["id"];
+    if (typeof id !== "string") continue;
+    const rawNodes = subgraph["nodes"];
+    const nodes = Array.isArray(rawNodes) ? rawNodes.filter(isNodeRecord) : [];
+    index.set(id, { nodes, links: linkOriginsOf(subgraph["links"]) });
+  }
+  return index;
+}
+
+/**
+ * Walk one scope — the top-level graph, or one subgraph's interior — and
+ * record every decoy address found in it. Recurses into any node that is
+ * itself an instance of a known subgraph (`node.type` matching a subgraph's
+ * own `id`), prefixing that subgraph's addresses with `<node id>/`, which is
+ * what produces `52/6.text` from top-level node `52` and inner node `6`, or a
+ * longer slash-joined path for deeper nesting.
+ *
+ * A decoy's upstream candidate is always resolved against `nodesById`/`links`
+ * from THIS SAME call — a link can only ever connect two nodes in the same
+ * scope (the boundary sentinel is the one exception, and it is not a real
+ * node to look up at all) — so no cross-scope bookkeeping is needed.
+ */
+function analyseScope(
+  nodes: readonly Record<string, unknown>[],
+  links: Map<number, number>,
+  prefix: string,
+  subgraphsByType: Map<string, SubgraphDef>,
+  results: Map<string, InertInput>,
+): void {
+  const nodesById = new Map<string, Record<string, unknown>>();
+  for (const node of nodes) {
+    const id = idOf(node);
+    if (id !== undefined) nodesById.set(id, node);
+  }
+
+  for (const node of nodes) {
+    const id = idOf(node);
+    if (id === undefined) continue;
+    const subgraph = subgraphsByType.get(typeOf(node));
+    if (subgraph !== undefined) {
+      analyseScope(subgraph.nodes, subgraph.links, `${prefix}${id}/`, subgraphsByType, results);
+    }
+  }
+
+  for (const node of nodes) {
+    const id = idOf(node);
+    if (id === undefined) continue;
+    for (const input of widgetInputsOf(node)) {
+      const status = classifyInput(input, links);
+      if (status.kind !== "decoy") continue;
+
+      const address = `${prefix}${id}.${input.name}`;
+      const originNode = nodesById.get(String(status.originId));
+      results.set(address, {
+        address,
+        upstream:
+          originNode === undefined
+            ? null
+            : {
+                node_id: String(status.originId),
+                node_type: typeOf(originNode),
+                candidate_addresses: cleanCandidatesOf(originNode, String(status.originId), prefix, links),
+              },
+      });
+    }
+  }
+}
+
+/**
+ * Every decoy address in a parsed workflow graph, keyed by address exactly as
+ * `comfy workflow slots` reports it.
+ *
+ * Pure and total: given any object, including one with no `nodes`,
+ * `definitions` or either, this returns an empty map rather than throwing.
+ * The graph is not modified or copied beyond the small per-scope index this
+ * needs.
+ */
+export function inertInputsOf(graph: Record<string, unknown>): Map<string, InertInput> {
+  const results = new Map<string, InertInput>();
+  const rawNodes = graph["nodes"];
+  const topNodes = Array.isArray(rawNodes) ? rawNodes.filter(isNodeRecord) : [];
+  analyseScope(topNodes, linkOriginsOf(graph["links"]), "", indexSubgraphs(graph), results);
+  return results;
+}
+
+/**
+ * {@link inertInputsOf}, reading and parsing the workflow file itself.
+ *
+ * Independent of {@link discoverWorkflows}: `describe_workflow` and
+ * `run_workflow` both accept an absolute path outside every configured root
+ * (see `resolveWorkflow` in `tools.ts`), where no listing exists to consult,
+ * and this has to work for that case too.
+ *
+ * Never throws. A file this cannot read or parse yields an empty map rather
+ * than a decoy list — this function only ever ADDS a refusal reason to
+ * `run_workflow`; the very next step (`comfy workflow set-slot`) reads the
+ * same file and is what actually diagnoses a missing or corrupt one.
+ */
+export async function inertInputsOfFile(path: string): Promise<Map<string, InertInput>> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch {
+    return new Map();
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return new Map();
+  }
+  const graph = asRecord(value);
+  return graph === undefined ? new Map() : inertInputsOf(graph);
 }

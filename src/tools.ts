@@ -31,11 +31,11 @@ import {
   workflowRoots,
   type Environment,
 } from "./config.ts";
-import { toolAnswer, WorkflowNotFoundError } from "./toolResult.ts";
+import { InertSlotError, toolAnswer, WorkflowNotFoundError } from "./toolResult.ts";
 import { describeSlots } from "./workflows/describe.ts";
-import { discoverWorkflows } from "./workflows/discover.ts";
+import { discoverWorkflows, inertInputsOfFile, type InertInput } from "./workflows/discover.ts";
 import { listSlots } from "./workflows/slots.ts";
-import { runWorkflow, type WorkflowRun } from "./workflows/run.ts";
+import { runWorkflow, type EffectiveParameter, type WorkflowRun } from "./workflows/run.ts";
 import { applySlots, type SlotInputs } from "./workflows/setSlots.ts";
 
 /**
@@ -213,6 +213,37 @@ async function resolveWorkflow(handle: string, config: ToolConfig): Promise<Reso
   );
 }
 
+/**
+ * Refuse `run_workflow` before anything is spawned, when one or more
+ * requested addresses are decoys — see `workflows/discover.ts`'s
+ * `inertInputsOf` for the rule. Reads the workflow file directly, independent
+ * of `comfy`, so the refusal costs nothing beyond the file this server was
+ * about to touch anyway.
+ *
+ * Every offending address is named at once rather than stopping at the
+ * first: a caller fixing one at a time against a workflow with several would
+ * otherwise spend one round trip per address.
+ */
+async function refuseInertInputs(resolved: ResolvedWorkflow, inputs: SlotInputs | undefined): Promise<void> {
+  const addresses = Object.keys(inputs ?? {});
+  if (addresses.length === 0) return;
+
+  const inertInputs = await inertInputsOfFile(resolved.path);
+  if (inertInputs.size === 0) return;
+
+  const offending: InertInput[] = [];
+  for (const address of addresses) {
+    const found = inertInputs.get(address);
+    if (found !== undefined) offending.push(found);
+  }
+  if (offending.length > 0) {
+    throw new InertSlotError(
+      resolved.name,
+      offending.map((entry) => ({ address: entry.address, upstream: entry.upstream })),
+    );
+  }
+}
+
 // --- wire shapes ---------------------------------------------------------
 
 function instanceBody(instance: RunningInstance): Record<string, unknown> {
@@ -322,6 +353,43 @@ function cancelBody(result: CancelResult): Record<string, unknown> {
 }
 
 /**
+ * A loud warning for every requested address the submitted graph did not
+ * confirm — `missing` or `mismatch` only. `unconfirmed` is deliberately
+ * silent: it means "the submitted graph's own report of itself never
+ * arrived", which is not evidence of anything having gone wrong, only that
+ * this particular check could not be made.
+ *
+ * This is precisely the check that would have caught the benchmark bug: a
+ * caller reading only `applied` — `set-slot`'s own echo of what it was
+ * ASKED, never proof of what took — cannot tell a real success from
+ * `set-slot` reporting an address `applied` that the submitted graph never
+ * carried at all. A `warnings` entry is placed where every other warning
+ * already lands, rather than trusting a caller to go read a new field on
+ * their own.
+ */
+function effectiveParameterWarnings(parameters: EffectiveParameter[]): Array<Record<string, unknown>> {
+  return parameters
+    .filter((parameter) => parameter.status === "missing" || parameter.status === "mismatch")
+    .map((parameter) =>
+      parameter.status === "missing"
+        ? {
+            code: "value_not_submitted",
+            message:
+              `${parameter.address} was requested but does not appear in the submitted graph at all; ` +
+              `the value was not applied to this run.`,
+            address: parameter.address,
+          }
+        : {
+            code: "value_mismatch",
+            message:
+              `${parameter.address} was requested as ${JSON.stringify(parameter.requested)} but the ` +
+              `submitted graph carries ${JSON.stringify(parameter.submitted)} instead.`,
+            address: parameter.address,
+          },
+    );
+}
+
+/**
  * A run's answer.
  *
  * `events` is deliberately absent. A completed run's events are the sampler
@@ -331,11 +399,18 @@ function cancelBody(result: CancelResult): Record<string, unknown> {
  * run is the opposite case and its events travel on the error, because that is
  * where the traceback is.
  *
- * The two warning sources are merged into one list rather than nested, because
- * a caller wants to know whether anything is wrong, not which of two CLI
- * invocations said so — but each entry keeps a `source`, since the fix for "the
- * value you set is out of range" and "only one output node returned anything"
- * are not remotely the same.
+ * `applied` (from `set-slot`) and `effective_parameters` (from the submitted
+ * graph's own `prompt_preview` report of itself) are BOTH kept, deliberately:
+ * `applied` is what was asked, `effective_parameters` is what took, and the
+ * difference between them is the whole reason the second one exists — see
+ * `workflows/run.ts`'s `extractEffectiveParameters`.
+ *
+ * The three warning sources are merged into one list rather than nested,
+ * because a caller wants to know whether anything is wrong, not which of
+ * three checks said so — but each entry keeps a `source`, since the fix for
+ * "the value you set is out of range", "only one output node returned
+ * anything" and "the value you set was silently discarded" are not remotely
+ * the same.
  */
 function runBody(
   workflow: ResolvedWorkflow,
@@ -350,10 +425,15 @@ function runBody(
     terminal: run.terminal,
     prompt_id: run.promptId,
     applied,
+    effective_parameters: run.effectiveParameters,
     outputs: outputsBody(run.outputs, instance),
     warnings: [
       ...setSlotWarnings.map((warning) => ({ source: "set_slot", ...warning })),
       ...run.warnings.map((warning) => ({ source: "run", ...warning })),
+      ...effectiveParameterWarnings(run.effectiveParameters).map((warning) => ({
+        source: "effective_parameters",
+        ...warning,
+      })),
     ],
     elapsed_seconds: run.elapsedSeconds,
     event_count: run.events.length,
@@ -577,8 +657,11 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "run_workflow both take a workflow by the `name` in this listing, or by its absolute " +
         "`path`. Only entries with `format: \"frontend\"` — the graph the ComfyUI editor saves — " +
         "can be described or run; `api` is the Export (API) form, which these tools do not read, " +
-        "and `invalid` carries a `problem` saying what is wrong with the file. Set " +
-        "MCP_COMFYUI_WORKFLOW_DIRS (colon-separated, like PATH) to change the directories scanned.",
+        "and `invalid` carries a `problem` saying what is wrong with the file. `has_subgraphs` is " +
+        "informational only — it does not block describing or running a workflow — and means its " +
+        "settable addresses may run deeper than the usual `<id>.<name>`, e.g. `52/6.text`; " +
+        "describe_workflow's `inert` list is what actually says which addresses on it are decoys. " +
+        "Set MCP_COMFYUI_WORKFLOW_DIRS (colon-separated, like PATH) to change the directories scanned.",
       inputSchema: {},
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
@@ -608,7 +691,12 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "workflow file currently holds, so a run with no inputs uses those values. `unresolved` " +
         "lists inputs whose constraints could not be recovered — usually an uninstalled custom " +
         "node, or a dropdown whose model list is empty on this machine; those inputs are still " +
-        "settable, but the schema cannot say what they accept. Reads node definitions from a " +
+        "settable, but the schema cannot say what they accept. `inert` lists addresses that exist " +
+        "on the workflow but are decoys: ComfyUI's own graph execution overrides that widget from a " +
+        "link to another node, so a value set there is silently never read — these are deliberately " +
+        "absent from `schema.properties`, and run_workflow refuses a call that sets one. Each `inert` " +
+        "entry names the upstream node that actually supplies the value, and a candidate address to " +
+        "set instead where one could be identified. Reads node definitions from a " +
         "local cache, so it normally works while ComfyUI is stopped." +
         (config.autoLaunch
           ? " If that cache is missing or stale and ComfyUI is not running, this will start " +
@@ -632,13 +720,18 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           ...target(config),
           objectInfoPath: objectInfoCachePath(location),
         });
-        const described = describeSlots(listing.slots, objectInfo);
+        // A THIRD read of the same file, independent of the CLI entirely: the
+        // decoy analysis is pure JS over the raw graph, and `listSlots` never
+        // sees the link topology that decides it.
+        const inertInputs = await inertInputsOfFile(resolved.path);
+        const described = describeSlots(listing.slots, objectInfo, inertInputs);
 
         return {
           workflow: { name: resolved.name, path: resolved.path },
           slot_count: listing.count,
           schema: described.schema,
           unresolved: described.unresolved,
+          inert: described.inert,
         };
       }),
   );
@@ -650,8 +743,10 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
       description:
         "Run a workflow, optionally overriding its inputs. Call describe_workflow first to learn " +
         "valid input addresses and value constraints; run_workflow inputs are keyed by slot " +
-        "address such as `3.seed`. The workflow file is never modified — the values are applied " +
-        "to a private copy. " +
+        "address such as `3.seed`. Setting an address describe_workflow lists under `inert` is " +
+        "refused outright, before anything runs: that address is a decoy whose value ComfyUI's " +
+        "own graph execution overrides from a link to another node, so the value would never take " +
+        "effect. The workflow file is never modified — the values are applied to a private copy. " +
         "By DEFAULT this submits the run and returns immediately with a `prompt_id` and no " +
         "outputs: poll get_job with that id until `terminal` is true to collect them. Pass " +
         "`wait: true` to block until the run finishes and get the output paths back directly, " +
@@ -699,6 +794,11 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
     async ({ workflow, inputs, wait, timeout_seconds }) =>
       toolAnswer(async () => {
         const resolved = await resolveWorkflow(workflow, config);
+        // Before anything else, and independent of the CLI entirely: a decoy
+        // address writes its value nowhere ComfyUI reads it, so nothing below
+        // this line — no CLI spawn, no launch, no submit — may run for a call
+        // that sets one.
+        await refuseInertInputs(resolved, inputs as SlotInputs | undefined);
         const timeoutMs =
           timeout_seconds === undefined
             ? wait
@@ -738,7 +838,16 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // ownership of the prepared copy and removes it in a `finally` on every
         // path, so it is the only owner — but only from the moment it is
         // entered, and anything that threw first would leak the temp directory.
-        const run = await runWorkflow(prepared, { ...target(config), wait, timeoutMs });
+        //
+        // `requestedValues` is the caller's own `inputs`, not `prepared.applied`:
+        // it is what builds `effective_parameters`, and the caller's original
+        // values are what a mismatch is measured against.
+        const run = await runWorkflow(prepared, {
+          ...target(config),
+          wait,
+          timeoutMs,
+          requestedValues: inputs as SlotInputs | undefined,
+        });
 
         return runBody(resolved, prepared.applied, prepared.warnings, run, instance);
       }),

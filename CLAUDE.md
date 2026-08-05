@@ -64,7 +64,23 @@ These are not style preferences. Each was measured, and each has a test pinning 
 
 The full list of verified landmines — each with the measurement behind it — is in [`docs/comfy-cli-ground-truth.md`](docs/comfy-cli-ground-truth.md). **Read it before changing anything that touches the CLI.** Several were found only after the bug they caused; none is inferred.
 
-**Subgraph workflows are not usable through comfy-cli** (ground truth #15). `convert_ui_to_api` drops the subgraph's input widget values and submits the inner nodes' stale ones, so `describe_workflow` will offer addresses that are inert and `run_workflow` will report success on a graph nobody configured. Until that is fixed upstream, treat a workflow containing `definitions.subgraphs` as unsupported rather than silently mis-running it.
+**Some slot addresses are decoys** (ground truth #15). An input that is link-fed rather than widget-backed is listed by `slots` and reported `applied` by `set-slot`, but its value is resolved from upstream during conversion and silently discarded. Setting the inert pair on `audio_stable_audio_3_medium.json` produced 150s of tropical house for a request of "black metal, 60s"; setting the upstream primitives that feed those links produced exactly 60.000s of the requested prompt. Subgraph workflows are fully usable — the hazard is picking the wrong address, so the server must mark the inert ones rather than offering both alike.
+
+## Working here without wasting turns
+
+Rules earned by getting each of these wrong in this repo, usually more than once. They are about tool use, not about ComfyUI.
+
+**Never assert what you have not run.** In this project every claim that was *measured* held up, and roughly half of what was *inferred* about comfy-cli was wrong — the `age < 0` mtime guard would have disabled the object_info cache entirely; "set-slot silently ignores a bad address" was backwards (it hard-fails); "`MCP_COMFYUI_WORKSPACE` fixes artifact paths" is impossible by construction. Before a factual claim about the CLI goes into a task brief, a doc, or a commit message, run the command. `docs/comfy-cli-ground-truth.md` exists so this only has to be paid once per fact.
+
+**Verify the effect before measuring the cost.** A benchmark of a run that did the wrong thing is worse than no benchmark. Check the submitted graph, the output file, the actual dimensions — *then* time it.
+
+**Shell discipline.** Every one of these cost a wasted turn:
+
+- More than one pipe, or any heredoc → **write a script file and run the file.** Inlining is where backtick interpolation and quoting failures come from.
+- **Never post-process `but status` or `bun test` through `grep`/`awk`.** `but status -fv` prints box-drawing characters that become garbage "IDs"; `bun test | grep -A` buffers and gets backgrounded. Write output to a file, then read the file.
+- **Pass data to a child process explicitly**, never through an ambient shell variable — `FOO=x bun --eval '…process.env.FOO…'` in one compound command does not do what it looks like.
+- **Never run two `bun test` invocations at once.** They contend, 5-second budgets blow, and you will diagnose your own contention as a defect.
+- Check a command exists before scripting around it (`but mark` does not).
 
 ## Testing
 

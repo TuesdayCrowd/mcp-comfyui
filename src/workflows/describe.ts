@@ -1,4 +1,5 @@
 import type { NodeSchema, ObjectInfo } from "../comfy/objectInfo.ts";
+import type { InertInput, InertUpstream } from "./discover.ts";
 import type { Slot } from "./slots.ts";
 
 /**
@@ -108,20 +109,45 @@ export interface UnresolvedSlot {
 }
 
 /**
- * The schema, and the slots it could not constrain.
+ * A slot whose stored value is a decoy: ComfyUI's own graph execution
+ * overrides it from a link to another node, so nothing `run_workflow` writes
+ * there is ever read. See `discover.ts`'s `inertInputsOf` for the rule and
+ * the measured example this exists to fix — a benchmark request for "black
+ * metal, 60 seconds" against `audio_stable_audio_3_medium.json` that produced
+ * 150 seconds of stock tropical house, because the two addresses set were
+ * exactly this kind of decoy.
+ */
+export interface InertSlot {
+  address: string;
+  name: string;
+  node_type: string;
+  /** What actually supplies the value instead, when this server could identify it one hop upstream. */
+  upstream: InertUpstream | null;
+}
+
+/**
+ * The schema, the slots it could not constrain, and the slots it refused to
+ * offer at all.
  *
- * The two are siblings rather than one nested in the other because they have
- * different audiences. `schema` goes to an MCP client as-is (Task 5), so it has
- * to be a standalone JSON Schema document with nothing bolted onto it — an
- * `x-unresolved` key inside it would travel into every tool listing and mean
- * nothing to the validator that reads it. `unresolved` is for the operator, who
- * is the only one who can install the missing custom node, and who otherwise
- * has no way to distinguish "this input takes anything" from "this server could
- * not find out what this input takes".
+ * Three siblings rather than any of them nested, because they have three
+ * different audiences and one document cannot serve all of them undecorated.
+ * `schema` goes to an MCP client as-is, so it has to be a standalone JSON
+ * Schema document with nothing bolted onto it — an `x-unresolved` or
+ * `x-inert` key inside it would travel into every tool listing and mean
+ * nothing to the validator that reads it. `unresolved` is for the operator,
+ * who is the only one who can install a missing custom node, and who
+ * otherwise has no way to distinguish "this input takes anything" from "this
+ * server could not find out what this input takes". `inert` is for whoever
+ * is about to call `run_workflow`: every address here would be silently
+ * ignored if set, which is why none of them appear in `schema.properties` at
+ * all — offering an address that does nothing is worse than not offering it,
+ * matching the same reasoning that already puts `additionalProperties: false`
+ * on the schema.
  */
 export interface WorkflowDescription {
   schema: WorkflowInputSchema;
   unresolved: UnresolvedSlot[];
+  inert: InertSlot[];
 }
 
 /**
@@ -465,22 +491,50 @@ function describeSlot(
  * @param slots  from `listSlots`, in the order the CLI reported them.
  * @param objectInfo  from `getObjectInfo`, for the same instance the slots came
  * from. Passing `{}` is legal and yields the fully degraded description.
+ * @param inertInputs  from `discover.ts`'s `inertInputsOf`/`inertInputsOfFile`,
+ * keyed by address exactly as `slots` carries them. A slot found here is
+ * reported under {@link WorkflowDescription.inert} instead of
+ * `schema.properties`, and never reaches {@link describeSlot} at all — a
+ * decoy's own bounds and enum are true facts about the node, but stating them
+ * would still invite a caller to set a value nothing reads. Omitted or empty
+ * behaves exactly as this function did before decoy detection existed.
  */
-export function describeSlots(slots: Slot[], objectInfo: ObjectInfo): WorkflowDescription {
+export function describeSlots(
+  slots: Slot[],
+  objectInfo: ObjectInfo,
+  inertInputs: ReadonlyMap<string, InertInput> = new Map(),
+): WorkflowDescription {
   // A Map, then `Object.fromEntries`: assigning `properties[slot.address]` sets
   // the prototype rather than an own property when the address is `__proto__`,
   // which would leave `Object.keys` empty and the serialised `properties` `{}`
   // while `unresolved` still described an entry that was not there.
   const properties = new Map<string, InputSchema>();
   const unresolved: UnresolvedSlot[] = [];
+  const inert: InertSlot[] = [];
+  // Every address already accounted for, across BOTH outputs — a slot decided
+  // to be a decoy must never also be visited for `properties`/`unresolved`,
+  // and a duplicate of either kind must still resolve only once.
+  const seen = new Set<string>();
 
   for (const slot of slots) {
     // Addresses are unique within a listing — they are the keys `set-slot`
     // takes, so the CLI could not accept a duplicate either. If one arrives
-    // anyway, the first wins for both outputs; last-wins on `properties` while
-    // `unresolved` collected every slot would let the two disagree about what
-    // the document contains.
-    if (properties.has(slot.address)) continue;
+    // anyway, the first wins for every output; last-wins on `properties` while
+    // `unresolved`/`inert` collected every slot would let them disagree about
+    // what the document contains.
+    if (seen.has(slot.address)) continue;
+    seen.add(slot.address);
+
+    const decoy = inertInputs.get(slot.address);
+    if (decoy !== undefined) {
+      inert.push({
+        address: slot.address,
+        name: slot.name,
+        node_type: slot.node_type,
+        upstream: decoy.upstream,
+      });
+      continue;
+    }
 
     const { schema, reason } = describeSlot(slot, objectInfo);
     properties.set(slot.address, schema);
@@ -501,5 +555,6 @@ export function describeSlots(slots: Slot[], objectInfo: ObjectInfo): WorkflowDe
       additionalProperties: false,
     },
     unresolved,
+    inert,
   };
 }

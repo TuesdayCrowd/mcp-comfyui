@@ -930,6 +930,214 @@ test("the source workflow is untouched by a run", async () => {
   expect(readFileSync(source, "utf8")).toBe(before);
 });
 
+// --- effective parameters: what was actually submitted ---------------------
+//
+// `applied` (from `set-slot`) is only an echo of the addresses requested —
+// `workflow.py:313` is literally `list(overrides_dict.keys())` — and proves
+// nothing about the submitted graph. This is the check that would have
+// caught the benchmark bug landmine #15 describes in one call instead of a
+// whole run: `set-slot` reported `52/6.text` "applied" while the submitted
+// graph never carried it at all.
+//
+// Constraint that must hold throughout (landmine #14): the submitted graph
+// must never reach a caller whole, and an integer at or above 2^53 in it must
+// never round-trip through a JS number.
+
+/** One node's worth of an API-format prompt, as `prompt_preview` emits it. */
+function promptNode(classType: string, inputs: Record<string, unknown>): Record<string, unknown> {
+  return { class_type: classType, inputs };
+}
+
+/** A `prompt_preview` event line carrying `graph` as the literal, unparsed JSON text of `prompt`. */
+function promptPreviewLine(graphJson: string): string {
+  return `{"schema":"event/1","type":"prompt_preview","prompt":${graphJson},"prompt_id":null}`;
+}
+
+test("an ordinary value is confirmed when the submitted graph carries it unchanged", async () => {
+  const graph = JSON.stringify({ "6": promptNode("CLIPTextEncode", { text: "black metal" }) });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "6.text": "black metal" },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    { address: "6.text", status: "confirmed", requested: "black metal", submitted: "black metal" },
+  ]);
+});
+
+test("a 2^64-1 seed is reported byte-exact, never rounded, when confirmed", async () => {
+  // The landmine itself: `comfy` emits the bare, unquoted digits, and ordinary
+  // `JSON.parse` would round them to ROUNDED_SEED before this module ever saw
+  // the value. The digit-preserving guard is what this test pins.
+  const graph = `{"3":{"class_type":"KSampler","inputs":{"seed":${HUGE_SEED},"steps":20}}}`;
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "3.seed": HUGE_SEED },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    { address: "3.seed", status: "confirmed", requested: HUGE_SEED, submitted: HUGE_SEED },
+  ]);
+  const wire = JSON.stringify(result);
+  expect(wire).toContain(HUGE_SEED);
+  expect(wire).not.toContain(ROUNDED_SEED);
+});
+
+test("a value the submitted graph disagrees with is a mismatch, not silently confirmed", async () => {
+  // The mutation this pins: a comparison that always reports "confirmed"
+  // regardless of what the graph actually holds.
+  const graph = JSON.stringify({ "3": promptNode("KSampler", { seed: 222 }) });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "3.seed": "111" },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    { address: "3.seed", status: "mismatch", requested: "111", submitted: 222 },
+  ]);
+});
+
+test("an address absent from the submitted graph is reported missing, not silently confirmed", async () => {
+  // Landmine #15's actual failure mode: `set-slot` can report an address
+  // `applied` that the submitted graph never carries at all.
+  const graph = JSON.stringify({ "3": promptNode("KSampler", { steps: 20 }) }); // no `seed` at all
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "3.seed": 42 },
+  });
+
+  expect(result.effectiveParameters).toEqual([{ address: "3.seed", status: "missing", requested: 42 }]);
+});
+
+test("an address on a node absent from the submitted graph entirely is also missing", async () => {
+  const graph = JSON.stringify({ "9": promptNode("SaveImage", {}) }); // node 3 never submitted
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "3.seed": 42 },
+  });
+
+  expect(result.effectiveParameters).toEqual([{ address: "3.seed", status: "missing", requested: 42 }]);
+});
+
+test("no prompt_preview event at all leaves every requested address unconfirmed", async () => {
+  // Not the same claim as "missing": this is "could not be checked", not
+  // "checked and it is not there".
+  serveStream(`${[...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`);
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "3.seed": 42 },
+  });
+
+  expect(result.effectiveParameters).toEqual([{ address: "3.seed", status: "unconfirmed", requested: 42 }]);
+});
+
+test("nothing requested yields an empty report", async () => {
+  serveStream(completedStream());
+  const result = await runWorkflow(await prepare(), { wait: true });
+  expect(result.effectiveParameters).toEqual([]);
+});
+
+test("booleans compare directly and a numeric string matches the graph's own number", async () => {
+  const graph = JSON.stringify({ "3": promptNode("KSampler", { add_noise: true, steps: 20 }) });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    // "20", a string, for a value the graph holds as the JS number 20 —
+    // exactly what `encodeString` sends unquoted for a slot known numeric.
+    requestedValues: { "3.add_noise": true, "3.steps": "20" },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    { address: "3.add_noise", status: "confirmed", requested: true, submitted: true },
+    { address: "3.steps", status: "confirmed", requested: "20", submitted: 20 },
+  ]);
+});
+
+test("a boolean requested does not falsely match a differently-typed submitted value", async () => {
+  const graph = JSON.stringify({ "3": promptNode("KSampler", { add_noise: "true" }) }); // a STRING, not a bool
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "3.add_noise": true },
+  });
+
+  expect(result.effectiveParameters[0]?.status).toBe("mismatch");
+});
+
+test("the full submitted graph never reaches the caller, even through effective-parameter extraction", async () => {
+  // The general defence behind the named `prompt` drop in `sanitiseEvent`,
+  // proven again here: a huge graph is scanned only for the ONE address asked
+  // about, and nothing else in it — other nodes, other class_types, other
+  // huge integers nobody requested — is ever carried into the result.
+  const big: Record<string, unknown> = {};
+  for (let i = 0; i < 400; i++) {
+    big[String(i)] = promptNode("KSampler", { seed: HUGE_SEED, steps: i });
+  }
+  big["3"] = promptNode("KSampler", { seed: 42 });
+  const graph = JSON.stringify(big);
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "3.seed": 42 },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    { address: "3.seed", status: "confirmed", requested: 42, submitted: 42 },
+  ]);
+  // Scoped to effectiveParameters alone: `result.events` legitimately carries
+  // its own, unrelated "KSampler" in the `executing` event's declared
+  // `class_type` field, which is not what this test is pinning.
+  const params = JSON.stringify(result.effectiveParameters);
+  expect(params).not.toContain(ROUNDED_SEED);
+  expect(params).not.toContain(HUGE_SEED); // no OTHER node's huge seed leaked either
+  expect(params).not.toContain("KSampler"); // no class_type reached the caller via this path
+  expect(params.length).toBeLessThan(200); // nowhere near the ~15KB raw graph
+});
+
+test("an address this server cannot parse (no dot) is unconfirmed rather than guessed at", async () => {
+  const graph = JSON.stringify({ "3": promptNode("KSampler", { seed: 42 }) });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { malformed: 42 },
+  });
+
+  expect(result.effectiveParameters).toEqual([{ address: "malformed", status: "unconfirmed", requested: 42 }]);
+});
+
 // --- the fixtures are the real contract ----------------------------------
 
 /** The subset of JSON Schema the two copied contracts use. */

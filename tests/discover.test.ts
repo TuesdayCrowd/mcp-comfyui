@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DEFAULT_WORKFLOW_DIR, workflowRoots } from "../src/config";
@@ -7,6 +7,8 @@ import {
   type WorkflowFile,
   type WorkflowListing,
   discoverWorkflows,
+  inertInputsOf,
+  inertInputsOfFile,
 } from "../src/workflows/discover";
 
 /**
@@ -593,4 +595,252 @@ test("discoverWorkflows falls back to the configured roots", async () => {
   const listing = await discoverWorkflows({ env: { MCP_COMFYUI_WORKFLOW_DIRS: root } });
 
   expect(names(listing)).toEqual(["graph"]);
+});
+
+// --- has_subgraphs: informational only, never a refusal --------------------
+//
+// A first diagnosis of this feature concluded a subgraph-controlled workflow
+// could not be run through comfy-cli at all, and this field was meant to back
+// a hard refusal in describe_workflow/run_workflow. That diagnosis was wrong
+// — measured directly against a live run, the conversion resolves a
+// subgraph's own inputs correctly; what it gets wrong is which *inner*
+// addresses are decoys (see the "inert inputs" section below), which is an
+// orthogonal, per-slot fact. `has_subgraphs` survives only as a cheap,
+// informational signal for list_workflows.
+
+test("a workflow with a non-empty definitions.subgraphs is flagged has_subgraphs", async () => {
+  const root = makeRoot();
+  write(
+    root,
+    "graph.json",
+    JSON.stringify({
+      nodes: [{ id: 1 }],
+      links: [],
+      definitions: { subgraphs: [{ id: "sg-1", nodes: [] }] },
+    }),
+  );
+
+  const listing = await discoverWorkflows({ roots: [root] });
+
+  expect(byName(listing, "graph").has_subgraphs).toBe(true);
+});
+
+test("an empty definitions.subgraphs array is not flagged", async () => {
+  const root = makeRoot();
+  write(
+    root,
+    "graph.json",
+    JSON.stringify({ nodes: [{ id: 1 }], links: [], definitions: { subgraphs: [] } }),
+  );
+
+  const listing = await discoverWorkflows({ roots: [root] });
+
+  expect(byName(listing, "graph").has_subgraphs).toBe(false);
+});
+
+test("an empty definitions object does not slip through as having subgraphs", async () => {
+  // Mutation guard: a check narrowed to merely "does `definitions` exist"
+  // would wrongly flag this. `definitions: {}` carries no subgraphs at all.
+  const root = makeRoot();
+  write(root, "graph.json", JSON.stringify({ nodes: [{ id: 1 }], links: [], definitions: {} }));
+
+  const listing = await discoverWorkflows({ roots: [root] });
+
+  expect(byName(listing, "graph").has_subgraphs).toBe(false);
+});
+
+test("no definitions key at all is not flagged", async () => {
+  const root = makeRoot();
+  write(root, "graph.json", frontend());
+
+  const listing = await discoverWorkflows({ roots: [root] });
+
+  expect(byName(listing, "graph").has_subgraphs).toBe(false);
+});
+
+test("has_subgraphs is null for an invalid file, unknowable rather than false", async () => {
+  // Same reasoning as node_count: null is a claim this could not be checked,
+  // not a claim the file has no subgraphs.
+  const root = makeRoot();
+  write(root, "broken.json", "{ not json");
+
+  const listing = await discoverWorkflows({ roots: [root] });
+
+  expect(byName(listing, "broken").has_subgraphs).toBeNull();
+});
+
+test("has_subgraphs is reported on the real, measured subgraph workflow", async () => {
+  const root = makeRoot();
+  const real = readFileSync(join(import.meta.dir, "fixtures", "audio_stable_audio_3_medium.json"), "utf8");
+  write(root, "audio.json", real);
+
+  const listing = await discoverWorkflows({ roots: [root] });
+
+  expect(byName(listing, "audio").format).toBe("frontend"); // still fully usable
+  expect(byName(listing, "audio").has_subgraphs).toBe(true);
+});
+
+// --- inert inputs: a widget a link overrides at execution time -------------
+//
+// The corrected diagnosis: a subgraph's own inputs convert correctly.
+// What is actually broken is narrower and NOT specific to subgraphs at all —
+// any widget-backed input that is fed by a link from a real, computing node
+// has its stored value overridden at execution time, so setting it through
+// `set-slot` does nothing. The one exception is a link whose origin is the
+// subgraph's own input boundary (a negative `origin_id`, `-10` measured),
+// which is not a "real node" and leaves the widget authoritative.
+
+/** A node with zero or more widget-backed inputs, each optionally linked. */
+function node(
+  id: number,
+  type: string,
+  inputs: Array<{ name: string; link?: number | null; widget?: boolean }> = [],
+): Record<string, unknown> {
+  return {
+    id,
+    type,
+    inputs: inputs.map((i) => ({
+      name: i.name,
+      link: i.link ?? null,
+      ...(i.widget === false ? {} : { widget: { name: i.name } }),
+    })),
+  };
+}
+
+/** A top-level link, in the `[id, origin_id, origin_slot, target_id, target_slot, type]` array form. */
+function arrayLink(id: number, originId: number, targetId: number): unknown[] {
+  return [id, originId, 0, targetId, 0, "*"];
+}
+
+/** A subgraph-interior link, in the `{id, origin_id, ...}` object form. */
+function objectLink(id: number, originId: number, targetId: number): Record<string, unknown> {
+  return { id, origin_id: originId, origin_slot: 0, target_id: targetId, target_slot: 0, type: "*" };
+}
+
+const REAL_SUBGRAPH_FIXTURE = join(import.meta.dir, "fixtures", "audio_stable_audio_3_medium.json");
+
+test("the real subgraph workflow: measured decoys are flagged, measured effective controls are not", async () => {
+  // Ground truth from a live run, not inference: setting 52/6.text and
+  // 52/11.seconds produced 150s of stock tropical house regardless (the
+  // widgets are decoys); setting 52/31.value, 52/36.value and 52/3.seed
+  // produced exactly the requested 60s of black metal (the widgets are the
+  // real controls).
+  const inert = await inertInputsOfFile(REAL_SUBGRAPH_FIXTURE);
+
+  expect(inert.has("52/6.text")).toBe(true);
+  expect(inert.has("52/11.seconds")).toBe(true);
+  expect(inert.has("52/31.value")).toBe(false);
+  expect(inert.has("52/36.value")).toBe(false);
+  expect(inert.has("52/3.seed")).toBe(false);
+});
+
+test("a decoy names the upstream node, and a clean candidate one hop away when there is one", async () => {
+  // 52/11.seconds is fed by node 36 (PrimitiveFloat); node 36's own `value`
+  // input is itself clean — its link originates at the subgraph boundary
+  // (-10), not at another real node — so it is a usable candidate.
+  const inert = await inertInputsOfFile(REAL_SUBGRAPH_FIXTURE);
+
+  expect(inert.get("52/11.seconds")).toEqual({
+    address: "52/11.seconds",
+    upstream: { node_id: "36", node_type: "PrimitiveFloat", candidate_addresses: ["52/36.value"] },
+  });
+});
+
+test("a decoy chained through another decoy names the node but invents no candidate", async () => {
+  // 52/6.text is fed by node 34 (ComfySwitchNode). Node 34's own addressable
+  // input (`switch`) is ITSELF fed by a link from a real node (35), so no
+  // clean address is even one hop away — and none is guessed at.
+  const inert = await inertInputsOfFile(REAL_SUBGRAPH_FIXTURE);
+
+  expect(inert.get("52/6.text")).toEqual({
+    address: "52/6.text",
+    upstream: { node_id: "34", node_type: "ComfySwitchNode", candidate_addresses: [] },
+  });
+});
+
+test("a widget input with no link at all is effective, no subgraph involved", () => {
+  const graph = { nodes: [node(1, "KSampler", [{ name: "seed" }])], links: [] };
+
+  expect(inertInputsOf(graph).size).toBe(0);
+});
+
+test("the rule generalises past subgraphs: an ordinary top-level link to a real node is a decoy", () => {
+  // Not keyed on definitions.subgraphs at all: any workflow where a widget
+  // was converted to an input and wired to a producing node has this shape.
+  const graph = {
+    nodes: [
+      node(1, "KSampler", [{ name: "seed", link: 10 }]),
+      node(2, "PrimitiveInt", [{ name: "value" }]), // no link -> clean
+    ],
+    links: [arrayLink(10, 2, 1)],
+  };
+
+  const inert = inertInputsOf(graph);
+
+  expect(inert.get("1.seed")).toEqual({
+    address: "1.seed",
+    upstream: { node_id: "2", node_type: "PrimitiveInt", candidate_addresses: ["2.value"] },
+  });
+});
+
+test("a link id with no matching entry is treated as effective, not decoy — the safe direction", () => {
+  const graph = { nodes: [node(1, "KSampler", [{ name: "seed", link: 999 }])], links: [] };
+
+  expect(inertInputsOf(graph).size).toBe(0);
+});
+
+test("any negative origin id is treated as the subgraph boundary, not just -10", () => {
+  // Only -10 has been directly measured. Treating every negative id as the
+  // boundary is the safe direction: a false decoy label would hide a working
+  // control, which is worse than this function missing one.
+  const graph = { nodes: [node(1, "KSampler", [{ name: "seed", link: 10 }])], links: [arrayLink(10, -99, 1)] };
+
+  expect(inertInputsOf(graph).size).toBe(0);
+});
+
+test("an input with no widget marker is never treated as a settable slot at all", () => {
+  const graph = {
+    nodes: [node(2, "SomeSource", []), node(1, "Save", [{ name: "audio", link: 10, widget: false }])],
+    links: [arrayLink(10, 2, 1)],
+  };
+
+  expect(inertInputsOf(graph).size).toBe(0);
+});
+
+test("more than one clean candidate one hop upstream are all listed", () => {
+  const graph = {
+    nodes: [
+      node(1, "Multiplex", [{ name: "a" }, { name: "b" }]),
+      node(2, "Consumer", [{ name: "in", link: 5 }]),
+    ],
+    links: [arrayLink(5, 1, 2)],
+  };
+
+  const inert = inertInputsOf(graph);
+
+  expect(inert.get("2.in")?.upstream?.candidate_addresses.slice().sort()).toEqual(["1.a", "1.b"]);
+});
+
+test("a decoy inside a doubly-nested subgraph gets the full slash-joined address", () => {
+  const graph = {
+    nodes: [node(1, "outer-sg", [])],
+    links: [],
+    definitions: {
+      subgraphs: [
+        { id: "outer-sg", nodes: [node(2, "inner-sg", [])], links: [] },
+        {
+          id: "inner-sg",
+          nodes: [node(3, "KSampler", [{ name: "seed", link: 20 }]), node(4, "PrimitiveInt", [{ name: "value" }])],
+          links: [objectLink(20, 4, 3)],
+        },
+      ],
+    },
+  };
+
+  const inert = inertInputsOf(graph);
+
+  expect(inert.get("1/2/3.seed")).toEqual({
+    address: "1/2/3.seed",
+    upstream: { node_id: "4", node_type: "PrimitiveInt", candidate_addresses: ["1/2/4.value"] },
+  });
 });

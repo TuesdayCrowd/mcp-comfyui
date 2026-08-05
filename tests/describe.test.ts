@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ObjectInfo } from "../src/comfy/objectInfo";
+import type { InertInput } from "../src/workflows/discover";
 import type { Slot } from "../src/workflows/slots";
 import { describeSlots, type InputSchema, type WorkflowDescription } from "../src/workflows/describe";
 
@@ -621,6 +622,87 @@ test("a repeated address yields one property and one report", () => {
 
   expect(Object.keys(described.schema.properties)).toHaveLength(1);
   expect(described.unresolved).toHaveLength(1);
+});
+
+// ---------------------------------------------------------------------------
+// Inert inputs: a decoy is excluded from the schema and reported separately
+// ---------------------------------------------------------------------------
+
+/** A decoy entry as `discover.ts`'s `inertInputsOf` would produce it. */
+function decoy(address: string, upstream: InertInput["upstream"] = null): [string, InertInput] {
+  return [address, { address, upstream }];
+}
+
+test("a decoy address is excluded from schema.properties", () => {
+  const inert = new Map([decoy("3.seed")]);
+
+  const described = describeSlots(imageGen, objectInfo, inert);
+
+  // `Object.hasOwn`, not `toHaveProperty`: the address contains a `.`, which
+  // that matcher reads as a path separator rather than as part of the key.
+  expect(Object.hasOwn(described.schema.properties, "3.seed")).toBe(false);
+});
+
+test("a decoy address is listed in `inert` instead, with its name and node type", () => {
+  const inert = new Map([
+    decoy("3.seed", { node_id: "7", node_type: "PrimitiveInt", candidate_addresses: ["7.value"] }),
+  ]);
+
+  const described = describeSlots(imageGen, objectInfo, inert);
+
+  expect(described.inert).toEqual([
+    {
+      address: "3.seed",
+      name: "seed",
+      node_type: "KSampler",
+      upstream: { node_id: "7", node_type: "PrimitiveInt", candidate_addresses: ["7.value"] },
+    },
+  ]);
+});
+
+test("a decoy with no identifiable upstream is still listed, with upstream null", () => {
+  const inert = new Map([decoy("3.seed", null)]);
+
+  const described = describeSlots(imageGen, objectInfo, inert);
+
+  expect(described.inert[0]?.upstream).toBeNull();
+});
+
+test("a decoy is never also reported unresolved — it never reaches that check at all", () => {
+  const inert = new Map([decoy("3.seed")]);
+
+  const described = describeSlots(imageGen, objectInfo, inert);
+
+  expect(described.unresolved.some((u) => u.address === "3.seed")).toBe(false);
+});
+
+test("an address absent from the inert map is described exactly as before", () => {
+  // Regression: every other slot of a real 13-slot capture is untouched by
+  // passing a (mostly empty) inert map alongside it.
+  const inert = new Map([decoy("3.seed")]);
+
+  const withInert = describeSlots(imageGen, objectInfo, inert);
+  const without = describeSlots(imageGen, objectInfo);
+
+  const otherAddress = "3.sampler_name";
+  expect(withInert.schema.properties[otherAddress]).toEqual(without.schema.properties[otherAddress]);
+});
+
+test("omitting the inert map entirely behaves exactly as it did before this feature existed", () => {
+  // Backward compatible by construction: every call site written before this
+  // parameter existed passes exactly two arguments.
+  expect(describeSlots(imageGen, objectInfo)).toEqual(describeSlots(imageGen, objectInfo, new Map()));
+});
+
+test("a decoy that never appears in the slot listing at all contributes nothing", () => {
+  // The inert map may know about addresses the slots listing does not carry
+  // (a different workflow, a stale cache) — those are simply never visited.
+  const inert = new Map([decoy("999.nonexistent")]);
+
+  const described = describeSlots(imageGen, objectInfo, inert);
+
+  expect(described.inert).toEqual([]);
+  expect(Object.keys(described.schema.properties)).toHaveLength(imageGen.length);
 });
 
 // ---------------------------------------------------------------------------

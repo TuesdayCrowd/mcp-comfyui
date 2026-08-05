@@ -9,6 +9,7 @@ import {
 } from "./comfy/instance.ts";
 import { JobPayloadError } from "./comfy/jobs.ts";
 import { ObjectInfoCacheWriteError, ObjectInfoFetchError } from "./comfy/objectInfo.ts";
+import type { InertUpstream } from "./workflows/discover.ts";
 import { RunContractError, RunFailedError, type RunEvent } from "./workflows/run.ts";
 import { SetSlotContractError, SlotValueError, WorkflowFileError } from "./workflows/setSlots.ts";
 import { SlotListingParseError } from "./workflows/slots.ts";
@@ -68,6 +69,16 @@ export type ToolErrorKind =
   | "invalid_input"
   /** No workflow by that name or path. Carries the names that do exist. */
   | "workflow_not_found"
+  /**
+   * The caller set an address whose value ComfyUI's own graph execution
+   * overrides from a link to another node — a decoy `describe_workflow`
+   * excludes from its schema for the same reason. The caller can fix this by
+   * choosing a different address, so it is caller-actionable like
+   * `invalid_input`, but it gets its own kind because the fix is "use a
+   * different address, named below" rather than "adjust this value" — and
+   * because there may be several offending addresses in one call, not one.
+   */
+  | "inert_slot"
   /** The workflow file could not be read: missing, unreadable, a directory. */
   | "workflow_file"
   /** `/object_info` could not be read, so no constraints could be recovered. */
@@ -124,6 +135,8 @@ export interface ToolErrorBody {
   workflow_path?: string;
   /** `workflow_not_found`: the handles `list_workflows` would return. */
   known_workflows?: string[];
+  /** `inert_slot`: every address requested that would be silently ignored, and what supplies it instead. */
+  inert_addresses?: Array<{ address: string; upstream: InertUpstream | null }>;
   /** `object_info_*`, `launch_timeout`, `launch_failed`: the address or file at fault. */
   url?: string;
   cache_path?: string;
@@ -164,6 +177,59 @@ export class WorkflowNotFoundError extends Error {
     );
     this.known = known;
   }
+}
+
+/** One address `run_workflow` refused, and what actually supplies its value. */
+export interface InertSlotErrorEntry {
+  address: string;
+  upstream: InertUpstream | null;
+}
+
+/**
+ * The caller set an address `discover.ts`'s `inertInputsOf` found to be a
+ * decoy: ComfyUI's own graph execution feeds that node's input from a link to
+ * another node, so the widget `set-slot` writes to is never read once the
+ * graph runs.
+ *
+ * Raised by this layer rather than any library module, on the same reasoning
+ * as {@link WorkflowNotFoundError}: refusing the call is a decision only the
+ * tool surface makes, and it is made **before anything is spawned** — the
+ * measured cost of not catching this is a request for "black metal, 60
+ * seconds" silently producing 150 seconds of stock tropical house, with
+ * `applied: [...]` reporting success the entire time. A caller who sets even
+ * one decoy address gets none of their edits applied: this server cannot know
+ * which of several requested addresses the caller would still want set once
+ * they learn one of them does nothing, so the honest answer is to run nothing
+ * and let them decide.
+ */
+export class InertSlotError extends Error {
+  override readonly name = "InertSlotError";
+  readonly entries: InertSlotErrorEntry[];
+
+  constructor(workflowName: string, entries: InertSlotErrorEntry[]) {
+    super(
+      `${entries.length} of the address${entries.length === 1 ? "" : "es"} requested for ` +
+        `${JSON.stringify(workflowName)} would be silently ignored — ComfyUI's own graph execution ` +
+        `overrides the widget there with a value from a link to another node, so nothing was run:\n` +
+        entries.map(describeInertEntry).join("\n") +
+        `\ndescribe_workflow lists every inert address for this workflow under \`inert\`, alongside ` +
+        `whatever upstream node and candidate address this server could identify for each.`,
+    );
+    this.entries = entries;
+  }
+}
+
+function describeInertEntry(entry: InertSlotErrorEntry): string {
+  const { address, upstream } = entry;
+  if (upstream === null) {
+    return `  ${address}: fed by a link this server could not trace to any node in the graph.`;
+  }
+  const node = `node ${upstream.node_id} (${upstream.node_type || "unknown type"})`;
+  const suggestion =
+    upstream.candidate_addresses.length > 0
+      ? ` Try ${upstream.candidate_addresses.map((a) => JSON.stringify(a)).join(" or ")} instead.`
+      : ` No settable address one hop upstream of ${node} could be identified automatically.`;
+  return `  ${address}: fed by a link from ${node}, not by its own widget.${suggestion}`;
 }
 
 /** A successful tool result: one text block holding the answer as JSON. */
@@ -272,6 +338,9 @@ export function describeError(err: unknown): ToolErrorBody {
   }
   if (err instanceof WorkflowNotFoundError) {
     return { kind: "workflow_not_found", message: err.message, known_workflows: err.known };
+  }
+  if (err instanceof InertSlotError) {
+    return { kind: "inert_slot", message: err.message, inert_addresses: err.entries };
   }
   if (err instanceof WorkflowFileError) {
     // The errno is the actionable part: ENOENT is a wrong name, EACCES is a

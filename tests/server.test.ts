@@ -633,6 +633,17 @@ test("a corrupt workflow is listed with its problem rather than failing the list
   expect(String(workflows[0]?.["problem"] ?? "")).toContain("JSON");
 });
 
+test("list_workflows reports has_subgraphs, informationally — never a refusal", async () => {
+  writeFileSync(join(roots, "audio.json"), readFileSync(join(FIXTURES, "audio_stable_audio_3_medium.json"), "utf8"));
+
+  const body = await ok(await connect(), "list_workflows");
+
+  const workflows = body["workflows"] as Array<Record<string, unknown>>;
+  const audio = workflows.find((entry) => entry["name"] === "audio");
+  expect(audio?.["has_subgraphs"]).toBe(true);
+  expect(audio?.["format"]).toBe("frontend"); // still fully usable, not refused
+});
+
 // --- describe_workflow ---------------------------------------------------
 
 test("describe_workflow returns a JSON Schema keyed by slot address", async () => {
@@ -758,6 +769,55 @@ test("an absolute path outside the configured roots is still accepted", async ()
   expect((body["workflow"] as Record<string, unknown>)["path"]).toBe(outside);
 });
 
+// --- describe_workflow: decoy addresses (a link overrides the widget) ----
+
+/**
+ * A minimal, non-subgraph workflow whose `3.seed` is a decoy: the widget's
+ * own link comes from node 99 (a clean `PrimitiveInt`), so at execution time
+ * ComfyUI reads 99's output, never 3's stored widget value. Deliberately NOT
+ * a subgraph, to exercise the general rule rather than the specific fixture —
+ * `tests/discover.test.ts` and the real `audio_stable_audio_3_medium.json`
+ * fixture cover the subgraph case precisely.
+ */
+function decoyWorkflowBody(): string {
+  return JSON.stringify({
+    nodes: [
+      { id: 3, type: "KSampler", inputs: [{ name: "seed", widget: { name: "seed" }, link: 10 }] },
+      { id: 99, type: "PrimitiveInt", inputs: [{ name: "value", widget: { name: "value" }, link: null }] },
+    ],
+    links: [[10, 99, 0, 3, 0, "INT"]],
+  });
+}
+
+test("describe_workflow excludes a decoy address from schema.properties and lists it under inert", async () => {
+  writeWorkflow("flow", decoyWorkflowBody());
+  seedObjectInfoCache();
+  serveSlots(); // the real 13-slot default_image_gen listing, which includes 3.seed
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "flow" });
+
+  const schema = body["schema"] as { properties: Record<string, unknown> };
+  expect(Object.hasOwn(schema.properties, "3.seed")).toBe(false);
+  expect(body["inert"]).toContainEqual({
+    address: "3.seed",
+    name: "seed",
+    node_type: "KSampler",
+    upstream: { node_id: "99", node_type: "PrimitiveInt", candidate_addresses: ["99.value"] },
+  });
+});
+
+test("describe_workflow's other addresses are unaffected by one decoy", async () => {
+  writeWorkflow("flow", decoyWorkflowBody());
+  seedObjectInfoCache();
+  serveSlots();
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "flow" });
+
+  const schema = body["schema"] as { properties: Record<string, unknown> };
+  expect(Object.hasOwn(schema.properties, "6.text")).toBe(true); // untouched
+  expect(body["slot_count"]).toBe(13); // still the full listing's own count
+});
+
 // --- run_workflow --------------------------------------------------------
 
 test("run_workflow submits without --wait by default and returns the job handle", async () => {
@@ -872,6 +932,139 @@ test("run_workflow surfaces set-slot warnings alongside the run's own", async ()
   expect(warnings[0]?.["field"]).toBe("steps");
 });
 
+// --- effective_parameters: what was actually submitted (landmine #14/#15) --
+
+test("run_workflow reports effective_parameters: what the submitted graph actually holds", async () => {
+  writeWorkflow("flow");
+  serveStream(
+    `${[
+      event("prompt_preview", {
+        prompt: { "3": { class_type: "KSampler", inputs: { seed: 42 } } },
+        prompt_id: null,
+      }),
+      envelopeLine(completedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "3.seed": 42 },
+    wait: true,
+  });
+
+  expect(body["effective_parameters"]).toEqual([
+    { address: "3.seed", status: "confirmed", requested: 42, submitted: 42 },
+  ]);
+});
+
+test("a missing effective parameter produces a loud warning nobody can miss", async () => {
+  // The exact shape of landmine #15's failure: `applied` would still say
+  // "3.seed" was set, but the submitted graph never carried it at all.
+  writeWorkflow("flow");
+  serveStream(
+    `${[
+      event("prompt_preview", {
+        prompt: { "3": { class_type: "KSampler", inputs: { steps: 20 } } }, // no seed at all
+        prompt_id: null,
+      }),
+      envelopeLine(completedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "3.seed": 42 },
+    wait: true,
+  });
+
+  expect(body["applied"]).toContain("3.seed"); // set-slot's echo still claims success
+  expect(body["effective_parameters"]).toEqual([{ address: "3.seed", status: "missing", requested: 42 }]);
+  const warnings = body["warnings"] as Array<Record<string, unknown>>;
+  const effectiveWarning = warnings.find((w) => w["source"] === "effective_parameters");
+  expect(effectiveWarning).toBeDefined();
+  expect(String(effectiveWarning?.["message"])).toContain("3.seed");
+});
+
+test("a mismatched effective parameter also produces a loud warning", async () => {
+  writeWorkflow("flow");
+  serveStream(
+    `${[
+      event("prompt_preview", {
+        prompt: { "3": { class_type: "KSampler", inputs: { seed: 999 } } }, // not the 42 requested
+        prompt_id: null,
+      }),
+      envelopeLine(completedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "3.seed": 42 },
+    wait: true,
+  });
+
+  expect(body["effective_parameters"]).toEqual([
+    { address: "3.seed", status: "mismatch", requested: 42, submitted: 999 },
+  ]);
+  const warnings = body["warnings"] as Array<Record<string, unknown>>;
+  expect(warnings.some((w) => w["source"] === "effective_parameters")).toBe(true);
+});
+
+test("a confirmed effective parameter produces no extra warning", async () => {
+  writeWorkflow("flow");
+  serveStream(
+    `${[
+      event("prompt_preview", {
+        prompt: { "3": { class_type: "KSampler", inputs: { seed: 42 } } },
+        prompt_id: null,
+      }),
+      envelopeLine(completedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "3.seed": 42 },
+    wait: true,
+  });
+
+  expect(body["warnings"]).toEqual([]);
+});
+
+test("effective_parameters is reported for a submit-only run too, not just wait:true", async () => {
+  // Landmine #14: prompt_preview is unconditional in stream mode, not gated
+  // on --wait.
+  writeWorkflow("flow");
+  serveStream(
+    `${[
+      event("prompt_preview", {
+        prompt: { "3": { class_type: "KSampler", inputs: { seed: 42 } } },
+        prompt_id: null,
+      }),
+      event("queued", { prompt_id: PROMPT_ID }),
+      envelopeLine(queuedPayload()),
+    ].join("\n")}\n`,
+  );
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "3.seed": 42 },
+  });
+
+  expect(body["effective_parameters"]).toEqual([
+    { address: "3.seed", status: "confirmed", requested: 42, submitted: 42 },
+  ]);
+});
+
+test("nothing requested yields an empty effective_parameters list", async () => {
+  writeWorkflow("flow");
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "flow" });
+
+  expect(body["effective_parameters"]).toEqual([]);
+});
+
 test("a successful run does not mirror its progress events back", async () => {
   // Measured upstream: a 400-step run produced 107KB of events, all of it
   // destined for a model's context and none of it about the outputs.
@@ -907,6 +1100,109 @@ test("a workflow that cannot be read is refused before anything is spawned", asy
   expect(error["kind"]).toBe("workflow_file");
   expect(error["code"]).toBe("ENOENT");
   expect(error["workflow_path"]).toBe(missing);
+});
+
+// --- run_workflow: decoy addresses are refused, before anything is spawned -
+
+test("run_workflow refuses a call that sets a decoy address, before spawning anything", async () => {
+  writeWorkflow("flow", decoyWorkflowBody());
+
+  const error = await failure(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "3.seed": 42 },
+  });
+
+  expect(error["kind"]).toBe("inert_slot");
+  expect(String(error["message"])).toContain("3.seed");
+  expect(String(error["message"])).toContain("99.value");
+  expect(error["inert_addresses"]).toEqual([
+    {
+      address: "3.seed",
+      upstream: { node_id: "99", node_type: "PrimitiveInt", candidate_addresses: ["99.value"] },
+    },
+  ]);
+  // The CLI was never invoked at all: not even set-slot, let alone run — the
+  // argv file the fake writes on every invocation was never created.
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("run_workflow names every decoy address requested, not just the first", async () => {
+  writeWorkflow(
+    "flow",
+    JSON.stringify({
+      nodes: [
+        { id: 3, type: "KSampler", inputs: [{ name: "seed", widget: { name: "seed" }, link: 10 }] },
+        { id: 6, type: "CLIPTextEncode", inputs: [{ name: "text", widget: { name: "text" }, link: 11 }] },
+        { id: 99, type: "PrimitiveInt", inputs: [{ name: "value", widget: { name: "value" }, link: null }] },
+        { id: 98, type: "PrimitiveString", inputs: [{ name: "value", widget: { name: "value" }, link: null }] },
+      ],
+      links: [
+        [10, 99, 0, 3, 0, "INT"],
+        [11, 98, 0, 6, 0, "STRING"],
+      ],
+    }),
+  );
+
+  const error = await failure(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "3.seed": 42, "6.text": "hello" },
+  });
+
+  expect(error["kind"]).toBe("inert_slot");
+  const addresses = (error["inert_addresses"] as Array<Record<string, unknown>>)
+    .map((entry) => entry["address"])
+    .sort();
+  expect(addresses).toEqual(["3.seed", "6.text"]);
+});
+
+test("run_workflow allows setting the effective address that actually supplies a decoy", async () => {
+  writeWorkflow("flow", decoyWorkflowBody());
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "flow",
+    inputs: { "99.value": 7 },
+  });
+
+  expect(body["status"]).toBe("queued");
+});
+
+test("run_workflow proceeds normally with no inputs, even when the workflow has decoys", async () => {
+  writeWorkflow("flow", decoyWorkflowBody());
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "flow" });
+
+  expect(body["status"]).toBe("queued");
+});
+
+test("run_workflow refuses on the real measured decoy address of the ground-truth workflow", async () => {
+  // The exact benchmark that motivated this feature: setting 52/6.text
+  // produced 150s of stock tropical house regardless of what was asked for.
+  const path = join(workdir, "audio.json");
+  writeFileSync(path, readFileSync(join(FIXTURES, "audio_stable_audio_3_medium.json"), "utf8"));
+
+  const error = await failure(await connect(), "run_workflow", {
+    workflow: path,
+    inputs: { "52/6.text": "black metal" },
+  });
+
+  expect(error["kind"]).toBe("inert_slot");
+  expect(String(error["message"])).toContain("52/6.text");
+});
+
+test("run_workflow accepts the real measured effective addresses of the ground-truth workflow", async () => {
+  // The corrected fix: the SAME workflow, set through its real controls.
+  const path = join(workdir, "audio.json");
+  writeFileSync(path, readFileSync(join(FIXTURES, "audio_stable_audio_3_medium.json"), "utf8"));
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: path,
+    inputs: { "52/31.value": "black metal", "52/36.value": 60, "52/3.seed": 42 },
+  });
+
+  expect(body["status"]).toBe("queued");
 });
 
 // --- errors become actionable results, not opaque transport faults -------
