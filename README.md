@@ -43,6 +43,18 @@ That's it — `npx` fetches and runs the package, no separate build step. Verify
 claude mcp list
 ```
 
+### Deno
+
+The same server is published to [JSR](https://jsr.io/@tuesdaycrowd/mcp-comfyui) as TypeScript source:
+
+```bash
+claude mcp add comfyui -- deno run -A jsr:@tuesdaycrowd/mcp-comfyui
+```
+
+Deno needs all five permissions — it spawns `comfy`, reads workflow files, writes temp copies, talks to `127.0.0.1:8188`, and reads its configuration — so `-A` is the practical form. The long spelling is `--allow-run --allow-read --allow-write --allow-net --allow-env`.
+
+`bunx mcp-comfyui` works too, from the same npm package.
+
 ### From source
 
 Building from a checkout instead (e.g. to test a change) still needs [Bun](https://bun.sh) 1.3+ to run the test suite and the bundler, but the artifact it produces (`dist/index.js`) is a plain Node script — Bun is a build-time tool here, not a runtime dependency of what ships:

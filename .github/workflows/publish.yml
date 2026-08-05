@@ -1,0 +1,39 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # The OIDC ID token authenticates with JSR. No secrets, no access token —
+      # this only works once the package is linked to this repo in its JSR
+      # settings (jsr.io/@tuesdaycrowd/mcp-comfyui -> Settings -> link repo).
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - run: bun install --frozen-lockfile
+
+      # Publishing a broken version is not undoable — JSR refuses to republish a
+      # version number, so a bad one is spent. The gates run first for that
+      # reason, not for tidiness.
+      - name: Test
+        run: bun test
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # `jsr publish` is a no-op when deno.json's version is already published,
+      # so pushing to main without bumping the version is safe and silent.
+      - name: Publish to JSR
+        run: npx jsr publish
