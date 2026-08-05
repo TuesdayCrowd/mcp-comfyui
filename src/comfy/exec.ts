@@ -1,3 +1,5 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import type { Readable } from "node:stream";
 import {
   EnvelopeParseError,
   parseEnvelope,
@@ -113,20 +115,43 @@ export class ComfyTimeoutError extends Error {
  * Drain a pipe to text, with a handle to abandon the read. Killing the child is
  * not enough to end a read: every descendant inherits the pipe's write end, so
  * EOF waits on the slowest grandchild — and `comfy launch` exists precisely to
- * leave one behind. Cancelling the read side is what unblocks us.
+ * leave one behind. `cancel()` destroys *our* end of the pipe instead: that
+ * closes this process's read descriptor outright, which needs no cooperation
+ * from whichever descendant is still holding the write end open, and is the
+ * Node equivalent of the read-side cancellation Bun's `reader.cancel()` did.
  */
-function drain(stream: ReadableStream<Uint8Array>): { text: Promise<string>; cancel: () => void } {
-  const reader = stream.getReader();
-  const text = (async () => {
-    const chunks: Uint8Array[] = [];
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value) chunks.push(value);
-    }
-    return new TextDecoder().decode(Buffer.concat(chunks));
-  })();
-  return { text, cancel: () => void reader.cancel().catch(() => {}) };
+function drain(stream: Readable): { text: Promise<string>; cancel: () => void } {
+  const chunks: Buffer[] = [];
+  let settled = false;
+  let resolveText!: (value: string) => void;
+  let rejectText!: (cause: unknown) => void;
+  const text = new Promise<string>((resolve, reject) => {
+    resolveText = resolve;
+    rejectText = reject;
+  });
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    resolveText(Buffer.concat(chunks).toString("utf8"));
+  };
+  stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+  // `end` is the natural EOF; `close` also fires once `cancel()` destroys the
+  // stream ourselves, which is exactly the case a descendant is still holding
+  // the write end open and no `end` is ever coming.
+  stream.on("end", finish);
+  stream.on("close", finish);
+  stream.on("error", (cause: unknown) => {
+    if (settled) return;
+    settled = true;
+    rejectText(cause);
+  });
+  return { text, cancel: () => void stream.destroy() };
+}
+
+/** Resolve once the child has actually exited — the Node equivalent of Bun's `proc.exited`. */
+function exited(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => child.once("exit", () => resolve()));
 }
 
 /**
@@ -146,34 +171,58 @@ export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promis
   const argv = [binary, SKIP_PROMPT, ...args];
   const commandLine = argv.join(" ");
 
-  let proc: Bun.Subprocess<"ignore", "pipe", "pipe">;
-  try {
-    proc = Bun.spawn(argv, {
-      cwd: opts.cwd,
-      // Passed explicitly: Bun otherwise hands the child the environment as it
-      // stood at startup, so anything set after boot — PATH, COMFYUI_* — would
-      // be invisible to `comfy`.
-      env: process.env,
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "pipe",
+  const child = spawn(binary, [SKIP_PROMPT, ...args], {
+    cwd: opts.cwd,
+    // Passed explicitly, exactly as the Bun implementation did (landmine #17):
+    // Node already forwards live `process.env` by default, unlike Bun, but
+    // every spawn in this project passes `env` on principle so the behaviour
+    // cannot regress if that default ever changes upstream.
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  // Unlike Bun, which throws synchronously when a spawn cannot start, Node
+  // only ever reports it asynchronously via an `error` event — there is no
+  // synchronous failure mode to catch here. `spawn` is the complementary
+  // success signal (fired once the OS call has actually gone through), so
+  // racing the two turns Node's async report back into the same
+  // fails-before-anything-else contract this module already promised its
+  // callers.
+  let startedSettled = false;
+  const started = new Promise<void>((resolve, reject) => {
+    child.once("spawn", () => {
+      startedSettled = true;
+      resolve();
     });
-  } catch (cause) {
-    // Bun throws this synchronously, before any of the handling below applies.
-    throw new ComfyUnavailableError(binary, opts.cwd, cause);
+    // A persistent listener, not `.once`: Node throws (crashing this process)
+    // when an `error` event has no listener at all, and this one must go on
+    // swallowing a *later* error — e.g. one after the child has already
+    // spawned — once the initial race above has already settled.
+    child.on("error", (cause: unknown) => {
+      if (startedSettled) return;
+      startedSettled = true;
+      reject(new ComfyUnavailableError(binary, opts.cwd, cause));
+    });
+  });
+  await started;
+
+  if (child.stdout === null || child.stderr === null) {
+    // Unreachable with `stdio: ["ignore", "pipe", "pipe"]`; keeps the types
+    // honest without a non-null assertion.
+    throw new ComfyUnavailableError(binary, opts.cwd, new Error("child produced no stdio pipes"));
   }
 
   // Both pipes are drained concurrently: reading them in sequence deadlocks as
   // soon as the other one fills its buffer.
-  const out = drain(proc.stdout);
-  const err = drain(proc.stderr);
+  const out = drain(child.stdout);
+  const err = drain(child.stderr);
 
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
     // SIGKILL rather than SIGTERM: the point of the timeout is that this child
     // has stopped behaving, so it gets no say in whether it dies.
-    proc.kill("SIGKILL");
+    child.kill("SIGKILL");
     // ...and killing it is not enough. Descendants hold the same write end, so
     // without cancelling the reads this call would go on waiting for them.
     out.cancel();
@@ -184,13 +233,13 @@ export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promis
   let stderr: string;
   try {
     [stdout, stderr] = await Promise.all([out.text, err.text]);
-    await proc.exited;
+    await exited(child);
   } catch (cause) {
     // A failed drain must not leave the child running: `finally` is about to
     // clear the only timer that would have killed it. Cancel the reads too —
     // a SIGKILL alone leaves any descendant holding the write end, and the
     // surviving reader would then pend forever with nobody awaiting it.
-    proc.kill("SIGKILL");
+    child.kill("SIGKILL");
     out.cancel();
     err.cancel();
     throw cause;
@@ -200,7 +249,7 @@ export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promis
 
   if (timedOut) throw new ComfyTimeoutError(commandLine, timeoutMs, stdout, stderr);
 
-  return { stdout, stderr, exitCode: proc.exitCode, commandLine };
+  return { stdout, stderr, exitCode: child.exitCode, commandLine };
 }
 
 /**

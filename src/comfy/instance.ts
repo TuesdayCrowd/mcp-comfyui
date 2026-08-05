@@ -1,3 +1,4 @@
+import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { AUTO_LAUNCH_ENV, WORKSPACE_ENV } from "../config.ts";
 import { EnvelopeParseError, snippet } from "./envelope.ts";
@@ -874,7 +875,7 @@ async function performLaunch(opts: LaunchOptions, argv: string[], target: Target
     if (isVerdict(failure)) throw explainVerdict(failure, opts.workspace);
 
     if (Date.now() >= deadline) break;
-    await Bun.sleep(opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
+    await delay(opts.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS);
   }
 
   throw new LaunchTimeoutError(targetUrl, timeoutMs, lastReason, describeFailure(cli.failure()));

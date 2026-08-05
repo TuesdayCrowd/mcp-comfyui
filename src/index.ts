@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { TransportSendOptions } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { ErrorCode, isJSONRPCErrorResponse, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
@@ -175,11 +177,48 @@ async function main(): Promise<void> {
   await server.connect(transport);
 }
 
+/**
+ * Whether this module is the one `node`/`bun` was actually asked to run, as
+ * opposed to merely imported — the same question `import.meta.main` answers
+ * natively on both runtimes (verified directly: true when run, false when
+ * imported, on Node v26.5.1 and on Bun, including through the shebang'd,
+ * symlinked file npm's `bin` mechanism installs). It is reimplemented here
+ * rather than used directly because `bun build --target=node` — the tool that
+ * produces the artifact this project ships — rewrites `import.meta.main` into
+ * `__require.main == __require.module`, referencing a `__require` binding
+ * `--target=node`'s own ESM output never defines; every real invocation of
+ * the built bundle would throw a `ReferenceError` before it could even reach
+ * `main()`. `import.meta.url` and `node:fs`/`node:url` are ordinary runtime
+ * values the bundler has no special-cased rewrite for, so this survives the
+ * same build unchanged (checked directly against the built `dist/index.js`).
+ *
+ * `realpathSync` on `process.argv[1]` matters as much as `import.meta.url`
+ * itself: Node resolves the entry module's URL through any symlink, but
+ * leaves `process.argv[1]` as the literal path the shell invoked — exactly
+ * npm's own `bin` symlink — so a strict-equality comparison without it would
+ * read a normal `npx`/global install as "merely imported" and never start.
+ *
+ * The `catch` matters too, and for a different runtime this project also has
+ * to support: `tests/server.test.ts` exercises the real entrypoint by
+ * compiling it with `bun build --compile`, and inside that standalone binary
+ * both `import.meta.url` and `process.argv[1]` are a virtual path —
+ * `/$bunfs/root/<name>` — that is not a real file on disk at all, so
+ * `realpathSync` throws `ENOENT` on it (verified directly). There is nothing
+ * to resolve in that case; the two virtual paths already match textually.
+ */
+function isMainModule(): boolean {
+  if (process.argv[1] === undefined) return false;
+  const here = fileURLToPath(import.meta.url);
+  try {
+    return here === realpathSync(process.argv[1]);
+  } catch {
+    return here === process.argv[1];
+  }
+}
+
 // Guarded so this module can be imported for its pure exports (as
 // `tests/index.test.ts` does) without attaching real stdin/stdout listeners.
-// `bun src/index.ts` — the only way this project actually runs the server —
-// makes `import.meta.main` true.
-if (import.meta.main) {
+if (isMainModule()) {
   try {
     await main();
   } catch (err) {

@@ -138,6 +138,24 @@ test("kills the child and rejects when the timeout expires", async () => {
   expect(isAlive(pidFrom(pidOut))).toBe(false); // actually dead, not merely abandoned
 });
 
+test("the timeout kill signal is specifically SIGKILL, not SIGTERM", async () => {
+  // A plain `sleep 30` dies to either signal, so it cannot tell them apart —
+  // this fixture mode traps and ignores SIGTERM before exec'ing the sleeper,
+  // so only SIGKILL (unblockable) can actually end it. A regression that
+  // downgrades the kill signal would leave this one alive for its full 30s.
+  process.env.FAKE_COMFY_MODE = "hang_ignore_sigterm";
+  const pidOut = join(workdir, "pid");
+  process.env.FAKE_COMFY_PID_OUT = pidOut;
+
+  const started = Date.now();
+  const err = await rejection(runComfy(["run"], { timeoutMs: 250 }));
+  const elapsed = Date.now() - started;
+
+  expect(err).toBeInstanceOf(ComfyTimeoutError);
+  expect(elapsed).toBeLessThan(1_500);
+  expect(isAlive(pidFrom(pidOut))).toBe(false);
+});
+
 test("a timeout that leaves a descendant holding stdout still ends on time", async () => {
   // `comfy launch` exits while leaving a ComfyUI server running, and that
   // server inherits the stdout write end. Killing the child's pid does nothing

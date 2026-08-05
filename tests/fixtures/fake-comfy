@@ -66,6 +66,18 @@ case "$FAKE_COMFY_MODE" in
     [ -n "$FAKE_COMFY_PID_OUT" ] && printf '%s\n' "$$" > "$FAKE_COMFY_PID_OUT"
     # exec so the sleeper keeps this pid: the test asserts on this exact pid.
     exec sleep 30 ;;
+  hang_ignore_sigterm)
+    # Same as `hang`, but proves the SPECIFIC signal a timeout sends: `trap ''
+    # TERM` sets SIGTERM to be ignored (SIG_IGN), and POSIX exec() preserves an
+    # *ignored* disposition across exec (unlike a caught one, which resets to
+    # the default action) -- so the execed `sleep` inherits SIGTERM-ignored and
+    # can only be stopped by SIGKILL, which nothing can block or ignore.
+    # Verified directly: `trap '' TERM; exec sleep N` survives SIGTERM and
+    # dies immediately on SIGKILL.
+    echo 'loading model checkpoint...' >&2
+    [ -n "$FAKE_COMFY_PID_OUT" ] && printf '%s\n' "$$" > "$FAKE_COMFY_PID_OUT"
+    trap '' TERM
+    exec sleep 30 ;;
   orphan)
     # The hard case, and the one `comfy launch` will really produce: the child
     # exits immediately but leaves a descendant holding the stdout write end,

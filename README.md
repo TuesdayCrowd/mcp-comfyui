@@ -27,17 +27,33 @@ That is the difference between a model guessing `Euler` and a model knowing the 
 
 ## Requirements
 
-- [Bun](https://bun.sh) 1.3+
+- [Node.js](https://nodejs.org) 18 or later — verified working on 18, 20, 22, 24 and 26. Bun and Deno run it too (`bunx mcp-comfyui`, `deno run -A npm:mcp-comfyui`), since the server uses only `node:` builtins.
 - `comfy` on your PATH — `uv tool install comfy-cli` (do **not** use the Homebrew tap; it pins 0.0.29, which predates every command this server needs)
 - A ComfyUI instance, running or launchable
 
 ## Install
 
 ```bash
-bun install
-bun run build          # -> dist/mcp-comfyui, a self-contained executable
-claude mcp add comfyui /absolute/path/to/dist/mcp-comfyui
+claude mcp add comfyui -- npx -y mcp-comfyui
 ```
+
+That's it — `npx` fetches and runs the package, no separate build step. Verify Claude can see it:
+
+```bash
+claude mcp list
+```
+
+### From source
+
+Building from a checkout instead (e.g. to test a change) still needs [Bun](https://bun.sh) 1.3+ to run the test suite and the bundler, but the artifact it produces (`dist/index.js`) is a plain Node script — Bun is a build-time tool here, not a runtime dependency of what ships:
+
+```bash
+bun install
+bun run build           # -> dist/index.js, runnable under plain `node`
+claude mcp add comfyui /absolute/path/to/dist/index.js
+```
+
+A `bun run compile` script is also available if a self-contained platform binary (no `node` on PATH required) is preferable to the npm path for a given deployment; it produces `dist/mcp-comfyui`.
 
 ## Configuration
 
