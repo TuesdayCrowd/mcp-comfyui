@@ -62,7 +62,9 @@ These are not style preferences. Each was measured, and each has a test pinning 
 
 **6. Never launch a second ComfyUI.** Detect first, on both the detection target and the address the startup args name. Auto-launch is on by default, so this fires from ordinary tool handlers — hence the single global in-flight launch in `instance.ts`, deliberately *not* keyed by address. `comfy_status` never launches. A tool that may launch cannot be annotated `readOnlyHint: true`.
 
-The full list of 14 verified landmines — each with the measurement behind it — is in [`docs/comfy-cli-ground-truth.md`](docs/comfy-cli-ground-truth.md). **Read it before changing anything that touches the CLI.** Several were found only after the bug they caused; none is inferred.
+The full list of verified landmines — each with the measurement behind it — is in [`docs/comfy-cli-ground-truth.md`](docs/comfy-cli-ground-truth.md). **Read it before changing anything that touches the CLI.** Several were found only after the bug they caused; none is inferred.
+
+**Subgraph workflows are not usable through comfy-cli** (ground truth #15). `convert_ui_to_api` drops the subgraph's input widget values and submits the inner nodes' stale ones, so `describe_workflow` will offer addresses that are inert and `run_workflow` will report success on a graph nobody configured. Until that is fixed upstream, treat a workflow containing `definitions.subgraphs` as unsupported rather than silently mis-running it.
 
 ## Testing
 
