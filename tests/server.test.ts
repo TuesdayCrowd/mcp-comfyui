@@ -1,4 +1,4 @@
-import { afterEach, beforeAll, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, expect, sleep, test } from "./support/testing.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -14,8 +14,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "../src/server";
-import { toolConfig } from "../src/tools";
+import { createServer } from "../src/server.ts";
+import { toolConfig } from "../src/tools.ts";
 
 /**
  * The MCP surface, exercised through a real client over a real transport.
@@ -23,40 +23,76 @@ import { toolConfig } from "../src/tools";
  * No test here may contact a ComfyUI, invoke the real `comfy`, or leave a
  * process behind. Every CLI invocation goes to `tests/fixtures/fake-comfy` (via
  * the dispatcher, since one tool call can make two CLI calls with different
- * subcommands), and every HTTP probe goes to a hermetic `Bun.serve` on an
+ * subcommands), and every HTTP probe goes to a hermetic `Deno.serve` on an
  * ephemeral port. The instance address is never left at its 8188 default, so an
  * accidental probe cannot reach the ComfyUI that may well be running on this
  * machine — and auto-launch is OFF unless a test turns it on, so nothing here
  * can start one.
  */
 
-const FIXTURES = join(import.meta.dir, "fixtures");
+const FIXTURES = join(import.meta.dirname, "fixtures");
 const FAKE_COMFY = join(FIXTURES, "fake-comfy-dispatch");
 const OBJECT_INFO_SAMPLE = join(FIXTURES, "object_info.sample.json");
 const SLOTS_SAMPLE = join(FIXTURES, "slots.default_image_gen.json");
 
-const REPO_ROOT = join(import.meta.dir, "..");
-/** The compiled, standalone executable a real MCP client actually runs. */
-const DIST_BINARY = join(REPO_ROOT, "dist", "mcp-comfyui");
+const REPO_ROOT = join(import.meta.dirname, "..");
+/**
+ * The Node-runnable bundle a real MCP client actually runs — `npx -y
+ * mcp-comfyui` and `claude mcp add ... -- npx -y mcp-comfyui` both resolve to
+ * this file. Finding 1's tests used to drive a `bun build --compile` standalone
+ * binary instead; that binary is no longer this project's primary shipped
+ * artifact (a `deno compile` binary is now the *optional* one — see
+ * `deno.json`'s `compile` task), so those tests now exercise `dist/index.js`
+ * under `node` directly, which is both the more faithful target and the one
+ * this migration's own definition of done independently proves runs correctly
+ * over stdio.
+ */
+const DIST_ENTRY = join(REPO_ROOT, "dist", "index.js");
 
 /**
- * Build the real `dist/mcp-comfyui` fresh, so Finding 1's tests exercise the
- * exact artifact a user runs rather than `bun src/index.ts` — this is the
- * binary the original repro (an ~11.5MB `tools/call` line over real stdio)
- * was driven against, and `bun build --compile` is fast enough (roughly
- * 100ms for this project) that rebuilding it here costs nothing meaningful.
+ * Build the real `dist/index.js` fresh, so Finding 1's tests exercise the
+ * exact artifact a user runs rather than a source file executed in dev mode.
+ * Runs the project's own build script (`node scripts/build.mjs`, which shells
+ * out to `deno bundle`) exactly as `npm run build` / `prepublishOnly` would.
  */
 async function buildDist(): Promise<void> {
-  const build = Bun.spawn(["bun", "build", "src/index.ts", "--compile", "--outfile", "dist/mcp-comfyui"], {
+  const build = new Deno.Command("node", {
+    args: ["scripts/build.mjs"],
     cwd: REPO_ROOT,
-    env: process.env,
-    stdout: "pipe",
-    stderr: "pipe",
+    env: process.env as Record<string, string>,
+    stdout: "piped",
+    stderr: "piped",
   });
-  const exitCode = await build.exited;
-  if (exitCode !== 0) {
-    throw new Error(`bun build failed with exit code ${exitCode}: ${await new Response(build.stderr).text()}`);
+  const output = await build.output();
+  if (!output.success) {
+    throw new Error(
+      `build failed with exit code ${output.code}: ${new TextDecoder().decode(output.stderr)}`,
+    );
   }
+}
+
+/** Spawn the built `dist/index.js` under `node`, wired for a raw stdio conversation. */
+function spawnDist(env: NodeJS.ProcessEnv = process.env): Deno.ChildProcess {
+  const command = new Deno.Command("node", {
+    args: [DIST_ENTRY],
+    env: env as Record<string, string>,
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  });
+  return command.spawn();
+}
+
+/**
+ * Write text to a child's stdin. The writer is released (not closed) after
+ * each write rather than held across calls, the Deno `WritableStream`
+ * equivalent of Bun's independent `child.stdin.write()` calls — several
+ * tests below write more than once to the same child, interleaved with reads.
+ */
+async function writeStdin(child: Deno.ChildProcess, text: string): Promise<void> {
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(text));
+  writer.releaseLock();
 }
 
 /** How `workflows/setSlots.ts` names the temp directories it creates. */
@@ -77,7 +113,30 @@ const SYSTEM_STATS = {
   devices: [{ name: "mps", type: "mps", vram_total: 51539607552, vram_free: 11458723840 }],
 };
 
-type TestServer = ReturnType<typeof Bun.serve>;
+/**
+ * `Bun.serve`-shaped wrapper over `Deno.serve`: a `{port, stop}` pair rather
+ * than the raw `Deno.HttpServer`. `stop(true)` (this file only ever forces)
+ * aborts the creating `signal` instead of calling `.shutdown()`, which —
+ * unlike `.shutdown()` — resolves immediately even against a handler that
+ * never returns (measured directly).
+ */
+interface TestServer {
+  readonly port: number;
+  stop(force?: boolean): Promise<void>;
+}
+
+function denoServe(handler: (request: Request) => Response | Promise<Response>): TestServer {
+  const ac = new AbortController();
+  const inner = Deno.serve({ hostname: "127.0.0.1", port: 0, signal: ac.signal, onListen: () => {} }, handler);
+  const port = (inner.addr as Deno.NetAddr).port;
+  return {
+    port,
+    stop: async () => {
+      ac.abort();
+      await inner.finished;
+    },
+  };
+}
 
 let workdir: string;
 let roots: string;
@@ -119,7 +178,7 @@ const MANAGED_ENV = [
   "MCP_COMFYUI_WORKSPACE",
 ];
 
-beforeEach(() => {
+beforeEach(async () => {
   workdir = mkdtempSync(join(tmpdir(), "mcp-comfyui-server-"));
   roots = join(workdir, "workflows");
   cacheDir = join(workdir, "cache");
@@ -129,7 +188,7 @@ beforeEach(() => {
   servers = [];
   open = [];
   objectInfoRequests = 0;
-  deadPort = closedPort();
+  deadPort = await closedPort();
 
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
@@ -145,7 +204,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const close of open) await close();
-  for (const bound of servers) bound.stop(true); // force: a hung handler must not hold the suite
+  for (const bound of servers) await bound.stop(true); // force: a hung handler must not hold the suite
   for (const name of MANAGED_ENV) delete process.env[name];
   rmSync(workdir, { recursive: true, force: true });
   for (const name of leakedTempDirs()) rmSync(join(tmpdir(), name), { recursive: true, force: true });
@@ -162,10 +221,14 @@ function prepareTempDirs(): Set<string> {
  * Temp directories THIS test created and nobody cleaned up.
  *
  * Scoped to the difference against a snapshot taken in `beforeEach`, never the
- * whole prefix: `tmpdir()` is shared, bun runs test files concurrently, and
- * `tests/setSlots.test.ts` creates directories under the same prefix. Reaping
- * every match deleted another file's live fixtures mid-test, which showed up as
- * a transient ENOENT that never reproduced when either file was run alone.
+ * whole prefix: `tmpdir()` is shared, and `tests/setSlots.test.ts` creates
+ * directories under the same prefix. Reaping every match deleted another
+ * file's live fixtures mid-test, which showed up as a transient ENOENT that
+ * never reproduced when either file was run alone — under Bun, which ran test
+ * files concurrently by default. `deno test` (see `tests/setSlots.test.ts` for
+ * the full account) runs files sequentially unless `--parallel` is passed,
+ * which this project's `deno task test` does not do, so the race itself
+ * cannot currently happen — the scoping stays anyway.
  */
 function leakedTempDirs(): string[] {
   return readdirSync(tmpdir()).filter(
@@ -174,16 +237,14 @@ function leakedTempDirs(): string[] {
 }
 
 function portOf(bound: TestServer): number {
-  const { port } = bound;
-  if (port === undefined) throw new Error("test server did not bind a port");
-  return port;
+  return bound.port;
 }
 
 /** A port nothing is listening on: bind one, then give it back. */
-function closedPort(): number {
-  const throwaway = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+async function closedPort(): Promise<number> {
+  const throwaway = denoServe(() => new Response(""));
   const port = portOf(throwaway);
-  throwaway.stop(true);
+  await throwaway.stop(true);
   return port;
 }
 
@@ -196,16 +257,12 @@ function closedPort(): number {
  * system-stats body as a node dictionary.
  */
 function serveInstance(body: unknown = SYSTEM_STATS): number {
-  const bound = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: (request) => {
-      const path = new URL(request.url).pathname;
-      if (path === "/object_info") objectInfoRequests += 1;
-      return path === "/system_stats"
-        ? new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } })
-        : new Response("not found", { status: 404 });
-    },
+  const bound = denoServe((request) => {
+    const path = new URL(request.url).pathname;
+    if (path === "/object_info") objectInfoRequests += 1;
+    return path === "/system_stats"
+      ? new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } })
+      : new Response("not found", { status: 404 });
   });
   servers.push(bound);
   const port = portOf(bound);
@@ -249,15 +306,11 @@ function nothingRunning(): number {
  */
 function launchable(failures: number): number {
   let seen = 0;
-  const bound = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: (request) => {
-      if (new URL(request.url).pathname !== "/system_stats") return new Response("nf", { status: 404 });
-      return seen++ < failures
-        ? new Response("starting", { status: 503 })
-        : new Response(JSON.stringify(SYSTEM_STATS), { headers: { "content-type": "application/json" } });
-    },
+  const bound = denoServe((request) => {
+    if (new URL(request.url).pathname !== "/system_stats") return new Response("nf", { status: 404 });
+    return seen++ < failures
+      ? new Response("starting", { status: 503 })
+      : new Response(JSON.stringify(SYSTEM_STATS), { headers: { "content-type": "application/json" } });
   });
   servers.push(bound);
   const port = portOf(bound);
@@ -1597,12 +1650,7 @@ test("the server writes nothing to stdout but JSON-RPC frames", async () => {
   process.env.FAKE_COMFY_ERROR_CODE = "server_not_running";
   process.env.FAKE_COMFY_ERROR_MESSAGE = "no server";
 
-  const child = Bun.spawn(["bun", join(import.meta.dir, "..", "src", "index.ts")], {
-    env: process.env,
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const child = spawnDist();
 
   const requests = [
     {
@@ -1626,14 +1674,13 @@ test("the server writes nothing to stdout but JSON-RPC frames", async () => {
       params: { name: "get_job", arguments: { prompt_id: PROMPT_ID } },
     },
   ];
-  child.stdin.write(requests.map((request) => `${JSON.stringify(request)}\n`).join(""));
-  await child.stdin.flush();
+  await writeStdin(child, requests.map((request) => `${JSON.stringify(request)}\n`).join(""));
 
   const stdout = await readUntil(child.stdout, 4, 10_000);
   child.kill("SIGKILL");
   child.stdout.cancel();
   child.stderr.cancel();
-  await child.exited;
+  await child.status;
 
   const lines = stdout.split("\n").filter((line) => line.trim() !== "");
   expect(lines.length).toBeGreaterThanOrEqual(4);
@@ -1708,7 +1755,7 @@ async function readUntilSafely(
       if (remaining <= 0) {
         throw new Error(`the server produced only ${JSON.stringify(text)} within ${timeoutMs}ms`);
       }
-      const outcome = await Promise.race([reader.read(), Bun.sleep(remaining).then(() => timedOut)]);
+      const outcome = await Promise.race([reader.read(), sleep(remaining).then(() => timedOut)]);
       if (typeof outcome === "symbol") continue; // let the loop re-check the deadline
       const { done, value } = outcome;
       if (done) {
@@ -1737,7 +1784,7 @@ async function readFor(stream: ReadableStream<Uint8Array>, timeoutMs: number): P
     while (true) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) break;
-      const outcome = await Promise.race([reader.read(), Bun.sleep(remaining).then(() => timedOut)]);
+      const outcome = await Promise.race([reader.read(), sleep(remaining).then(() => timedOut)]);
       if (typeof outcome === "symbol") break;
       const { done, value } = outcome;
       if (done) break;
@@ -1792,19 +1839,18 @@ test("a legitimate large payload does not kill the server", async () => {
   process.env.FAKE_COMFY_ERROR_CODE = "server_not_running";
   process.env.FAKE_COMFY_ERROR_MESSAGE = "no server";
 
-  const child = Bun.spawn([DIST_BINARY], { env: process.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const child = spawnDist();
   const followUp = `${JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/list", params: {} })}\n`;
 
-  child.stdin.write(INITIALIZE_LINE);
-  child.stdin.write(paddedToolCallLine(2, 11_500_000));
-  child.stdin.write(followUp);
-  await child.stdin.flush();
+  await writeStdin(child, INITIALIZE_LINE);
+  await writeStdin(child, paddedToolCallLine(2, 11_500_000));
+  await writeStdin(child, followUp);
 
   const stdout = await readUntilSafely(child.stdout, 3, 20_000);
   child.kill("SIGKILL");
   child.stdout.cancel();
   child.stderr.cancel();
-  await child.exited;
+  await child.status;
 
   const lines = stdout.split("\n").filter((line) => line.trim() !== "");
   const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -1820,19 +1866,25 @@ test("a payload beyond the buffer limit is reported on stderr rather than dying 
   // (dist/esm/shared/stdio.js) still throws and closes the transport on
   // overflow — that part cannot be made recoverable without wrapping the
   // transport (see the report) — but the failure must now be visible.
-  const child = Bun.spawn([DIST_BINARY], {
-    env: { ...process.env, COMFY_BIN: FAKE_COMFY },
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const child = spawnDist({ ...process.env, COMFY_BIN: FAKE_COMFY });
 
-  child.stdin.write(INITIALIZE_LINE);
-  await child.stdin.flush();
+  await writeStdin(child, INITIALIZE_LINE);
   await readUntilSafely(child.stdout, 1, 5_000); // the initialize response
 
-  child.stdin.write(paddedToolCallLine(2, 20_000_000));
-  await child.stdin.flush();
+  // The write of the 20MB line can itself fail with a broken pipe: the
+  // server exits once `ReadBuffer.append()` throws on overflow (see
+  // `src/index.ts`'s doc comment on Finding 1), and streaming 20MB takes
+  // long enough that the child can already be gone before the write
+  // completes. Measured directly — unlike Bun's `FileSink.write()`, which
+  // did not surface this the same way — Deno's stdin writer rejects with
+  // `Deno.errors.BrokenPipe` when that race is lost. That IS the failure
+  // this test exists to prove (the transport died), not a different one, so
+  // it is tolerated here rather than propagated.
+  try {
+    await writeStdin(child, paddedToolCallLine(2, 20_000_000));
+  } catch (err) {
+    if (!(err instanceof Deno.errors.BrokenPipe)) throw err;
+  }
 
   // No response for the oversized request ever arrives.
   await expect(readUntilSafely(child.stdout, 2, 4_000)).rejects.toThrow();
@@ -1841,7 +1893,7 @@ test("a payload beyond the buffer limit is reported on stderr rather than dying 
   child.kill("SIGKILL");
   child.stdout.cancel();
   child.stderr.cancel();
-  await child.exited;
+  await child.status;
 
   expect(stderr.trim()).not.toBe("");
 });
@@ -1849,12 +1901,7 @@ test("a payload beyond the buffer limit is reported on stderr rather than dying 
 // --- Finding 2: a malformed tools/call must not read as a server bug ------
 
 test("a malformed tools/call is refused as an invalid request, not reported as an internal error", async () => {
-  const child = Bun.spawn([DIST_BINARY], {
-    env: { ...process.env, COMFY_BIN: FAKE_COMFY },
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const child = spawnDist({ ...process.env, COMFY_BIN: FAKE_COMFY });
 
   const malformed = [
     { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "list_workflows", arguments: null } },
@@ -1863,15 +1910,14 @@ test("a malformed tools/call is refused as an invalid request, not reported as a
     { jsonrpc: "2.0", id: 5, method: "tools/call", params: { arguments: {} } }, // missing name
     { jsonrpc: "2.0", id: 6, method: "tools/call" }, // omitted params
   ];
-  child.stdin.write(INITIALIZE_LINE);
-  child.stdin.write(malformed.map((request) => `${JSON.stringify(request)}\n`).join(""));
-  await child.stdin.flush();
+  await writeStdin(child, INITIALIZE_LINE);
+  await writeStdin(child, malformed.map((request) => `${JSON.stringify(request)}\n`).join(""));
 
   const stdout = await readUntilSafely(child.stdout, 1 + malformed.length, 10_000);
   child.kill("SIGKILL");
   child.stdout.cancel();
   child.stderr.cancel();
-  await child.exited;
+  await child.status;
 
   const lines = stdout.split("\n").filter((line) => line.trim() !== "");
   const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -1911,8 +1957,8 @@ function invocationsOf(log: string, matching: string): string[] {
  */
 async function settledInvocationsOf(log: string, matching: string, expected: number): Promise<string[]> {
   const deadline = Date.now() + 5_000;
-  while (invocationsOf(log, matching).length < expected && Date.now() < deadline) await Bun.sleep(5);
-  await Bun.sleep(60);
+  while (invocationsOf(log, matching).length < expected && Date.now() < deadline) await sleep(5);
+  await sleep(60);
   return invocationsOf(log, matching);
 }
 
@@ -2029,13 +2075,7 @@ test("describe_workflow starts ComfyUI when it has no usable cache", async () =>
   const port = launchable(2);
   const log = cliLog();
   // The launched instance serves object_info once it is up.
-  servers.push(
-    Bun.serve({
-      hostname: "127.0.0.1",
-      port: 0,
-      fetch: () => new Response("{}"),
-    }),
-  );
+  servers.push(denoServe(() => new Response("{}")));
   process.env.FAKE_COMFY_MODE = "data_file";
   process.env.FAKE_COMFY_DATA_FILE = SLOTS_SAMPLE;
 

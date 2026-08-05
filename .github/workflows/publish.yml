@@ -18,20 +18,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: denoland/setup-deno@v2
         with:
-          bun-version: "1.3.14"
+          deno-version: "2.9.4"
 
-      - run: bun install --frozen-lockfile
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Populates node_modules for the Node-facing tooling (`tsc`, and
+      # `scripts/build.mjs` itself, which runs under `node`). `deno test` /
+      # `deno bundle` extend the same directory as needed for npm: specifiers
+      # (`nodeModulesDir: "auto"` in deno.json) once this step has run.
+      - run: npm ci
 
       # Publishing a broken version is not undoable — JSR refuses to republish a
       # version number, so a bad one is spent. The gates run first for that
       # reason, not for tidiness.
       - name: Test
-        run: bun test
+        run: deno task test
 
       - name: Typecheck
-        run: bun run typecheck
+        run: deno task typecheck
 
       # `jsr publish` is a no-op when deno.json's version is already published,
       # so pushing to main without bumping the version is safe and silent.

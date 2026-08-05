@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, sleep, test } from "./support/testing.ts";
 import {
   chmodSync,
   mkdtempSync,
@@ -10,17 +10,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EnvelopeParseError } from "../src/comfy/envelope";
+import { EnvelopeParseError } from "../src/comfy/envelope.ts";
 import {
   ComfyCliError,
   ComfyTimeoutError,
   ComfyUnavailableError,
   runComfy,
   runComfyRaw,
-} from "../src/comfy/exec";
+} from "../src/comfy/exec.ts";
 
 /** No test in this file may touch a real `comfy` or a real ComfyUI server. */
-const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
+const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 
 let workdir: string;
 
@@ -56,6 +56,26 @@ function isAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Whether `pid` is confirmed dead within `timeoutMs`, polling rather than
+ * checking once. Measured directly under `deno test`: Deno's `node:child_process`
+ * compat resolves the child's `exit` event (and so `runComfy`'s own timeout
+ * rejection) a few milliseconds before `process.kill(pid, 0)` — a raw,
+ * un-mediated syscall — agrees the pid is gone; consistently under 10ms
+ * across repeated trials, never the kind of gap a stuck process would leave.
+ * A single immediate check does not survive that gap; this does, without
+ * weakening what the assertion actually pins (the child dies from the
+ * timeout's kill, not from something else, eventually).
+ */
+async function deadWithin(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (isAlive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await sleep(5);
+  }
+  return true;
 }
 
 function pidFrom(file: string): number {
@@ -135,7 +155,7 @@ test("kills the child and rejects when the timeout expires", async () => {
   expect(err).toBeInstanceOf(ComfyTimeoutError);
   expect((err as Error).message).toContain("250ms");
   expect(elapsed).toBeLessThan(1_500); // the budget bounds the call, near enough
-  expect(isAlive(pidFrom(pidOut))).toBe(false); // actually dead, not merely abandoned
+  expect(await deadWithin(pidFrom(pidOut), 500)).toBe(true); // actually dead, not merely abandoned
 });
 
 test("the timeout kill signal is specifically SIGKILL, not SIGTERM", async () => {
@@ -153,7 +173,7 @@ test("the timeout kill signal is specifically SIGKILL, not SIGTERM", async () =>
 
   expect(err).toBeInstanceOf(ComfyTimeoutError);
   expect(elapsed).toBeLessThan(1_500);
-  expect(isAlive(pidFrom(pidOut))).toBe(false);
+  expect(await deadWithin(pidFrom(pidOut), 500)).toBe(true);
 });
 
 test("a timeout that leaves a descendant holding stdout still ends on time", async () => {

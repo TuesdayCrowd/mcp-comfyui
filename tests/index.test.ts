@@ -1,15 +1,17 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "./support/testing.ts";
 import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import { MAX_BUFFER_SIZE, describeValidationFailure, remapValidationError } from "../src/index";
+import { MAX_BUFFER_SIZE, describeValidationFailure, remapValidationError } from "../src/index.ts";
 
 /**
  * The pure logic behind Findings 1 and 2, tested in isolation from real stdio.
  *
  * `src/index.ts` is the stdio entrypoint and normally runs `main()` as a side
- * effect of being executed directly (`bun src/index.ts`), which is why every
- * other test that exercises it (`tests/server.test.ts`'s "stdio landmine"
- * section) spawns it as a subprocess rather than importing it. The exports
- * this file imports are guarded behind `import.meta.main`, so importing this
+ * effect of being executed directly (`node dist/index.js`, the built
+ * artifact), which is why every other test that exercises it
+ * (`tests/server.test.ts`'s "stdio landmine" section) spawns it as a
+ * subprocess rather than importing it. The exports this file imports are
+ * guarded behind `isMainModule()` (this project's `import.meta.main`
+ * equivalent — see its doc comment in `src/index.ts`), so importing this
  * module here does not attach real stdin/stdout listeners or start a server —
  * only the transport-hardening logic itself is under test.
  */

@@ -1,18 +1,18 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EnvelopeParseError } from "../src/comfy/envelope";
-import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec";
-import { RunContractError, RunFailedError, runWorkflow } from "../src/workflows/run";
-import { applySlots, type PreparedWorkflow } from "../src/workflows/setSlots";
+import { EnvelopeParseError } from "../src/comfy/envelope.ts";
+import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec.ts";
+import { RunContractError, RunFailedError, runWorkflow } from "../src/workflows/run.ts";
+import { applySlots, type PreparedWorkflow } from "../src/workflows/setSlots.ts";
 
 /**
  * No test in this file may invoke a real `comfy`, reach a real ComfyUI, or run
  * a real workflow: `COMFY_BIN` points at the sh fixture for every one of them,
  * and every byte of NDJSON these tests decode is written by the test itself.
  */
-const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
+const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 
 /** How `workflows/setSlots.ts` names the temp directories it creates. */
 const TEMP_PREFIX = "mcp-comfyui-apply-";
@@ -75,10 +75,15 @@ function snapshotTempDirs(): Set<string> {
  * Temp directories THIS test created and nobody cleaned up.
  *
  * Scoped against a `beforeEach` snapshot rather than sweeping the whole prefix:
- * `tmpdir()` is shared, bun runs test files concurrently, and two other test
- * files create directories under this same prefix. An unscoped sweep deletes a
- * sibling file's live fixtures mid-test, which surfaces as a transient ENOENT
- * that never reproduces when either file is run alone.
+ * `tmpdir()` is shared, and two other test files create directories under this
+ * same prefix. An unscoped sweep deletes a sibling file's live fixtures
+ * mid-test, which surfaces as a transient ENOENT that never reproduces when
+ * either file is run alone — under Bun, which ran test files concurrently by
+ * default. `deno test` (see `tests/setSlots.test.ts` for the full account)
+ * runs files sequentially unless `--parallel` is passed, which this project's
+ * `deno task test` does not do, so the race itself cannot currently happen —
+ * the scoping stays anyway, since it costs nothing and is the difference
+ * between a fixed bug and a reintroduced one the day `--parallel` is added.
  */
 function leakedTempDirs(): string[] {
   return readdirSync(tmpdir()).filter(
@@ -1152,7 +1157,7 @@ interface JsonSchema {
 }
 
 function loadSchema(name: string): JsonSchema {
-  return JSON.parse(readFileSync(join(import.meta.dir, "fixtures", name), "utf8")) as JsonSchema;
+  return JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", name), "utf8")) as JsonSchema;
 }
 
 const RUN_SCHEMA = loadSchema("schema.run.json");

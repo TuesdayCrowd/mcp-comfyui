@@ -1,5 +1,5 @@
-import { expect, test } from "bun:test";
-import { EnvelopeParseError, parseEnvelope, parseEnvelopeValue } from "../src/comfy/envelope";
+import { expect, test } from "./support/testing.ts";
+import { EnvelopeParseError, parseEnvelope, parseEnvelopeValue } from "../src/comfy/envelope.ts";
 
 /** A well-formed envelope, overridable field by field. */
 function envelope(overrides: Record<string, unknown> = {}): string {
@@ -141,27 +141,39 @@ test("rejects an object whose type is not envelope", () => {
   expect(() => parseEnvelope(envelope({ type: "event" }))).toThrow(EnvelopeParseError);
 });
 
-test.each([["null", "null"], ["array", "[]"], ["number", "42"]])(
-  "rejects non-object JSON (%s)",
-  (_label, raw) => {
-    expect(() => parseEnvelope(raw)).toThrow(EnvelopeParseError);
-  },
-);
+// `test.each` has no equivalent under `@std/testing/bdd` (see
+// `tests/support/testing.ts`), so each case is its own `test()`.
+test("rejects non-object JSON (null)", () => {
+  expect(() => parseEnvelope("null")).toThrow(EnvelopeParseError);
+});
 
-test.each([["empty", ""], ["whitespace", "  \n\t "]])(
-  "reports no output for %s stdout",
-  (_label, raw) => {
-    let caught: unknown;
-    try {
-      parseEnvelope(raw);
-    } catch (err) {
-      caught = err;
-    }
-    expect(caught).toBeInstanceOf(EnvelopeParseError);
-    expect((caught as Error).message).toMatch(/no output/);
-    expect((caught as EnvelopeParseError).raw).toBe(raw);
-  },
-);
+test("rejects non-object JSON (array)", () => {
+  expect(() => parseEnvelope("[]")).toThrow(EnvelopeParseError);
+});
+
+test("rejects non-object JSON (number)", () => {
+  expect(() => parseEnvelope("42")).toThrow(EnvelopeParseError);
+});
+
+function expectNoOutput(raw: string): void {
+  let caught: unknown;
+  try {
+    parseEnvelope(raw);
+  } catch (err) {
+    caught = err;
+  }
+  expect(caught).toBeInstanceOf(EnvelopeParseError);
+  expect((caught as Error).message).toMatch(/no output/);
+  expect((caught as EnvelopeParseError).raw).toBe(raw);
+}
+
+test("reports no output for empty stdout", () => {
+  expectNoOutput("");
+});
+
+test("reports no output for whitespace stdout", () => {
+  expectNoOutput("  \n\t ");
+});
 
 test("rejects an ok:false envelope that carries no error object", () => {
   const raw = envelope({ ok: false, command: "run", data: null, error: null });

@@ -1,15 +1,15 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { DEFAULT_WORKFLOW_DIR, workflowRoots } from "../src/config";
+import { DEFAULT_WORKFLOW_DIR, workflowRoots } from "../src/config.ts";
 import {
   type WorkflowFile,
   type WorkflowListing,
   discoverWorkflows,
   inertInputsOf,
   inertInputsOfFile,
-} from "../src/workflows/discover";
+} from "../src/workflows/discover.ts";
 
 /**
  * No test in this file may read the operator's real workflow directory or
@@ -671,7 +671,7 @@ test("has_subgraphs is null for an invalid file, unknowable rather than false", 
 
 test("has_subgraphs is reported on the real, measured subgraph workflow", async () => {
   const root = makeRoot();
-  const real = readFileSync(join(import.meta.dir, "fixtures", "audio_stable_audio_3_medium.json"), "utf8");
+  const real = readFileSync(join(import.meta.dirname, "fixtures", "audio_stable_audio_3_medium.json"), "utf8");
   write(root, "audio.json", real);
 
   const listing = await discoverWorkflows({ roots: [root] });
@@ -717,7 +717,7 @@ function objectLink(id: number, originId: number, targetId: number): Record<stri
   return { id, origin_id: originId, origin_slot: 0, target_id: targetId, target_slot: 0, type: "*" };
 }
 
-const REAL_SUBGRAPH_FIXTURE = join(import.meta.dir, "fixtures", "audio_stable_audio_3_medium.json");
+const REAL_SUBGRAPH_FIXTURE = join(import.meta.dirname, "fixtures", "audio_stable_audio_3_medium.json");
 
 test("the real subgraph workflow: measured decoys are flagged, measured effective controls are not", async () => {
   // Ground truth from a live run, not inference: setting 52/6.text and

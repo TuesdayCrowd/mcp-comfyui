@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S deno run --allow-read --allow-write --allow-env --allow-run --allow-net
 
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -178,19 +178,22 @@ async function main(): Promise<void> {
 }
 
 /**
- * Whether this module is the one `node`/`bun` was actually asked to run, as
- * opposed to merely imported — the same question `import.meta.main` answers
- * natively on both runtimes (verified directly: true when run, false when
- * imported, on Node v26.5.1 and on Bun, including through the shebang'd,
- * symlinked file npm's `bin` mechanism installs). It is reimplemented here
- * rather than used directly because `bun build --target=node` — the tool that
- * produces the artifact this project ships — rewrites `import.meta.main` into
- * `__require.main == __require.module`, referencing a `__require` binding
- * `--target=node`'s own ESM output never defines; every real invocation of
- * the built bundle would throw a `ReferenceError` before it could even reach
- * `main()`. `import.meta.url` and `node:fs`/`node:url` are ordinary runtime
- * values the bundler has no special-cased rewrite for, so this survives the
- * same build unchanged (checked directly against the built `dist/index.js`).
+ * Whether this module is the one `node` was actually asked to run, as opposed
+ * to merely imported — the same question `import.meta.main` answers natively
+ * on Node (verified directly: true when run, false when imported, on Node
+ * v26.5.1, including through the shebang'd, symlinked file npm's `bin`
+ * mechanism installs). It is reimplemented here rather than used directly
+ * because this project's supported range (`engines.node >= 18`) reaches back
+ * before `import.meta.main` existed, and — historically, back when `bun build
+ * --target=node` was this project's bundler — because that bundler rewrote
+ * `import.meta.main` into `__require.main == __require.module`, a reference
+ * to a binding its own ESM output never defined. `deno bundle`, the bundler
+ * now, does not touch `import.meta.main` at all — but it also does not need
+ * to, since the manual comparison below still has to carry the weight for
+ * pre-24 Node either way. `import.meta.url` and `node:fs`/`node:url` are
+ * ordinary runtime values no bundler this project has used has ever rewritten
+ * specially, so this survives a build unchanged (checked directly against the
+ * built `dist/index.js`).
  *
  * `realpathSync` on `process.argv[1]` matters as much as `import.meta.url`
  * itself: Node resolves the entry module's URL through any symlink, but
@@ -198,13 +201,13 @@ async function main(): Promise<void> {
  * npm's own `bin` symlink — so a strict-equality comparison without it would
  * read a normal `npx`/global install as "merely imported" and never start.
  *
- * The `catch` matters too, and for a different runtime this project also has
- * to support: `tests/server.test.ts` exercises the real entrypoint by
- * compiling it with `bun build --compile`, and inside that standalone binary
- * both `import.meta.url` and `process.argv[1]` are a virtual path —
- * `/$bunfs/root/<name>` — that is not a real file on disk at all, so
- * `realpathSync` throws `ENOENT` on it (verified directly). There is nothing
- * to resolve in that case; the two virtual paths already match textually.
+ * The `catch` matters too, for the same reason it always has: a runtime whose
+ * `process.argv[1]` is a path with nothing real on disk at that exact spot
+ * (verified directly for Bun's `bun build --compile`, back when that was this
+ * project's optional standalone binary: both paths were the virtual
+ * `/$bunfs/root/<name>`, and `realpathSync` threw `ENOENT` on it). There is
+ * nothing to resolve in that case; if the two paths already match textually,
+ * that is answer enough.
  */
 function isMainModule(): boolean {
   // A remote specifier — `deno run jsr:@scope/pkg` or an https: URL. There is
@@ -212,6 +215,23 @@ function isMainModule(): boolean {
   // non-file scheme, which crashed the module before `main()` was ever reached.
   // A remote entry is the entry: nothing here imports this module remotely.
   if (!import.meta.url.startsWith("file:")) return true;
+
+  // Under `deno compile` specifically — this project's optional standalone
+  // binary, built from the same `src/index.ts` — `import.meta.url` and
+  // `process.argv[1]` are real paths, but for two DIFFERENT files: the
+  // compiled binary extracts its embedded source to a temp directory at
+  // startup (measured: `.../deno-compile-<name>/index.ts`), while
+  // `process.argv[1]` stays the executable itself. Those never compare equal,
+  // so the Node-shaped logic below would read a running compiled binary as
+  // "merely imported" and exit without starting the server — measured
+  // directly as a silent, exit-0, no-output failure. Deno's own
+  // `import.meta.main` answers the same question correctly in every case
+  // tried, including this one, so it is trusted directly here; it is not used
+  // on the Node path above only because Node's own support does not reach
+  // back to this project's `engines.node >= 18` floor.
+  if (typeof (globalThis as { Deno?: unknown }).Deno !== "undefined") {
+    return (import.meta as { main?: boolean }).main === true;
+  }
 
   if (process.argv[1] === undefined) return false;
   const here = fileURLToPath(import.meta.url);

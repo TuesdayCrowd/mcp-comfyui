@@ -1,10 +1,10 @@
-import { expect, test } from "bun:test";
+import { expect, test } from "./support/testing.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { ObjectInfo } from "../src/comfy/objectInfo";
-import type { InertInput } from "../src/workflows/discover";
-import type { Slot } from "../src/workflows/slots";
-import { describeSlots, type InputSchema, type WorkflowDescription } from "../src/workflows/describe";
+import type { ObjectInfo } from "../src/comfy/objectInfo.ts";
+import type { InertInput } from "../src/workflows/discover.ts";
+import type { Slot } from "../src/workflows/slots.ts";
+import { describeSlots, type InputSchema, type WorkflowDescription } from "../src/workflows/describe.ts";
 
 /**
  * Every fixture here is a real capture from ComfyUI 0.29.0, not a hand-written
@@ -13,7 +13,7 @@ import { describeSlots, type InputSchema, type WorkflowDescription } from "../sr
  * the author's memory of the format.
  */
 function fixture<T>(name: string): T {
-  return JSON.parse(readFileSync(join(import.meta.dir, "fixtures", name), "utf8")) as T;
+  return JSON.parse(readFileSync(join(import.meta.dirname, "fixtures", name), "utf8")) as T;
 }
 
 const objectInfo = fixture<ObjectInfo>("object_info.sample.json");

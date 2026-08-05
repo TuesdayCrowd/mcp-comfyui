@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -12,20 +12,20 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec";
+import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec.ts";
 import {
   SetSlotContractError,
   SlotValueError,
   WorkflowFileError,
   applySlots,
   type PreparedWorkflow,
-} from "../src/workflows/setSlots";
+} from "../src/workflows/setSlots.ts";
 
 /**
  * No test in this file may invoke a real `comfy` or reach a real ComfyUI:
  * `COMFY_BIN` points at the sh fixture for every one of them.
  */
-const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
+const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 
 /**
  * 2^64−1, the largest seed ComfyUI accepts, and 2^53+ so it cannot survive a JS
@@ -60,6 +60,15 @@ let source: string;
  * flight the moment this test starts, and {@link leakedTempDirs} reports only
  * what is new since then — this test's own directories, and nothing a
  * sibling file made before or during it.
+ *
+ * Under `deno test` (this project's runner since the Bun migration) the race
+ * this guards against cannot currently happen: `deno test` runs test files
+ * sequentially by default, and this project's `deno task test` does not pass
+ * `--parallel` — verified directly (`deno test --help`: "Run test modules in
+ * parallel" is opt-in, off unless that flag is given). The scoping stays
+ * regardless: it costs nothing when files run one at a time, and it is the
+ * difference between a fixed bug and a reintroduced one the moment anyone
+ * adds `--parallel` back. Never broaden this to the whole prefix again.
  */
 let preexistingTempDirs = new Set<string>();
 
@@ -163,7 +172,7 @@ test("edits a temp copy under the OS temp dir and leaves the source untouched", 
   const prepared = await applySlots(source, { "3.steps": 7 });
 
   expect(prepared.path).not.toBe(source);
-  expect(dirname(prepared.path)).toStartWith(join(tmpdir(), TEMP_PREFIX));
+  expect(dirname(prepared.path).startsWith(join(tmpdir(), TEMP_PREFIX))).toBe(true);
   expect(prepared.source).toBe(source);
   expect(existsSync(prepared.path)).toBe(true);
   // The copy keeps the original's filename. comfy-cli displays
@@ -764,7 +773,7 @@ test("dispose removes the temp copy and is safe to repeat", async () => {
   expect(existsSync(dir)).toBe(false);
 
   expect(() => prepared.dispose()).not.toThrow(); // a `finally` may run twice
-  expect(sha256(source)).toBeString(); // and the source is still there
+  expect(typeof sha256(source)).toBe("string"); // and the source is still there
 });
 
 test("disposing does not disturb the source workflow", async () => {

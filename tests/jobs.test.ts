@@ -1,22 +1,22 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ComfyCliError } from "../src/comfy/exec";
+import { ComfyCliError } from "../src/comfy/exec.ts";
 import {
   InvalidPromptIdError,
   JobPayloadError,
   cancelJob,
   getJobStatus,
   listJobs,
-} from "../src/comfy/jobs";
+} from "../src/comfy/jobs.ts";
 
 /**
  * No test in this file may invoke a real `comfy`, reach a real ComfyUI, or
  * cancel a real job: `COMFY_BIN` points at the sh fixture for every one of
  * them, and every payload these tests decode is written by the test itself.
  */
-const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
+const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 
 const PROMPT_ID = "9b1c7d2e-0000-4000-8000-000000000001";
 const OTHER_ID = "9b1c7d2e-0000-4000-8000-000000000002";
@@ -634,7 +634,7 @@ interface JsonSchema {
 }
 
 const JOBS_SCHEMA = JSON.parse(
-  readFileSync(join(import.meta.dir, "fixtures", "schema.jobs.json"), "utf8"),
+  readFileSync(join(import.meta.dirname, "fixtures", "schema.jobs.json"), "utf8"),
 ) as JsonSchema;
 
 function isRecord(value: unknown): value is Record<string, unknown> {

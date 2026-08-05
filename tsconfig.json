@@ -5,9 +5,10 @@
     "target": "ESNext",
     "module": "Preserve",
     "moduleDetection": "force",
-    "types": ["bun"],
+    "types": ["node"],
 
-    // Bundler mode — Bun resolves and runs TypeScript directly.
+    // Bundler-style resolution — matches how `deno bundle` and Node's own
+    // package-exports resolution both walk node_modules.
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
@@ -25,5 +26,8 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  // `tests/` runs only under `deno test` now (jsr: imports `tsc` cannot
+  // resolve), so this project's Node-facing typecheck — the gate for the
+  // artifact `npm`/`npx` actually ship — covers `src/` only.
+  "include": ["src/**/*.ts"]
 }

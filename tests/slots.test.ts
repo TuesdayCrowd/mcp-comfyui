@@ -1,19 +1,19 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec";
-import { SlotListingParseError, listSlots, type Slot, type SlotListing } from "../src/workflows/slots";
+import { ComfyCliError, ComfyTimeoutError } from "../src/comfy/exec.ts";
+import { SlotListingParseError, listSlots, type Slot, type SlotListing } from "../src/workflows/slots.ts";
 
 /**
  * No test in this file may invoke a real `comfy` or reach a real ComfyUI:
  * `COMFY_BIN` points at the sh fixture for every one of them, and the payload
  * comes from a file the test controls.
  */
-const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
+const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 
 /** Real captured `data` from `comfy workflow slots` against a live instance. */
-const CAPTURED = join(import.meta.dir, "fixtures", "slots.default_image_gen.json");
+const CAPTURED = join(import.meta.dirname, "fixtures", "slots.default_image_gen.json");
 
 let workdir: string;
 let argvOut: string;

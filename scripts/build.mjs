@@ -7,17 +7,21 @@ import { spawnSync } from "node:child_process";
  * file `bin.mcp-comfyui` points at and the thing `npx -y mcp-comfyui` (and
  * `npm publish`'s own `prepublishOnly`) actually run.
  *
- * `bun build --target=node` is the bundler — it is only ever used as a build
- * tool here, never as the runtime the shipped file depends on — but its
- * output cannot be shipped unmodified. See `src/index.ts`'s `isMainModule`
- * doc comment for why: the bundler rewrites `import.meta.main` into a
- * `__require.main == __require.module` expression that references a binding
- * `--target=node`'s own ESM output never defines, which is why the source
- * uses a hand-written equivalent instead. What this script still has to fix
- * is the shebang: the bundler carries the *source* file's shebang
- * (`#!/usr/bin/env bun`) through verbatim regardless of `--target`, and a
- * `bun`-shebang'd file is exactly the thing this whole task exists to stop
- * requiring.
+ * `deno bundle` is the bundler — it is only ever used as a build tool here,
+ * never as the runtime the shipped file depends on. Measured directly:
+ * `deno bundle --platform=deno` (the only platform choices are `browser` and
+ * `deno` — there is no `node` target, and none is needed) produces a plain
+ * ESM file that runs correctly under `node`, because nothing in `src/` uses a
+ * Deno-only global; every runtime touchpoint goes through `node:*` imports
+ * (see `src/comfy/exec.ts`) or web-standard APIs (`fetch`, `URL`,
+ * `AbortSignal`) available in both.
+ *
+ * This script still has to fix the shebang, exactly as it did under Bun:
+ * `deno bundle` carries the *source* file's shebang through verbatim
+ * regardless of `--platform` (measured directly — a `--platform=deno` bundle
+ * of a file shebang'd `#!/usr/bin/env bun` still starts with that same
+ * line), so the shebang this project ships has to be rewritten same as
+ * before.
  */
 
 const OUTFILE = "dist/index.js";
@@ -26,8 +30,8 @@ const SHEBANG = "#!/usr/bin/env node\n";
 mkdirSync("dist", { recursive: true });
 
 const build = spawnSync(
-  "bun",
-  ["build", "src/index.ts", "--target=node", "--format=esm", "--outfile", OUTFILE],
+  "deno",
+  ["bundle", "--platform=deno", "--format=esm", "--no-check", "-o", OUTFILE, "src/index.ts"],
   { stdio: "inherit" },
 );
 if (build.status !== 0) {

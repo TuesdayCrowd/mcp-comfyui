@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -6,13 +6,13 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerTools, resolveSlotTypes, type ToolConfig } from "../src/tools";
+import { registerTools, resolveSlotTypes, type ToolConfig } from "../src/tools.ts";
 
 /**
  * Unit-level coverage for `src/tools.ts`'s own logic, below the level of the
- * full `bun build --compile` + stdio harness `tests/server.test.ts` uses for
- * the MCP surface end to end. Two things are covered here that have no other
- * home:
+ * full build-and-spawn-`dist/index.js`-under-`node` stdio harness
+ * `tests/server.test.ts` uses for the MCP surface end to end. Two things are
+ * covered here that have no other home:
  *
  * - **`resolveSlotTypes`** (finding 1's wiring): the gate that decides
  *   whether `run_workflow` is worth a `workflow slots` round trip before
@@ -29,15 +29,39 @@ import { registerTools, resolveSlotTypes, type ToolConfig } from "../src/tools";
  * No test in this file may invoke a real `comfy` or reach a real ComfyUI:
  * `COMFY_BIN` points at the sh fixture for every one of them.
  */
-const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
-const SLOTS_SAMPLE = join(import.meta.dir, "fixtures", "slots.default_image_gen.json");
+const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
+const SLOTS_SAMPLE = join(import.meta.dirname, "fixtures", "slots.default_image_gen.json");
 
 let workdir: string;
 let argvOut: string;
 /** A port nothing is listening on, freshly reserved for each test. */
 let deadPort: number;
 /** Loopback fixtures started by a `launch_comfyui` wiring test, stopped after it. */
-let launchServers: ReturnType<typeof Bun.serve>[] = [];
+let launchServers: TestServer[] = [];
+
+/**
+ * `Bun.serve`-shaped wrapper over `Deno.serve`, matching `tests/objectInfo.test.ts`:
+ * `stop(true)` aborts the creating `signal` rather than awaiting `.shutdown()`,
+ * which — unlike `.shutdown()` — resolves immediately even against a handler
+ * that never returns (measured directly).
+ */
+interface TestServer {
+  readonly port: number;
+  stop(force?: boolean): Promise<void>;
+}
+
+function denoServe(handler: (request: Request) => Response | Promise<Response>): TestServer {
+  const ac = new AbortController();
+  const inner = Deno.serve({ hostname: "127.0.0.1", port: 0, signal: ac.signal, onListen: () => {} }, handler);
+  const port = (inner.addr as Deno.NetAddr).port;
+  return {
+    port,
+    stop: async () => {
+      ac.abort();
+      await inner.finished;
+    },
+  };
+}
 
 /**
  * A port bound and immediately released. `detectInstance`'s probe (used by
@@ -52,25 +76,24 @@ let launchServers: ReturnType<typeof Bun.serve>[] = [];
  * `encodePair` guard) indistinguishable from outside, since both produce a
  * message containing "cannot start with".
  */
-function closedPort(): number {
-  const throwaway = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+async function closedPort(): Promise<number> {
+  const throwaway = denoServe(() => new Response(""));
   const { port } = throwaway;
-  throwaway.stop(true);
-  if (port === undefined) throw new Error("test server did not bind a port");
+  await throwaway.stop(true);
   return port;
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   workdir = mkdtempSync(join(tmpdir(), "mcp-comfyui-tools-"));
   argvOut = join(workdir, "argv");
-  deadPort = closedPort();
+  deadPort = await closedPort();
   launchServers = [];
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
 });
 
-afterEach(() => {
-  for (const bound of launchServers) bound.stop(true); // force: a hung handler must not hold the suite
+afterEach(async () => {
+  for (const bound of launchServers) await bound.stop(true); // force: a hung handler must not hold the suite
   delete process.env.COMFY_BIN;
   delete process.env.FAKE_COMFY_MODE;
   delete process.env.FAKE_COMFY_ARGV_OUT;
@@ -297,40 +320,33 @@ test("run_workflow's ordinary inputs are unaffected by the new schema guard", as
 // --- launch_comfyui wiring ---------------------------------------------------
 
 /** A loopback `/system_stats` fixture, cleaned up by `afterEach`. */
-function fakeInstance(): ReturnType<typeof Bun.serve> {
-  const bound = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: () =>
+function fakeInstance(): TestServer {
+  const bound = denoServe(
+    () =>
       new Response(JSON.stringify({ system: {}, devices: [] }), {
         headers: { "content-type": "application/json" },
       }),
-  });
+  );
   launchServers.push(bound);
   return bound;
 }
 
 /** Refuses until probed `failures` times, then answers like `fakeInstance`. */
-function fakeInstanceReadyAfter(failures: number): ReturnType<typeof Bun.serve> {
+function fakeInstanceReadyAfter(failures: number): TestServer {
   let seen = 0;
-  const bound = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch: () =>
-      seen++ < failures
-        ? new Response("starting", { status: 503 })
-        : new Response(JSON.stringify({ system: {}, devices: [] }), {
-            headers: { "content-type": "application/json" },
-          }),
-  });
+  const bound = denoServe(() =>
+    seen++ < failures
+      ? new Response("starting", { status: 503 })
+      : new Response(JSON.stringify({ system: {}, devices: [] }), {
+          headers: { "content-type": "application/json" },
+        }),
+  );
   launchServers.push(bound);
   return bound;
 }
 
-function portOf(bound: ReturnType<typeof Bun.serve>): number {
-  const { port } = bound;
-  if (port === undefined) throw new Error("test server did not bind a port");
-  return port;
+function portOf(bound: TestServer): number {
+  return bound.port;
 }
 
 test("launch_comfyui's instance is the one at the requested port, never the configured one", async () => {

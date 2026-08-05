@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, sleep, test } from "./support/testing.ts";
 import {
   chmodSync,
   existsSync,
@@ -19,7 +19,7 @@ import {
   ensureObjectInfoCache,
   getObjectInfo,
   objectInfoCachePath,
-} from "../src/comfy/objectInfo";
+} from "../src/comfy/objectInfo.ts";
 
 /**
  * No test in this file may contact a real ComfyUI, and none may read or write
@@ -27,11 +27,26 @@ import {
  * under a fresh temp directory, and every fetch goes to a hermetic server on an
  * ephemeral port.
  */
-const FIXTURE = join(import.meta.dir, "fixtures", "object_info.sample.json");
+const FIXTURE = join(import.meta.dirname, "fixtures", "object_info.sample.json");
 const PAYLOAD = readFileSync(FIXTURE, "utf8");
 
 type Handler = (request: Request) => Response | Promise<Response>;
-type TestServer = ReturnType<typeof Bun.serve>;
+
+/**
+ * `Bun.serve`-shaped wrapper over `Deno.serve`: a `{port, stop}` pair rather
+ * than the raw `Deno.HttpServer`. `stop(true)` (this file only ever forces)
+ * aborts the `signal` the server was created with rather than calling
+ * `.shutdown()`, which matters for a handler that never resolves — the
+ * "a server that never answers" tests below install exactly one. Measured
+ * directly: `.shutdown()` awaits every in-flight request and hangs forever
+ * against such a handler, while aborting via `signal` resolves `.finished`
+ * immediately and frees the port for the next test's `serve()` — the actual
+ * behaviour `Bun.serve(...).stop(true)` gave this suite.
+ */
+interface TestServer {
+  readonly port: number;
+  stop(force?: boolean): Promise<void>;
+}
 
 let cacheDir: string;
 let server: TestServer | null = null;
@@ -42,22 +57,31 @@ beforeEach(() => {
   requests = [];
 });
 
-afterEach(() => {
-  server?.stop(true); // force: a hung handler must not keep the suite open
+afterEach(async () => {
+  await server?.stop(true); // force: a hung handler must not keep the suite open
   server = null;
   rmSync(cacheDir, { recursive: true, force: true });
 });
 
+function denoServe(handler: Handler, hostname: string): TestServer {
+  const ac = new AbortController();
+  const inner = Deno.serve({ hostname, port: 0, signal: ac.signal, onListen: () => {} }, handler);
+  const port = (inner.addr as Deno.NetAddr).port;
+  return {
+    port,
+    stop: async () => {
+      ac.abort();
+      await inner.finished;
+    },
+  };
+}
+
 /** Start a loopback server on an ephemeral port and hand back that port. */
 function serve(handler: Handler = () => json(PAYLOAD), hostname = "127.0.0.1"): number {
-  server = Bun.serve({
-    hostname,
-    port: 0,
-    fetch(request) {
-      requests.push(new URL(request.url).pathname);
-      return handler(request);
-    },
-  });
+  server = denoServe((request) => {
+    requests.push(new URL(request.url).pathname);
+    return handler(request);
+  }, hostname);
   return portOf(server);
 }
 
@@ -72,10 +96,10 @@ function json(body: string): Response {
 }
 
 /** A port nothing is listening on: bind one, then give it back. */
-function closedPort(): number {
-  const throwaway = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+async function closedPort(): Promise<number> {
+  const throwaway = denoServe(() => new Response(""), "127.0.0.1");
   const port = portOf(throwaway);
-  throwaway.stop(true);
+  await throwaway.stop(true);
   return port;
 }
 
@@ -190,7 +214,7 @@ test("0.0.0.0 is rewritten to 127.0.0.1 in the fetch URL", async () => {
   // A wildcard bind address is not a connect address. Asserting on the error
   // text pins the rewrite even on platforms where connecting to 0.0.0.0 happens
   // to reach loopback anyway.
-  const port = closedPort();
+  const port = await closedPort();
   const err = await rejection(getObjectInfo({ host: "0.0.0.0", port, cacheDir }));
 
   expect(err).toBeInstanceOf(ObjectInfoFetchError);
@@ -231,7 +255,7 @@ test("the IPv6 wildcard is rewritten like 0.0.0.0", async () => {
 });
 
 test("a refused connection throws a typed error naming the URL and the cache path", async () => {
-  const port = closedPort();
+  const port = await closedPort();
   const err = await rejection(getObjectInfo({ port, cacheDir }));
 
   expect(err).toBeInstanceOf(ObjectInfoFetchError);
@@ -423,11 +447,11 @@ test("refresh never joins a fetch already in flight", async () => {
   // Joining would hand the refreshing caller the very copy it asked to bypass,
   // and would silently substitute the leader's timeout for its own.
   const port = serve(async () => {
-    await Bun.sleep(60);
+    await sleep(60);
     return json(PAYLOAD);
   });
   const leader = getObjectInfo({ port, cacheDir });
-  await Bun.sleep(10);
+  await sleep(10);
   const refreshing = getObjectInfo({ port, cacheDir, refresh: true });
   await Promise.all([leader, refreshing]);
 
@@ -442,15 +466,15 @@ test("a finished fetch does not evict another that is still running", async () =
   const port = serve(async () => {
     calls += 1;
     if (calls === 1) {
-      await Bun.sleep(60); // the leader: fails, but only after the refresh starts
+      await sleep(60); // the leader: fails, but only after the refresh starts
       return new Response("boom", { status: 503 });
     }
-    await Bun.sleep(250); // the refresh: still running when the leader cleans up
+    await sleep(250); // the refresh: still running when the leader cleans up
     return json(PAYLOAD);
   });
 
   const leader = getObjectInfo({ port, cacheDir });
-  await Bun.sleep(10); // the leader is registered
+  await sleep(10); // the leader is registered
   const refreshing = getObjectInfo({ port, cacheDir, refresh: true }); // replaces the entry
   await rejection(leader); // its cleanup must leave the refresh's entry alone
 

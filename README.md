@@ -57,15 +57,16 @@ Deno needs all five permissions — it spawns `comfy`, reads workflow files, wri
 
 ### From source
 
-Building from a checkout instead (e.g. to test a change) still needs [Bun](https://bun.sh) 1.3+ to run the test suite and the bundler, but the artifact it produces (`dist/index.js`) is a plain Node script — Bun is a build-time tool here, not a runtime dependency of what ships:
+Building from a checkout instead (e.g. to test a change) needs [Deno](https://deno.com) 2.x to run the test suite and the bundler, but the artifact it produces (`dist/index.js`) is a plain Node script — Deno is a build-time tool here, not a runtime dependency of what ships:
 
 ```bash
-bun install
-bun run build           # -> dist/index.js, runnable under plain `node`
+deno task build          # -> dist/index.js, runnable under plain `node`
 claude mcp add comfyui /absolute/path/to/dist/index.js
 ```
 
-A `bun run compile` script is also available if a self-contained platform binary (no `node` on PATH required) is preferable to the npm path for a given deployment; it produces `dist/mcp-comfyui`.
+No separate install step: `deno task build` resolves and caches everything it needs (including this project's npm dependencies) on first run.
+
+A `deno task compile` task is also available if a self-contained platform binary (no `node` on PATH required) is preferable to the npm path for a given deployment; it produces `dist/mcp-comfyui`.
 
 ## Configuration
 
@@ -143,13 +144,13 @@ The same problem recurs on the way back: `comfy run --json` echoes the whole gra
 ## Development
 
 ```bash
-bun test                       # full suite
-bun test tests/describe.test.ts
-bun run typecheck
-bun run build
+deno task test                        # full suite
+deno test tests/describe.test.ts      # one file
+deno task typecheck
+deno task build
 ```
 
-Tests never contact a real ComfyUI and never invoke the real `comfy`. The CLI is faked by `tests/fixtures/fake-comfy`, a dependency-free POSIX `sh` script driven by `$FAKE_COMFY_MODE`; HTTP is faked with `Bun.serve({port: 0})`.
+Tests never contact a real ComfyUI and never invoke the real `comfy`. The CLI is faked by `tests/fixtures/fake-comfy`, a dependency-free POSIX `sh` script driven by `$FAKE_COMFY_MODE`; HTTP is faked with `Deno.serve({port: 0})`.
 
 Fixtures under `tests/fixtures/` are real captures from a live ComfyUI 0.29.0, not hand-written approximations — including `slots.6key.json`, a 210-slot listing from a 122KB video workflow, and comfy-cli's own published JSON Schemas.
 

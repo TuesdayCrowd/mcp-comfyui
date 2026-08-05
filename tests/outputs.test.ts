@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
@@ -7,7 +7,7 @@ import {
   resolveArtifactPath,
   resolveArtifactPaths,
   type ArtifactLocation,
-} from "../src/comfy/outputs";
+} from "../src/comfy/outputs.ts";
 
 /**
  * Turning a `/view` URL back into a file on this machine.

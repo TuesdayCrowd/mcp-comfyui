@@ -31,15 +31,15 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "bun test",
-    "build": "bun scripts/build.mjs",
-    "compile": "bun build src/index.ts --compile --outfile dist/mcp-comfyui; code=$?; rm -f .*.bun-build; exit $code",
-    "prepublishOnly": "bun run build",
+    "test": "deno task test",
+    "build": "node scripts/build.mjs",
+    "compile": "deno task compile",
+    "prepublishOnly": "npm run build",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
-    "@types/bun": "^1.3.14",
+    "@types/node": "^26.1.2",
     "typescript": "^7.0.2",
     "zod": "4.4.3"
   }

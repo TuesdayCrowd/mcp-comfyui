@@ -1,8 +1,8 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, sleep, test } from "./support/testing.ts";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ComfyCliError, ComfyUnavailableError } from "../src/comfy/exec";
+import { ComfyCliError, ComfyUnavailableError } from "../src/comfy/exec.ts";
 import {
   InstanceUnavailableError,
   LaunchArgumentError,
@@ -13,12 +13,12 @@ import {
   launchInstance,
   type InstanceDetection,
   type RunningInstance,
-} from "../src/comfy/instance";
+} from "../src/comfy/instance.ts";
 
 /**
  * No test in this file may contact a real ComfyUI, invoke the real `comfy`, or
  * leave a long-lived process behind. Every HTTP probe goes to a hermetic
- * `Bun.serve` on an ephemeral port, and every CLI invocation goes to
+ * `Deno.serve` on an ephemeral port, and every CLI invocation goes to
  * `tests/fixtures/fake-comfy` via `COMFY_BIN`.
  */
 
@@ -58,17 +58,41 @@ const SYSTEM_STATS = {
 };
 
 /** No test may reach a real `comfy`; every invocation goes to this fake. */
-const FAKE_COMFY = join(import.meta.dir, "fixtures", "fake-comfy");
+const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 
 /**
  * The same fake behind a wrapper that APPENDS every invocation to a log.
  * `$FAKE_COMFY_ARGV_OUT` is overwritten per call and so cannot answer "how many
  * times was the CLI run", which is the whole question a deduplication test asks.
  */
-const FAKE_COMFY_LOGGING = join(import.meta.dir, "fixtures", "fake-comfy-dispatch");
+const FAKE_COMFY_LOGGING = join(import.meta.dirname, "fixtures", "fake-comfy-dispatch");
 
 type Handler = (request: Request) => Response | Promise<Response>;
-type TestServer = ReturnType<typeof Bun.serve>;
+
+/**
+ * `Bun.serve`-shaped wrapper over `Deno.serve`, matching `tests/objectInfo.test.ts`:
+ * `stop(true)` aborts the creating `signal` rather than awaiting `.shutdown()`,
+ * which — unlike `.shutdown()` — resolves immediately even against a handler
+ * that never returns (measured directly; several tests below install exactly
+ * one such handler).
+ */
+interface TestServer {
+  readonly port: number;
+  stop(force?: boolean): Promise<void>;
+}
+
+function denoServe(handler: Handler, hostname: string): TestServer {
+  const ac = new AbortController();
+  const inner = Deno.serve({ hostname, port: 0, signal: ac.signal, onListen: () => {} }, handler);
+  const port = (inner.addr as Deno.NetAddr).port;
+  return {
+    port,
+    stop: async () => {
+      ac.abort();
+      await inner.finished;
+    },
+  };
+}
 
 let servers: TestServer[] = [];
 let requests: string[] = [];
@@ -81,9 +105,9 @@ beforeEach(() => {
   process.env.COMFY_BIN = FAKE_COMFY;
 });
 
-afterEach(() => {
+afterEach(async () => {
   // force: a hung handler must not keep the suite open
-  for (const bound of servers) bound.stop(true);
+  for (const bound of servers) await bound.stop(true);
   servers = [];
   delete process.env.COMFY_BIN;
   delete process.env.FAKE_COMFY_MODE;
@@ -126,29 +150,23 @@ function invocations(log: string): number {
  */
 async function settledInvocations(log: string, expected: number, timeoutMs = 5_000): Promise<number> {
   const deadline = Date.now() + timeoutMs;
-  while (invocations(log) < expected && Date.now() < deadline) await Bun.sleep(5);
-  await Bun.sleep(60);
+  while (invocations(log) < expected && Date.now() < deadline) await sleep(5);
+  await sleep(60);
   return invocations(log);
 }
 
 /** Start a loopback server on an ephemeral port and hand back that port. */
 function serve(handler: Handler = () => stats(), hostname = "127.0.0.1"): number {
-  const bound = Bun.serve({
-    hostname,
-    port: 0,
-    fetch(request) {
-      requests.push(new URL(request.url).pathname);
-      return handler(request);
-    },
-  });
+  const bound = denoServe((request) => {
+    requests.push(new URL(request.url).pathname);
+    return handler(request);
+  }, hostname);
   servers.push(bound);
   return portOf(bound);
 }
 
 function portOf(bound: TestServer): number {
-  const { port } = bound;
-  if (port === undefined) throw new Error("test server did not bind a port");
-  return port;
+  return bound.port;
 }
 
 function stats(body: unknown = SYSTEM_STATS): Response {
@@ -158,10 +176,10 @@ function stats(body: unknown = SYSTEM_STATS): Response {
 }
 
 /** A port nothing is listening on: bind one, then give it back. */
-function closedPort(): number {
-  const throwaway = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("") });
+async function closedPort(): Promise<number> {
+  const throwaway = denoServe(() => new Response(""), "127.0.0.1");
   const port = portOf(throwaway);
-  throwaway.stop(true);
+  await throwaway.stop(true);
   return port;
 }
 
@@ -196,7 +214,7 @@ async function written(path: string, timeoutMs = 5_000): Promise<string> {
   const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error(`the fake comfy never wrote ${path}`);
-    await Bun.sleep(5);
+    await sleep(5);
   }
   return path;
 }
@@ -248,7 +266,7 @@ test("a refused connection is running:false, not a thrown error", async () => {
   // Nothing running is the normal state of this machine, not a fault: every
   // operation probes first, and a throw here would make "ComfyUI is not
   // running" indistinguishable from "this server is broken".
-  const port = closedPort();
+  const port = await closedPort();
   const detection = await detectInstance({ port });
 
   expect(detection.running).toBe(false);
@@ -256,7 +274,7 @@ test("a refused connection is running:false, not a thrown error", async () => {
 });
 
 test("a refused connection says why it could not connect", async () => {
-  const port = closedPort();
+  const port = await closedPort();
   const detection = await detectInstance({ port });
 
   if (detection.running) throw new Error("expected running:false");
@@ -426,7 +444,7 @@ test("refuses to launch when an instance is already running, and invokes nothing
 test("refuses when an instance is running on the port the arguments name", async () => {
   // The guard is about the machine, not just the default address: a second
   // ComfyUI on another port still competes for the same VRAM and model dir.
-  const detectPort = closedPort();
+  const detectPort = await closedPort();
   const targetPort = serve();
   const argvOut = armCli("launch");
 
@@ -496,7 +514,7 @@ test("the contention warning appears when another instance is running elsewhere"
 });
 
 test("no contention warning when nothing else is running", async () => {
-  const configuredPort = closedPort(); // nothing is running at the configured address
+  const configuredPort = await closedPort(); // nothing is running at the configured address
   const targetPort = serveReadyAfter(1);
   armCli("launch");
 
@@ -637,7 +655,7 @@ test("a launch that never answers times out, naming how long it waited", async (
 
 test("readiness is polled on the port the startup arguments name", async () => {
   // Getting this wrong reports a successful launch as a timeout.
-  const detectPort = closedPort();
+  const detectPort = await closedPort();
   const targetPort = serveReadyAfter(1);
   armCli("launch");
 
@@ -656,7 +674,7 @@ test("readiness is polled on the port the startup arguments name", async () => {
 test("the --port=N spelling in extraArgs is honoured by the poller too", async () => {
   // comfy-cli's own background launcher reads both spellings; a poller that
   // read only one would wait out the whole budget on a server that came up.
-  const detectPort = closedPort();
+  const detectPort = await closedPort();
   const targetPort = serveReadyAfter(1);
   armCli("launch");
 
@@ -671,7 +689,7 @@ test("the --port=N spelling in extraArgs is honoured by the poller too", async (
 });
 
 test("readiness follows --listen to the address ComfyUI will bind", async () => {
-  const detectPort = closedPort();
+  const detectPort = await closedPort();
   const targetPort = serveReadyAfter(1, "::1");
   armCli("launch");
 
@@ -750,7 +768,7 @@ test("a launch whose CLI exits non-zero with no envelope fails fast, not after t
   // ComfyCliError, so `isVerdict` alone never sees it and the poll loop would
   // otherwise burn the whole readiness budget on a child that is already dead.
   process.env.FAKE_COMFY_MODE = "garbage"; // non-zero exit, unparseable stdout, stderr traceback
-  const port = closedPort(); // nothing ever answers; only the crash should end the wait
+  const port = await closedPort(); // nothing ever answers; only the crash should end the wait
 
   const started = Date.now();
   const err = await rejection(launchInstance({ port, timeoutMs: 15_000, pollIntervalMs: 50 }));
@@ -780,7 +798,7 @@ test("a missing comfy binary aborts the wait rather than polling to the budget",
 test("an extra argument of `--` is refused, because it breaks the separator", async () => {
   // A second separator makes the boundary between our `--` and the caller's
   // arguments unreadable in every diagnostic that quotes the command line.
-  const port = closedPort();
+  const port = await closedPort();
   const argvOut = armCli("launch");
 
   const err = await rejection(launchInstance({ port, extraArgs: ["--"] }));
@@ -791,7 +809,7 @@ test("an extra argument of `--` is refused, because it breaks the separator", as
 });
 
 test("an empty extra argument is refused", async () => {
-  const port = closedPort();
+  const port = await closedPort();
   const argvOut = armCli("launch");
 
   const err = await rejection(launchInstance({ port, extraArgs: ["--fast", ""] }));
@@ -803,7 +821,7 @@ test("an empty extra argument is refused", async () => {
 test("an extra argument carrying a control character is refused", async () => {
   // Two flags smuggled into one argument, and a newline that would corrupt the
   // fixture's argv capture and every command line this server ever quotes.
-  const port = closedPort();
+  const port = await closedPort();
   const argvOut = armCli("launch");
 
   const err = await rejection(launchInstance({ port, extraArgs: ["--fast\n--listen 0.0.0.0"] }));
@@ -816,7 +834,7 @@ test("an extra argument carrying a control character is refused", async () => {
 test("a port outside the TCP range is refused before anything is spawned", async () => {
   // Otherwise the poller waits out its whole budget on a port that could never
   // have been bound.
-  const port = closedPort();
+  const port = await closedPort();
   const argvOut = armCli("launch");
 
   const err = await rejection(launchInstance({ port, args: { port: 70_000 } }));
@@ -960,7 +978,7 @@ test("ensureInstance launches at the configured address, not at an instance runn
 });
 
 test("ensureInstance refuses actionably when auto-launch is off", async () => {
-  const port = closedPort();
+  const port = await closedPort();
   const log = countingCli("launch");
 
   const err = await rejection(ensureInstance({ port, autoLaunch: false }));
@@ -1004,7 +1022,7 @@ test("a launch already in flight is joined rather than started again", async () 
 test("concurrent launches for different targets do not share an in-flight launch", async () => {
   // One in-flight launch per resolved target address, not one globally: two
   // launches for two different ports are legitimate and must both proceed.
-  const configured = closedPort(); // never touched: both calls target elsewhere
+  const configured = await closedPort(); // never touched: both calls target elsewhere
   const portA = serveReadyAfter(2);
   const portB = serveReadyAfter(2);
   const log = countingCli("launch");
@@ -1022,7 +1040,7 @@ test("concurrent launches for different targets do not share an in-flight launch
 test("a later launch runs again, because the in-flight entry is released", async () => {
   // Cleanup has to happen on the failure path too, or one bad launch wedges
   // this process until it restarts.
-  const closed = closedPort();
+  const closed = await closedPort();
   process.env.FAKE_COMFY_MODE = "launch_fail";
   process.env.FAKE_COMFY_ERROR_CODE = "port_in_use";
   process.env.FAKE_COMFY_ERROR_MESSAGE = "bound";
