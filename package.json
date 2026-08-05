@@ -33,7 +33,7 @@
   "scripts": {
     "test": "bun test",
     "build": "bun scripts/build.mjs",
-    "compile": "bun build src/index.ts --compile --outfile dist/mcp-comfyui",
+    "compile": "bun build src/index.ts --compile --outfile dist/mcp-comfyui; code=$?; rm -f .*.bun-build; exit $code",
     "prepublishOnly": "bun run build",
     "typecheck": "tsc --noEmit"
   },
