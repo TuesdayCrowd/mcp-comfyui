@@ -1,18 +1,25 @@
 import { z } from "zod";
 import { AUTO_LAUNCH_ENV, WORKSPACE_ENV } from "../config.ts";
-import { snippet } from "./envelope.ts";
+import { EnvelopeParseError, snippet } from "./envelope.ts";
 import { ComfyCliError, ComfyUnavailableError, runComfy } from "./exec.ts";
 import { DEFAULT_PORT, authority, resolveHost } from "./target.ts";
 
 /**
- * Is a ComfyUI answering, and — only when nothing is — may we start one.
+ * Is a ComfyUI answering at the address a launch names, and — only when
+ * nothing is there — may we start one.
  *
- * The order matters more than either half. This user runs ComfyUI Desktop,
- * which manages its own process and is **not** a comfy-cli workspace, so
- * `comfy launch` here would start a *second, competing* instance: two servers
- * bidding for port 8188, for the same 48GB of unified memory, and for the same
- * shared model directory. Detection is therefore the primary job of this module
- * and launching is the fallback, guarded by it (landmine #8).
+ * The refusal is scoped to **the address the request names**: the host/port
+ * from the startup arguments, falling back to the address this server is
+ * configured to talk to. That is the address a second instance would actually
+ * occupy, so it is the only one worth asking about before a launch. It is
+ * deliberately *not* "is anything running on this machine" — this user runs
+ * ComfyUI Desktop on 8188, which manages its own process and is not a
+ * comfy-cli workspace, and a launch aimed at a different, free port must be
+ * allowed to proceed rather than being refused for an instance nobody asked
+ * about. A launch that does proceed while another instance is running
+ * elsewhere still says so, in {@link LaunchResult}'s `warnings` array, because
+ * the two compete for the same unified memory and the same shared model
+ * directory (landmine #8) even though refusing outright would be wrong.
  *
  * `/system_stats` is the probe because it is cheap, unauthenticated, and
  * present in every ComfyUI this server could talk to. Its body is parsed
@@ -265,6 +272,17 @@ export interface LaunchOptions {
  * retrying. Both arms carry the same instance details, so a caller that only
  * wants to know about the instance reads `.instance` either way.
  *
+ * **`already_running.instance` is always the instance at the address the
+ * request named** — never a substitute from somewhere else. See
+ * {@link performLaunch}: exactly one probe decides this outcome, and it is the
+ * probe of the resolved target.
+ *
+ * **`launched.warnings`** is non-empty when this launch proceeded while
+ * another ComfyUI was already known to be running at a different address — a
+ * real resource conflict (VRAM, the shared model directory) that is worth
+ * surfacing, but not a reason to refuse a launch that was deliberately asked
+ * for. Empty, never absent, when there was nothing to warn about.
+ *
  * Genuine faults still throw: {@link LaunchArgumentError} for arguments this
  * server will not send, {@link ComfyCliError} for a failure the CLI diagnosed
  * (`not_in_workspace`, `port_in_use`), {@link ComfyUnavailableError} for a
@@ -273,7 +291,7 @@ export interface LaunchOptions {
  */
 export type LaunchResult =
   | { outcome: "already_running"; instance: RunningInstance }
-  | { outcome: "launched"; instance: RunningInstance };
+  | { outcome: "launched"; instance: RunningInstance; warnings: string[] };
 
 /**
  * An argument this server refuses to send. Thrown before anything is probed or
@@ -330,6 +348,51 @@ export class LaunchTimeoutError extends Error {
     );
     this.url = url;
     this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * The launch process died before ever producing a usable server or a verdict
+ * the CLI diagnosed.
+ *
+ * `comfy launch --background` is meant to emit a classified `ok:false`
+ * envelope for every failure it recognises — `not_in_workspace`,
+ * `port_in_use`, `server_already_running` — which {@link isVerdict} already
+ * catches via `ComfyCliError`. An unresolvable workspace instead crashes it
+ * **uncaught**: no envelope at all, a non-zero exit, a traceback on stderr —
+ * contrary to what `docs/comfy-cli-ground-truth.md` claimed for
+ * `--background` (being corrected). `runComfy` surfaces that as an
+ * {@link EnvelopeParseError}, whose own message already carries the command
+ * line, the exit code and a bounded stderr snippet (see `comfy/exec.ts`'s
+ * `decodeStdout`) — this class adds only what a caller waiting on readiness
+ * would otherwise lose: the address that was being polled, and the workspace
+ * fix, since an unresolvable workspace is the one cause this server can name
+ * with any confidence.
+ *
+ * Safe to treat as terminal without separately inspecting the process's exit
+ * code: `decodeStdout` only throws this once `runComfyRaw` has already
+ * awaited `proc.exited`, so a launch that is merely slow — still detached,
+ * still tailing its own log — cannot have settled the promise this error came
+ * from, and this class is never reached for it. Every instance reaching here
+ * therefore names a process that is provably gone; a clean exit never reaches
+ * it either, because `comfy launch --background`'s own success path always
+ * emits a usable envelope before exiting.
+ */
+export class LaunchFailedError extends Error {
+  override readonly name = "LaunchFailedError";
+  /** The `/system_stats` URL that was being polled when the launch died. */
+  readonly url: string;
+
+  constructor(url: string, cause: EnvelopeParseError, workspace: string | undefined) {
+    super(
+      `ComfyUI never answered at ${url}: comfy launch exited before producing a usable server\n` +
+        `  ${cause.message}\n` +
+        `The most common cause is a workspace comfy-cli could not resolve — the same failure ` +
+        `\`not_in_workspace\` reports when the CLI catches it instead of crashing.\n` +
+        workspaceGuidance(workspace),
+      { cause },
+    );
+    this.url = url;
   }
 }
 
@@ -671,14 +734,20 @@ function describeFailure(failure: unknown): string | null {
 }
 
 /**
- * Start ComfyUI, but only if nothing is already there.
+ * Start ComfyUI, but only if nothing is already at the address this launch
+ * names.
  *
- * 1. **Detect first, and refuse if anything answers.** Both the address this
- *    server talks to and the address the startup arguments name are checked,
- *    because a second instance on another port still competes for the same
- *    unified memory and the same shared model directory — the port collision is
- *    only the most visible of the three.
+ * 1. **Detect first, and refuse only if the target address answers.** The
+ *    target is the host/port the startup arguments name, falling back to the
+ *    address this server is configured to talk to (see
+ *    {@link launchTarget}) — never a broader "is anything running on this
+ *    machine" check. An instance running at some *other* address does not
+ *    block this launch; it is surfaced as a warning on the result instead
+ *    (step 2b), because the two still compete for the same unified memory and
+ *    the same shared model directory (landmine #8).
  * 2. Otherwise invoke `comfy --json launch --background -- <ComfyUI args>`.
+ *    2b. If another instance is known to be running at a different address,
+ *        note that on the result as a warning — surfaced, not refused.
  * 3. **Poll `/system_stats` until it answers**, rather than trusting the CLI's
  *    log scrape or its exit. The probe is the only evidence that survives an
  *    upstream change to either.
@@ -698,59 +767,89 @@ export async function launchInstance(opts: LaunchOptions = {}): Promise<LaunchRe
   const argv = comfyuiArgs(opts.args ?? {}, opts.extraArgs ?? []);
   validateComfyuiArgs(argv);
 
-  const running = inFlightLaunch;
-  if (running !== null) return running;
+  const target = launchTarget(opts, argv);
+  const key = authority(target.host, target.port);
 
-  const pending = performLaunch(opts, argv);
-  inFlightLaunch = pending;
+  const running = inFlightLaunches.get(key);
+  if (running !== undefined) return running;
+
+  const pending = performLaunch(opts, argv, target);
+  inFlightLaunches.set(key, pending);
   try {
     return await pending;
   } finally {
     // By identity, so a launch started after this one finished is not cleared
     // out from under its own callers. Runs on failure too, or one bad launch
     // would wedge this process until it restarts.
-    if (inFlightLaunch === pending) inFlightLaunch = null;
+    if (inFlightLaunches.get(key) === pending) inFlightLaunches.delete(key);
   }
 }
 
 /**
- * The launch this process is currently performing, if any.
+ * The launches this process is currently performing, keyed by resolved
+ * `host:port` target.
  *
- * **One, globally — not one per address.** `comfy/objectInfo.ts` keys its
- * in-flight map by cache path because two different payloads really are two
- * independent pieces of work. Launching is not like that: what a second launch
- * would collide with is not a port, it is the machine's accelerator and its
- * shared model directory (landmine #8), and those are singular however many
- * addresses are involved. A map keyed by target address would happily start a
- * second ComfyUI on 8189 alongside the first on 8188 — which is exactly the
- * thing the guard exists to prevent.
+ * **One per address, not one globally.** The guard this module enforces
+ * (landmine #8) is scoped to the address a launch names — see
+ * {@link launchInstance} — so two launches for two *different* addresses are
+ * both legitimate work and must both proceed; a global lock would make the
+ * second one silently join the first and come back with the wrong instance.
+ * Two launches for the *same* address really are one piece of work, which is
+ * what this map still collapses them to — the same reasoning
+ * `comfy/objectInfo.ts` uses keying its own in-flight map by cache path.
  *
  * This became reachable when auto-launch started firing from tool handlers:
  * before, a launch took a deliberate call, and two of them at once took two.
  *
  * A joiner gets the leader's result, which is the truth about what is now
- * running. Its own startup arguments are **not** applied — the leader's ComfyUI
- * is the one that exists — and that is the right trade against starting a second
- * server to honour them.
+ * running at that address. Its own startup arguments are **not** applied — the
+ * leader's ComfyUI is the one that exists — and that is the right trade
+ * against starting a second server to honour them.
  */
-let inFlightLaunch: Promise<LaunchResult> | null = null;
+const inFlightLaunches = new Map<string, Promise<LaunchResult>>();
+
+/**
+ * Whether another ComfyUI is known to be running somewhere other than this
+ * launch's target, phrased as the warning to attach to a `launched` result.
+ *
+ * Not a refusal — see the module doc — so this is only ever consulted once
+ * the target's own probe has already come back free. Skipped entirely (no
+ * probe made) when the address this server is configured to talk to *is* the
+ * target: that probe already ran as the refusal check, and it came back free,
+ * or this function would never have been reached.
+ */
+async function contentionWarnings(
+  opts: LaunchOptions,
+  target: Target,
+  probeTimeoutMs: number,
+): Promise<string[]> {
+  const configuredHost = resolveHost(opts.host);
+  const configuredPort = opts.port ?? DEFAULT_PORT;
+  if (configuredHost === target.host && configuredPort === target.port) return [];
+
+  const elsewhere = await detectInstance({ host: opts.host, port: opts.port, timeoutMs: probeTimeoutMs });
+  if (!elsewhere.running) return [];
+
+  return [
+    `another ComfyUI is already running at ${elsewhere.url}; this launch targets ` +
+      `${statsUrl(target.host, target.port)} instead, but the two will compete for the same ` +
+      `VRAM and the same shared model directory.`,
+  ];
+}
 
 /** The launch itself, once it has been established that this caller leads it. */
-async function performLaunch(opts: LaunchOptions, argv: string[]): Promise<LaunchResult> {
-  const target = launchTarget(opts, argv);
-
+async function performLaunch(opts: LaunchOptions, argv: string[], target: Target): Promise<LaunchResult> {
   const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_READY_TIMEOUT_MS;
+  const targetUrl = statsUrl(target.host, target.port);
 
-  const probe = { host: opts.host, port: opts.port, timeoutMs: probeTimeoutMs };
-  const here = await detectInstance(probe);
+  // The one and only refusal check: is the address THIS launch names already
+  // occupied? Nothing else is probed here — an instance anywhere else is not
+  // this launch's business to refuse over, only to warn about below.
+  const here = await detectInstance({ ...target, timeoutMs: probeTimeoutMs });
   if (here.running) return { outcome: "already_running", instance: here };
 
-  const targetUrl = statsUrl(target.host, target.port);
-  if (targetUrl !== here.url) {
-    const there = await detectInstance({ ...target, timeoutMs: probeTimeoutMs });
-    if (there.running) return { outcome: "already_running", instance: there };
-  }
+  const warnings = await contentionWarnings(opts, target, probeTimeoutMs);
 
   const cli = startLaunch(launchArgv(argv, opts.workspace), timeoutMs);
 
@@ -758,12 +857,20 @@ async function performLaunch(opts: LaunchOptions, argv: string[]): Promise<Launc
   let lastReason = "no probe completed";
   for (;;) {
     const detection = await detectInstance({ ...target, timeoutMs: probeTimeoutMs });
-    if (detection.running) return { outcome: "launched", instance: detection };
+    if (detection.running) return { outcome: "launched", instance: detection, warnings };
     lastReason = detection.reason;
 
     // Checked after the probe, not before it: if a ComfyUI is answering, it is
     // running whatever the CLI thinks, and reality outranks the CLI's opinion.
     const failure = cli.failure();
+    // A classified verdict (isVerdict) and an uncaught crash with no usable
+    // envelope (EnvelopeParseError — see LaunchFailedError) are both terminal:
+    // either way the process is gone and nothing will ever answer this poll.
+    // `--background` detaches on its OWN success path, so "the child exited"
+    // is not by itself a failure — only a settled `EnvelopeParseError` here
+    // proves it, since that can only happen once the process has actually
+    // exited with nothing usable to show for it.
+    if (failure instanceof EnvelopeParseError) throw new LaunchFailedError(targetUrl, failure, opts.workspace);
     if (isVerdict(failure)) throw explainVerdict(failure, opts.workspace);
 
     if (Date.now() >= deadline) break;

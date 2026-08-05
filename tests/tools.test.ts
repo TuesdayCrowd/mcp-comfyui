@@ -36,6 +36,8 @@ let workdir: string;
 let argvOut: string;
 /** A port nothing is listening on, freshly reserved for each test. */
 let deadPort: number;
+/** Loopback fixtures started by a `launch_comfyui` wiring test, stopped after it. */
+let launchServers: ReturnType<typeof Bun.serve>[] = [];
 
 /**
  * A port bound and immediately released. `detectInstance`'s probe (used by
@@ -62,11 +64,13 @@ beforeEach(() => {
   workdir = mkdtempSync(join(tmpdir(), "mcp-comfyui-tools-"));
   argvOut = join(workdir, "argv");
   deadPort = closedPort();
+  launchServers = [];
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
 });
 
 afterEach(() => {
+  for (const bound of launchServers) bound.stop(true); // force: a hung handler must not hold the suite
   delete process.env.COMFY_BIN;
   delete process.env.FAKE_COMFY_MODE;
   delete process.env.FAKE_COMFY_ARGV_OUT;
@@ -288,4 +292,92 @@ test("run_workflow's ordinary inputs are unaffected by the new schema guard", as
   expect(value).toContain("string");
   expect(value).toContain("number");
   expect(value).toContain("boolean");
+});
+
+// --- launch_comfyui wiring ---------------------------------------------------
+
+/** A loopback `/system_stats` fixture, cleaned up by `afterEach`. */
+function fakeInstance(): ReturnType<typeof Bun.serve> {
+  const bound = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () =>
+      new Response(JSON.stringify({ system: {}, devices: [] }), {
+        headers: { "content-type": "application/json" },
+      }),
+  });
+  launchServers.push(bound);
+  return bound;
+}
+
+/** Refuses until probed `failures` times, then answers like `fakeInstance`. */
+function fakeInstanceReadyAfter(failures: number): ReturnType<typeof Bun.serve> {
+  let seen = 0;
+  const bound = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch: () =>
+      seen++ < failures
+        ? new Response("starting", { status: 503 })
+        : new Response(JSON.stringify({ system: {}, devices: [] }), {
+            headers: { "content-type": "application/json" },
+          }),
+  });
+  launchServers.push(bound);
+  return bound;
+}
+
+function portOf(bound: ReturnType<typeof Bun.serve>): number {
+  const { port } = bound;
+  if (port === undefined) throw new Error("test server did not bind a port");
+  return port;
+}
+
+test("launch_comfyui's instance is the one at the requested port, never the configured one", async () => {
+  process.env.FAKE_COMFY_MODE = "launch";
+  const configured = fakeInstance(); // something else is answering at the configured address too
+  const target = fakeInstance(); // AND at the exact address requested
+  const client = await connect(baseConfig({ port: portOf(configured), allowLaunch: true }));
+
+  const result = (await client.callTool({
+    name: "launch_comfyui",
+    arguments: { port: portOf(target) },
+  })) as CallToolResult;
+
+  const body = JSON.parse(textOf(result)) as Record<string, unknown>;
+  expect(body["outcome"]).toBe("already_running");
+  expect((body["instance"] as Record<string, unknown>)["port"]).toBe(portOf(target));
+});
+
+test("launch_comfyui reports launch_failed, not launch_timeout, when the CLI dies without an envelope", async () => {
+  // An unresolvable workspace crashes `comfy launch --background` uncaught —
+  // no envelope, non-zero exit — which must not read as a five-minute timeout.
+  process.env.FAKE_COMFY_MODE = "garbage";
+  const client = await connect(baseConfig({ port: deadPort, allowLaunch: true }));
+
+  const result = (await client.callTool({ name: "launch_comfyui", arguments: {} })) as CallToolResult;
+
+  expect(result.isError).toBe(true);
+  const body = JSON.parse(textOf(result)) as Record<string, unknown>;
+  const error = body["error"] as Record<string, unknown>;
+  expect(error["kind"]).toBe("launch_failed");
+  expect(typeof error["url"]).toBe("string");
+  expect(String(error["message"])).toContain("MCP_COMFYUI_WORKSPACE");
+});
+
+test("launch_comfyui surfaces a contention warning when it proceeds alongside a running instance", async () => {
+  process.env.FAKE_COMFY_MODE = "launch";
+  const configured = fakeInstance(); // running at the address this server talks to
+  const target = fakeInstanceReadyAfter(1); // free, so the launch proceeds here
+  const client = await connect(baseConfig({ port: portOf(configured), allowLaunch: true }));
+
+  const result = (await client.callTool({
+    name: "launch_comfyui",
+    arguments: { port: portOf(target) },
+  })) as CallToolResult;
+
+  const body = JSON.parse(textOf(result)) as Record<string, unknown>;
+  expect(body["outcome"]).toBe("launched");
+  expect(Array.isArray(body["warnings"])).toBe(true);
+  expect((body["warnings"] as unknown[]).length).toBeGreaterThan(0);
 });

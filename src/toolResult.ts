@@ -4,6 +4,7 @@ import { ComfyCliError, ComfyTimeoutError, ComfyUnavailableError } from "./comfy
 import {
   InstanceUnavailableError,
   LaunchArgumentError,
+  LaunchFailedError,
   LaunchTimeoutError,
 } from "./comfy/instance.ts";
 import { JobPayloadError } from "./comfy/jobs.ts";
@@ -76,6 +77,13 @@ export type ToolErrorKind =
   /** `comfy launch` ran but no ComfyUI answered inside the budget. */
   | "launch_timeout"
   /**
+   * `comfy launch` exited before producing a usable server or a verdict the
+   * CLI diagnosed — an uncaught crash, not a timeout. Distinct from
+   * `launch_timeout` on purpose: waiting longer would not have helped, since
+   * the process was already gone.
+   */
+  | "launch_failed"
+  /**
    * Nothing is answering and this server may not start anything. Distinct from
    * `comfy_cli`, because nothing was attempted and no CLI was consulted — the
    * fix is a configuration choice or a hand-started ComfyUI, not a retry.
@@ -116,7 +124,7 @@ export interface ToolErrorBody {
   workflow_path?: string;
   /** `workflow_not_found`: the handles `list_workflows` would return. */
   known_workflows?: string[];
-  /** `object_info_*`, `launch_timeout`: the address or file at fault. */
+  /** `object_info_*`, `launch_timeout`, `launch_failed`: the address or file at fault. */
   url?: string;
   cache_path?: string;
   /** `object_info_unavailable`: the HTTP status, where the request got one. */
@@ -291,6 +299,13 @@ export function describeError(err: unknown): ToolErrorBody {
       message: err.message,
       cache_path: err.cachePath,
     };
+  }
+  // Before LaunchTimeoutError, and distinct from it on purpose: a timeout means
+  // "still waiting, budget spent", while this means "the child is gone and
+  // nothing will ever answer". Collapsing them would tell an operator to raise
+  // a budget that was never the problem.
+  if (err instanceof LaunchFailedError) {
+    return { kind: "launch_failed", message: err.message, url: err.url };
   }
   if (err instanceof LaunchTimeoutError) {
     return {

@@ -6,6 +6,7 @@ import { ComfyCliError, ComfyUnavailableError } from "../src/comfy/exec";
 import {
   InstanceUnavailableError,
   LaunchArgumentError,
+  LaunchFailedError,
   LaunchTimeoutError,
   detectInstance,
   ensureInstance,
@@ -436,6 +437,91 @@ test("refuses when an instance is running on the port the arguments name", async
   expect(existsSync(argvOut)).toBe(false);
 });
 
+test("a launch targeting a free port proceeds while another instance runs elsewhere", async () => {
+  // The bug this task exists to fix: `launch_comfyui {port: 8189}` used to be
+  // refused with `already_running` for the instance on 8188 even though 8189
+  // was free. The refusal must be scoped to the address the request names.
+  const elsewherePort = serve(); // e.g. ComfyUI Desktop, on the configured/default address
+  const targetPort = serveReadyAfter(1);
+  const argvOut = armCli("launch");
+
+  const result = await launchInstance({
+    port: elsewherePort,
+    args: { port: targetPort },
+    pollIntervalMs: 10,
+  });
+
+  expect(result.outcome).toBe("launched");
+  expect(result.instance.port).toBe(targetPort);
+  // The CLI really ran this time — awaited, since `launchInstance` does not
+  // wait for the (fire-and-forget) spawn, so a synchronous check here would
+  // race it.
+  await written(argvOut);
+});
+
+test("already_running never substitutes an instance from a different address", async () => {
+  // A caller asking for one port must never receive a different port's
+  // instance labelled a success. Both addresses are running here, so the old
+  // "refuse on either" policy would have handed back the configured
+  // instance — the wrong one — instead of refusing with the one requested.
+  const configuredPort = serve();
+  const targetPort = serve();
+  const argvOut = armCli("launch");
+
+  const result = await launchInstance({ port: configuredPort, args: { port: targetPort } });
+
+  expect(result.outcome).toBe("already_running");
+  expect(result.instance.port).toBe(targetPort);
+  expect(result.instance.port).not.toBe(configuredPort);
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("the contention warning appears when another instance is running elsewhere", async () => {
+  // Launching a second ComfyUI is allowed when it was asked for, but the two
+  // compete for VRAM and the shared model directory — the caller is told.
+  const elsewherePort = serve();
+  const targetPort = serveReadyAfter(1);
+  armCli("launch");
+
+  const result = await launchInstance({
+    port: elsewherePort,
+    args: { port: targetPort },
+    pollIntervalMs: 10,
+  });
+
+  expect(result.outcome).toBe("launched");
+  if (result.outcome !== "launched") return;
+  expect(result.warnings.length).toBeGreaterThan(0);
+  expect(result.warnings.join("\n")).toContain(String(elsewherePort));
+});
+
+test("no contention warning when nothing else is running", async () => {
+  const configuredPort = closedPort(); // nothing is running at the configured address
+  const targetPort = serveReadyAfter(1);
+  armCli("launch");
+
+  const result = await launchInstance({
+    port: configuredPort,
+    args: { port: targetPort },
+    pollIntervalMs: 10,
+  });
+
+  expect(result.outcome).toBe("launched");
+  if (result.outcome !== "launched") return;
+  expect(result.warnings).toEqual([]);
+});
+
+test("no contention warning when the target is the configured address itself", async () => {
+  const port = serveReadyAfter(1);
+  armCli("launch");
+
+  const result = await launchInstance({ port, pollIntervalMs: 10 });
+
+  expect(result.outcome).toBe("launched");
+  if (result.outcome !== "launched") return;
+  expect(result.warnings).toEqual([]);
+});
+
 test("the ComfyUI arguments follow a bare -- separator", async () => {
   // Extra arguments are trailing positionals; there is no --extra-args flag,
   // and without the separator Typer parses --lowvram as an option of its own.
@@ -656,6 +742,29 @@ test("a failure the CLI diagnosed aborts the wait instead of polling to the budg
   expect(elapsed).toBeLessThan(3_000); // nowhere near the readiness budget
 });
 
+test("a launch whose CLI exits non-zero with no envelope fails fast, not after the full budget", async () => {
+  // Measured against the real CLI: an unresolvable workspace crashes `comfy
+  // launch --background` uncaught — no envelope, a non-zero exit, a traceback
+  // on stderr — contrary to what the ground-truth doc claimed for
+  // `--background`. That surfaces as an EnvelopeParseError, not a
+  // ComfyCliError, so `isVerdict` alone never sees it and the poll loop would
+  // otherwise burn the whole readiness budget on a child that is already dead.
+  process.env.FAKE_COMFY_MODE = "garbage"; // non-zero exit, unparseable stdout, stderr traceback
+  const port = closedPort(); // nothing ever answers; only the crash should end the wait
+
+  const started = Date.now();
+  const err = await rejection(launchInstance({ port, timeoutMs: 15_000, pollIntervalMs: 50 }));
+  const elapsed = Date.now() - started;
+
+  expect(err).toBeInstanceOf(LaunchFailedError);
+  expect(err).not.toBeInstanceOf(LaunchTimeoutError);
+  expect(elapsed).toBeLessThan(3_000); // nowhere near the 15s budget
+  const message = (err as Error).message;
+  expect(message).toContain(`http://127.0.0.1:${port}/system_stats`); // the address being polled
+  expect(message).toContain("MCP_COMFYUI_WORKSPACE"); // the actual fix, surfaced
+  expect(message).toContain("RuntimeError: boom"); // the traceback survives, not just a verdict
+});
+
 test("a missing comfy binary aborts the wait rather than polling to the budget", async () => {
   process.env.COMFY_BIN = join(workdir, "definitely-not-installed");
   const port = serveReadyAfter(Number.MAX_SAFE_INTEGER);
@@ -834,6 +943,22 @@ test("a ComfyUI that appears between the two probes is not raced", async () => {
   expect(await settledInvocations(log, 0)).toBe(0);
 });
 
+test("ensureInstance launches at the configured address, not at an instance running elsewhere", async () => {
+  // ensureInstance keeps its current meaning: if the configured address is
+  // answering, use it; if not, launch there. Auto-launch must not start an
+  // instance on some other port just because one happens to be reachable.
+  const elsewherePort = serve(); // running, but not the configured address
+  const configuredPort = serveReadyAfter(2);
+  const log = countingCli("launch");
+
+  const ensured = await ensureInstance({ port: configuredPort, autoLaunch: true, pollIntervalMs: 10 });
+
+  expect(ensured.outcome).toBe("launched");
+  expect(ensured.instance.port).toBe(configuredPort);
+  expect(ensured.instance.port).not.toBe(elsewherePort);
+  expect(await settledInvocations(log, 1)).toBe(1);
+});
+
 test("ensureInstance refuses actionably when auto-launch is off", async () => {
   const port = closedPort();
   const log = countingCli("launch");
@@ -874,6 +999,24 @@ test("a launch already in flight is joined rather than started again", async () 
 
   expect(await settledInvocations(log, 1)).toBe(1);
   expect(first.instance.url).toBe(second.instance.url);
+});
+
+test("concurrent launches for different targets do not share an in-flight launch", async () => {
+  // One in-flight launch per resolved target address, not one globally: two
+  // launches for two different ports are legitimate and must both proceed.
+  const configured = closedPort(); // never touched: both calls target elsewhere
+  const portA = serveReadyAfter(2);
+  const portB = serveReadyAfter(2);
+  const log = countingCli("launch");
+
+  const [a, b] = await Promise.all([
+    launchInstance({ port: configured, args: { port: portA }, pollIntervalMs: 10 }),
+    launchInstance({ port: configured, args: { port: portB }, pollIntervalMs: 10 }),
+  ]);
+
+  expect(await settledInvocations(log, 2)).toBe(2);
+  expect(a.instance.port).toBe(portA);
+  expect(b.instance.port).toBe(portB);
 });
 
 test("a later launch runs again, because the in-flight entry is released", async () => {

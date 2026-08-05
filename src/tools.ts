@@ -804,13 +804,15 @@ function registerLaunch(server: McpServer, config: ToolConfig): void {
     {
       title: "Launch ComfyUI",
       description:
-        "Start a ComfyUI server, but only if nothing is already answering. Refuses with " +
-        "`outcome: \"already_running\"` when an instance is reachable at either the address this " +
-        "server talks to or the address these arguments name — a second instance would compete " +
-        "with the first for VRAM and for the shared model directory, so this is the expected and " +
-        "correct answer on a machine where ComfyUI Desktop is running. On success it waits until " +
-        "the new server actually answers, which can take a minute or two while it loads. " +
-        "Registered only when MCP_COMFYUI_ALLOW_LAUNCH=1.",
+        "Start a ComfyUI server, but only if nothing is already answering at the address these " +
+        "arguments name (falling back to the address this server talks to). Refuses with " +
+        "`outcome: \"already_running\"` — carrying that instance, never a different one — only " +
+        "when that specific address is occupied; an instance running elsewhere does not block " +
+        "this call, so launching on a free port succeeds even while ComfyUI Desktop is running " +
+        "on its own. When a launch does proceed alongside another running instance, `warnings` " +
+        "on the result says so, because the two compete for the same VRAM and the same shared " +
+        "model directory. On success it waits until the new server actually answers, which can " +
+        "take a minute or two while it loads. Registered only when MCP_COMFYUI_ALLOW_LAUNCH=1.",
       inputSchema: {
         listen: z
           .string()
@@ -866,7 +868,11 @@ function registerLaunch(server: McpServer, config: ToolConfig): void {
           args: launchArgs,
           extraArgs: args.extra_args ?? [],
         });
-        return { outcome: result.outcome, instance: instanceBody(result.instance) };
+        return {
+          outcome: result.outcome,
+          instance: instanceBody(result.instance),
+          ...(result.outcome === "launched" ? { warnings: result.warnings } : {}),
+        };
       }),
   );
 }
