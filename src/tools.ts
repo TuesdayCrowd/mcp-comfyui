@@ -31,6 +31,15 @@ import {
   workflowRoots,
   type Environment,
 } from "./config.ts";
+import {
+  HOSTS_FILE_ENV,
+  RemoteHostUnavailableError,
+  loadHostRegistry,
+  resolveHostRef,
+  type HostRegistry,
+  type ResolvedHost,
+} from "./hosts.ts";
+import { recordJobHost, resolveJobTarget, type JobTarget } from "./jobLedger.ts";
 import { InertSlotError, toolAnswer, WorkflowNotFoundError } from "./toolResult.ts";
 import { describeSlots } from "./workflows/describe.ts";
 import { discoverWorkflows, inertInputsOfFile, type InertInput } from "./workflows/discover.ts";
@@ -83,7 +92,17 @@ const MAX_PORT = 65535;
 
 /** What the tools need to know about this installation. */
 export interface ToolConfig {
-  /** ComfyUI's address. `undefined` means the library default, `127.0.0.1`. */
+  /**
+   * The **default host's** address. `undefined` means the library default,
+   * `127.0.0.1`.
+   *
+   * No longer the address every tool talks to: since multi-host, each call
+   * resolves its own target against the registry — see {@link resolveTarget}.
+   * These two survive because they are still the whole configuration of an
+   * installation that has no registry file, which is every installation that
+   * predates one, and because a registry that lists hosts of its own reports
+   * them as ignored rather than silently losing to them.
+   */
   host: string | undefined;
   /** `undefined` means the library default, `8188`. */
   port: number | undefined;
@@ -145,13 +164,94 @@ export function toolConfig(env: Environment = process.env): ToolConfig {
   };
 }
 
+// --- which host ----------------------------------------------------------
+
+/**
+ * The registry, read fresh for this call.
+ *
+ * Per call, not once at startup, and the cost is a few hundred bytes off the
+ * page cache against a tool call that is already reading whole workflow files.
+ * What it buys: an operator who edits `hosts.json`, or a `manage_hosts` call
+ * that rewrites it, takes effect on the very next tool call rather than on the
+ * next restart of their MCP client — and `manage_hosts` needs no shared mutable
+ * state to invalidate, because there is none.
+ */
+function hostRegistry(config: ToolConfig): Promise<HostRegistry> {
+  return loadHostRegistry({
+    env: config.env,
+    defaultAddress: { host: config.host, port: config.port },
+  });
+}
+
+/** The host one call meant — its `host` argument, or the registry's default. */
+async function resolveTarget(config: ToolConfig, host: string | undefined): Promise<ResolvedHost> {
+  return resolveHostRef(await hostRegistry(config), host);
+}
+
 /** The address arguments every CLI-backed call passes through. */
-function target(config: ToolConfig): { host?: string; port?: number } {
-  return { host: config.host, port: config.port };
+function address(resolved: ResolvedHost): { host: string; port: number } {
+  return { host: resolved.host, port: resolved.port };
+}
+
+/** How every host-aware tool reports which instance it actually talked to. */
+function targetBody(resolved: ResolvedHost): Record<string, unknown> {
+  return {
+    name: resolved.name,
+    address: `${resolved.host}:${resolved.port}`,
+    local: resolved.local,
+    auto_launch: resolved.autoLaunch,
+  };
 }
 
 /**
- * A running ComfyUI, started if need be and if permitted.
+ * Which host a question about an existing job goes to — the caller's, this
+ * server's memory of the run, or the only host there is. See
+ * `jobLedger.ts`'s `resolveJobTarget` for why a fourth option ("the default")
+ * is deliberately not on that list.
+ */
+async function decideJobTarget(
+  config: ToolConfig,
+  promptId: string,
+  host: string | undefined,
+): Promise<JobTarget> {
+  const registry = await hostRegistry(config);
+  const explicit = host === undefined ? null : resolveHostRef(registry, host);
+  return resolveJobTarget(registry, promptId, explicit);
+}
+
+/**
+ * The host a job tool used, and how it was chosen.
+ *
+ * `host_source` is reported rather than left implicit because the three
+ * answers are not interchangeable to a caller reading a `prompt_not_found`:
+ * `explicit` means their own argument was used, `ledger` means this server
+ * knew, and `only` means there was exactly one host it could have been.
+ */
+function jobTargetBody(decided: JobTarget): Record<string, unknown> {
+  return {
+    target: targetBody(decided.target),
+    host_source: decided.source,
+    ...(decided.contradiction === null
+      ? {}
+      : {
+          warnings: [
+            {
+              source: "host",
+              code: "host_contradicts_ledger",
+              message:
+                `this server recorded ${decided.contradiction.name ?? "an address"} ` +
+                `(${decided.contradiction.host}:${decided.contradiction.port}) for this job, but ` +
+                `\`host\` named ${decided.target.label}; the argument was used. If the answer is ` +
+                `\`prompt_not_found\`, try it without \`host\`.`,
+            },
+          ],
+        }),
+  };
+}
+
+/**
+ * A running ComfyUI, started if need be, if permitted, **and if it is even
+ * possible**.
  *
  * Only the two tools that genuinely cannot work without a server call this.
  * `comfy_status` never does — it is the tool you call to *ask* whether anything
@@ -159,12 +259,30 @@ function target(config: ToolConfig): { host?: string; port?: number } {
  * `get_job` and `cancel_job` never do either: a freshly started ComfyUI has no
  * record of the job being asked about, so launching one would burn a minute to
  * answer the same question worse.
+ *
+ * The remote arm is not a policy choice, it is arithmetic: `comfy launch` takes
+ * no `--host`, so no launch performed here could ever produce a server at
+ * another machine's address. Probing and then refusing is the whole of what can
+ * be done, and it is done in that order so that a remote instance which *is* up
+ * behaves exactly like a local one. Handing this to `ensureInstance` with
+ * `autoLaunch: false` would reach the same refusal by a worse road: the message
+ * would offer `MCP_COMFYUI_AUTO_LAUNCH=1` as the fix, and setting it would
+ * change nothing at all.
  */
-function ensureRunning(config: ToolConfig) {
+async function ensureRunning(config: ToolConfig, resolved: ResolvedHost) {
+  if (!resolved.local) {
+    const detection = await detectInstance(address(resolved));
+    if (detection.running) return { outcome: "already_running" as const, instance: detection };
+    throw new RemoteHostUnavailableError(resolved, detection.url, detection.reason);
+  }
   return ensureInstance({
-    ...target(config),
+    ...address(resolved),
     workspace: config.workspace,
-    autoLaunch: config.autoLaunch,
+    // Both must agree: the installation-wide setting says whether this server
+    // may ever start ComfyUI, and the host's own entry says whether it may for
+    // this box. A remote host's entry is always false — `hosts.ts` forces it —
+    // so this is belt and braces behind the branch above.
+    autoLaunch: config.autoLaunch && resolved.autoLaunch,
   });
 }
 
@@ -321,13 +439,18 @@ function outputsBody(
  * started one would be the wrong instance anyway: it neither knows the job nor
  * wrote the file. An unreachable server therefore costs the caller nothing but
  * the paths it could not have had.
+ *
+ * Skipped outright for a host on another machine. Its `outputDirectory` is a
+ * path in that machine's filesystem, so there is nothing here for it to name —
+ * `comfy/outputs.ts` refuses it a second time for the same reason, and this
+ * saves a probe that could only ever have been discarded.
  */
 async function resolvingInstance(
   urls: readonly string[],
-  config: ToolConfig,
+  resolved: ResolvedHost,
 ): Promise<ArtifactLocation | null> {
-  if (urls.length === 0) return null;
-  const detection = await detectInstance(target(config));
+  if (urls.length === 0 || !resolved.local) return null;
+  const detection = await detectInstance(address(resolved));
   return detection.running ? detection : null;
 }
 
@@ -464,12 +587,16 @@ function runBody(
 async function withObjectInfo(
   location: { host?: string; port?: number; cacheDir?: string },
   config: ToolConfig,
+  resolved: ResolvedHost,
 ) {
   try {
     return await getObjectInfo(location);
   } catch (err) {
-    if (!(err instanceof ObjectInfoFetchError) || !config.autoLaunch) throw err;
-    const ensured = await ensureRunning(config);
+    // A remote host is skipped here rather than probed: `ensureRunning` would
+    // refuse it, and that refusal would replace the fetch error — which is the
+    // one that says what actually went wrong — with one about launching.
+    if (!(err instanceof ObjectInfoFetchError) || !config.autoLaunch || !resolved.local) throw err;
+    const ensured = await ensureRunning(config, resolved);
     // It was up all along, so the address is not the problem; the original
     // diagnosis is the better one and a retry would only obscure it.
     if (ensured.outcome === "already_running") throw err;
@@ -531,14 +658,17 @@ function looksLikeJsonLiteral(value: string): boolean {
 export async function resolveSlotTypes(
   workflowPath: string,
   inputs: SlotInputs | undefined,
-  config: ToolConfig,
+  // The resolved address rather than the whole `ToolConfig`: this is the only
+  // thing it ever wanted from one, and taking it directly is what keeps the
+  // function callable from a test without standing up a host registry.
+  location: { host: string; port: number },
 ): Promise<Record<string, string>> {
   const values = Object.values(inputs ?? {});
   const ambiguous = values.some((value) => typeof value === "string" && looksLikeJsonLiteral(value));
   if (!ambiguous) return {};
 
   try {
-    const listing = await listSlots(workflowPath, target(config));
+    const listing = await listSlots(workflowPath, location);
     const types: Record<string, string> = {};
     for (const slot of listing.slots) types[slot.address] = slot.type;
     return types;
@@ -609,6 +739,26 @@ const inputsArgument = z
       "seed. Omit an address to keep the value the workflow file already holds.",
   );
 
+/**
+ * Which ComfyUI a call is for.
+ *
+ * Optional on every tool, and omitting it is the default host — which is what
+ * makes every call written before this argument existed keep working
+ * unchanged.
+ */
+const hostArgument = z
+  .string()
+  .min(1)
+  .optional()
+  .describe(
+    "Which ComfyUI to use: a `name` from list_hosts (e.g. \"rtx-video\"), or an address such as " +
+      "\"100.86.199.90:8189\". Omit it to use the default host. A name wins over an address " +
+      "spelled the same way. An address must carry an explicit port unless it is an IP literal " +
+      "or localhost — a bare word with no port is reported as an unknown host name, with the " +
+      "names that would have worked, rather than looked up as a hostname and reported " +
+      "unreachable.",
+  );
+
 // --- registration --------------------------------------------------------
 
 /**
@@ -629,22 +779,75 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "devices with their VRAM, and the output and input directories it was started with. " +
         "Nothing running is a normal answer rather than a failure — `running: false` comes back " +
         "with the address that was probed and the reason it did not answer. Call this first " +
-        "whenever another tool reports the server unreachable.",
-      inputSchema: {},
+        "whenever another tool reports the server unreachable. Pass `host` to ask about a " +
+        "particular ComfyUI; list_hosts names them. This never starts anything, on any host.",
+      inputSchema: { host: hostArgument },
       annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ host }) =>
+      toolAnswer(async () => {
+        const resolved = await resolveTarget(config, host);
+        const detection = await detectInstance(address(resolved));
+        return {
+          target: targetBody(resolved),
+          ...(detection.running
+            ? instanceBody(detection)
+            : {
+                running: false,
+                url: detection.url,
+                host: detection.host,
+                port: detection.port,
+                reason: detection.reason,
+              }),
+        };
+      }),
+  );
+
+  server.registerTool(
+    "list_hosts",
+    {
+      title: "List ComfyUI hosts",
+      description:
+        "List the ComfyUI instances this server can be pointed at. Every other tool takes an " +
+        "optional `host` naming one of these; omitting it uses `default`. Each entry says whether " +
+        "the instance is on this machine (`local`) and whether this server may start it " +
+        "(`auto_launch`) — only a local one can be started, because `comfy launch` runs ComfyUI " +
+        "wherever `comfy` runs and has no way to reach another machine. This reads a JSON file " +
+        "and never contacts any of the hosts, so an entry appearing here says nothing about " +
+        "whether that ComfyUI is up; call comfy_status for that. `problem` and `warnings` come " +
+        "first when the registry file has something wrong with it — a host missing from this list " +
+        "usually has its explanation there. Use manage_hosts to change the file.",
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async () =>
       toolAnswer(async () => {
-        const detection = await detectInstance(target(config));
-        return detection.running
-          ? instanceBody(detection)
-          : {
-              running: false,
-              url: detection.url,
-              host: detection.host,
-              port: detection.port,
-              reason: detection.reason,
-            };
+        const registry = await hostRegistry(config);
+        return {
+          // Lead with the breakage. A registry that half-loaded is the case
+          // where a caller most needs to know it, and burying it under a
+          // plausible-looking host list is how a routing mistake goes unnoticed.
+          problem: registry.problem,
+          warnings: registry.warnings,
+          registry: {
+            path: registry.path,
+            present: registry.present,
+            repairable: registry.repairable,
+            env_var: HOSTS_FILE_ENV,
+          },
+          default: registry.defaultName,
+          count: registry.hosts.length,
+          hosts: registry.hosts.map((entry) => ({
+            name: entry.name,
+            host: entry.host,
+            port: entry.port,
+            address: `${entry.host}:${entry.port}`,
+            local: entry.local,
+            auto_launch: entry.autoLaunch,
+            note: entry.note,
+            is_default: entry.name === registry.defaultName,
+          })),
+        };
       }),
   );
 
@@ -697,27 +900,32 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "absent from `schema.properties`, and run_workflow refuses a call that sets one. Each `inert` " +
         "entry names the upstream node that actually supplies the value, and a candidate address to " +
         "set instead where one could be identified. Reads node definitions from a " +
-        "local cache, so it normally works while ComfyUI is stopped." +
+        "local cache — one per host, so two ComfyUIs with different models installed never " +
+        "answer for each other — so it normally works while ComfyUI is stopped. Pass `host` to " +
+        "describe the workflow against a particular ComfyUI's nodes; a workflow's constraints " +
+        "genuinely differ between hosts, because the checkpoints and custom nodes do." +
         (config.autoLaunch
           ? " If that cache is missing or stale and ComfyUI is not running, this will start " +
-            "ComfyUI to rebuild it, which can take a minute or two."
+            "ComfyUI to rebuild it, which can take a minute or two — but only for a host on this " +
+            "machine, since ComfyUI cannot be started remotely."
           : ""),
-      inputSchema: { workflow: workflowArgument },
+      inputSchema: { workflow: workflowArgument, host: hostArgument },
       // Honest rather than flattering: with auto-launch on, this tool may start
       // a GPU process, and `readOnlyHint: true` is a promise that it will not.
       // See {@link registerTools}.
       annotations: { readOnlyHint: !config.autoLaunch, openWorldHint: true },
     },
-    async ({ workflow }) =>
+    async ({ workflow, host }) =>
       toolAnswer(async () => {
+        const target = await resolveTarget(config, host);
         const resolved = await resolveWorkflow(workflow, config);
-        const location = { ...target(config), cacheDir: config.cacheDir };
+        const location = { ...address(target), cacheDir: config.cacheDir };
         // Fetched and cached in one step, then the *path* is handed to the CLI:
         // the join below needs the parsed document, and `slots --input` needs
         // the file (landmine #7). Reading it twice would cost a second 1.7MB.
-        const objectInfo = await withObjectInfo(location, config);
+        const objectInfo = await withObjectInfo(location, config, target);
         const listing = await listSlots(resolved.path, {
-          ...target(config),
+          ...address(target),
           objectInfoPath: objectInfoCachePath(location),
         });
         // A THIRD read of the same file, independent of the CLI entirely: the
@@ -727,6 +935,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         const described = describeSlots(listing.slots, objectInfo, inertInputs);
 
         return {
+          target: targetBody(target),
           workflow: { name: resolved.name, path: resolved.path },
           slot_count: listing.count,
           schema: described.schema,
@@ -756,14 +965,20 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "To open a finished artifact: `outputs.files` are already paths on this machine, and " +
         "`outputs.local_paths` maps each URL in `outputs.urls` to the file it names here, where " +
         "that file exists. A URL missing from `local_paths` has no local path and must be " +
-        "fetched." +
+        "fetched. " +
+        "Pass `host` to run on a particular ComfyUI; the run is remembered against it, so a later " +
+        "get_job or cancel_job for the returned `prompt_id` finds it without being told again. A " +
+        "run on another machine writes its artifacts on that machine, so `local_paths` is empty " +
+        "for it — the URLs are the way in." +
         (config.autoLaunch
           ? " If ComfyUI is not running this will start ComfyUI first, so the first call after a " +
             "cold machine can take a minute or two before the run is even submitted; later calls " +
-            "are immediate."
+            "are immediate. That applies only to a host on this machine: a host that is not " +
+            "answering elsewhere is reported, never started."
           : ""),
       inputSchema: {
         workflow: workflowArgument,
+        host: hostArgument,
         inputs: inputsArgument.optional(),
         wait: z
           .boolean()
@@ -791,8 +1006,9 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         openWorldHint: true,
       },
     },
-    async ({ workflow, inputs, wait, timeout_seconds }) =>
+    async ({ workflow, inputs, wait, timeout_seconds, host }) =>
       toolAnswer(async () => {
+        const target = await resolveTarget(config, host);
         const resolved = await resolveWorkflow(workflow, config);
         // Before anything else, and independent of the CLI entirely: a decoy
         // address writes its value nowhere ComfyUI reads it, so nothing below
@@ -816,7 +1032,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // (see `comfy/outputs.ts`'s resolveArtifactPath). Nothing is re-probed
         // afterwards — a second probe could answer with a different instance
         // from the one that did the work.
-        const { instance } = await ensureRunning(config);
+        const { instance } = await ensureRunning(config, target);
 
         // Finding 1. Resolved against the same server `set-slot` is about to
         // use, not the offline `/object_info` cache: a run already requires a
@@ -824,14 +1040,18 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // workflow's own widget layout, which `workflow slots` reports no
         // matter which schema source resolved it. See `resolveSlotTypes` for
         // why this is skipped on the ordinary path.
-        const slotTypes = await resolveSlotTypes(resolved.path, inputs as SlotInputs | undefined, config);
+        const slotTypes = await resolveSlotTypes(
+          resolved.path,
+          inputs as SlotInputs | undefined,
+          address(target),
+        );
 
         // A run needs a live server whatever happens, so `set-slot` is pointed
         // at the same server rather than at the offline cache: making the edit
         // work with ComfyUI down would buy a graph nothing could then submit.
         // describe_workflow is the opposite case, and does the opposite.
         const prepared = await applySlots(resolved.path, (inputs ?? {}) as SlotInputs, {
-          ...target(config),
+          ...address(target),
           slotTypes,
         });
         // Nothing may go between here and the call below. `runWorkflow` takes
@@ -843,13 +1063,19 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // it is what builds `effective_parameters`, and the caller's original
         // values are what a mismatch is measured against.
         const run = await runWorkflow(prepared, {
-          ...target(config),
+          ...address(target),
           wait,
           timeoutMs,
           requestedValues: inputs as SlotInputs | undefined,
         });
 
-        return runBody(resolved, prepared.applied, prepared.warnings, run, instance);
+        // Recorded before the answer is built, so that a job whose result a
+        // caller is about to poll is already attributed. See `jobLedger.ts` for
+        // why the alternative — guessing on a miss — is the failure this
+        // exists to prevent.
+        if (run.promptId !== null) recordJobHost(run.promptId, target);
+
+        return { target: targetBody(target), ...runBody(resolved, prepared.applied, prepared.warnings, run, instance) };
       }),
   );
 
@@ -866,14 +1092,22 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "each URL up in `outputs.local_paths`, which maps a URL to the file it names on this " +
         "machine when that file is really there. A URL missing from `local_paths` has no local " +
         "path and must be fetched. A job started in the ComfyUI web interface can be polled here " +
-        "too.",
-      inputSchema: { prompt_id: promptIdArgument },
+        "too — but only on the host that ran it, so name that host. " +
+        "For a run this server submitted, the host is remembered and `host` can be omitted. " +
+        "Asking the WRONG ComfyUI about a real job answers `prompt_not_found`, exactly as an id " +
+        "that never existed does, so a job that seems to have vanished is worth re-checking " +
+        "against the right host before believing it is gone.",
+      inputSchema: { prompt_id: promptIdArgument, host: hostArgument },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ prompt_id }) =>
+    async ({ prompt_id, host }) =>
       toolAnswer(async () => {
-        const job = await getJobStatus(prompt_id, target(config));
-        return jobBody(job, await resolvingInstance(job.outputs.urls, config));
+        const decided = await decideJobTarget(config, prompt_id, host);
+        const job = await getJobStatus(prompt_id, address(decided.target));
+        return {
+          ...jobTargetBody(decided),
+          ...jobBody(job, await resolvingInstance(job.outputs.urls, decided.target)),
+        };
       }),
   );
 
@@ -886,8 +1120,13 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "which of three things happened: `cancelled` (the job was live and has been stopped), " +
         "`already_finished` (it had already ended, so there was nothing to stop — this is a " +
         "successful answer, not a failure), or `not_found` (no job anywhere with that id). " +
-        "Cancelling frees the GPU immediately; the work already done is discarded.",
-      inputSchema: { prompt_id: promptIdArgument },
+        "Cancelling frees the GPU immediately; the work already done is discarded. For a run this " +
+        "server submitted, the host is remembered and `host` can be omitted; otherwise name the " +
+        "ComfyUI the job is on. Note that `not_found` here is the CLI reporting no job of that id " +
+        "in its own local records, which is a different thing from get_job's `prompt_not_found` " +
+        "against a server — a job this machine never submitted can resist cancelling for that " +
+        "reason alone.",
+      inputSchema: { prompt_id: promptIdArgument, host: hostArgument },
       annotations: {
         readOnlyHint: false,
         destructiveHint: true,
@@ -895,8 +1134,14 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         openWorldHint: true,
       },
     },
-    async ({ prompt_id }) =>
-      toolAnswer(async () => cancelBody(await cancelJob(prompt_id, target(config)))),
+    async ({ prompt_id, host }) =>
+      toolAnswer(async () => {
+        const decided = await decideJobTarget(config, prompt_id, host);
+        return {
+          ...jobTargetBody(decided),
+          ...cancelBody(await cancelJob(prompt_id, address(decided.target))),
+        };
+      }),
   );
 
   if (config.allowLaunch) registerLaunch(server, config);
@@ -921,8 +1166,14 @@ function registerLaunch(server: McpServer, config: ToolConfig): void {
         "on its own. When a launch does proceed alongside another running instance, `warnings` " +
         "on the result says so, because the two compete for the same VRAM and the same shared " +
         "model directory. On success it waits until the new server actually answers, which can " +
-        "take a minute or two while it loads. Registered only when MCP_COMFYUI_ALLOW_LAUNCH=1.",
+        "take a minute or two while it loads. " +
+        "ComfyUI can only ever be started on THIS machine: `comfy launch` runs it wherever this " +
+        "server runs and has no way to reach another box. A `host`, or a `listen` address, that " +
+        "is not on this machine is refused outright rather than attempted — attempting it would " +
+        "start a ComfyUI here and then wait for a machine that was never going to answer. " +
+        "Registered only when MCP_COMFYUI_ALLOW_LAUNCH=1.",
       inputSchema: {
+        host: hostArgument,
         listen: z
           .string()
           .min(1)
@@ -971,13 +1222,15 @@ function registerLaunch(server: McpServer, config: ToolConfig): void {
           disableAutoLaunch: args.disable_auto_launch,
           verbose: args.verbose,
         };
+        const target = await resolveTarget(config, args.host);
         const result = await launchInstance({
-          ...target(config),
+          ...address(target),
           workspace: config.workspace,
           args: launchArgs,
           extraArgs: args.extra_args ?? [],
         });
         return {
+          target: targetBody(target),
           outcome: result.outcome,
           instance: instanceBody(result.instance),
           ...(result.outcome === "launched" ? { warnings: result.warnings } : {}),
