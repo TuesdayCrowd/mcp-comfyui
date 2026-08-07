@@ -7,6 +7,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerTools, resolveSlotTypes, type ToolConfig } from "../src/tools.ts";
+import { describeError } from "../src/toolResult.ts";
 
 /**
  * Unit-level coverage for `src/tools.ts`'s own logic, below the level of the
@@ -411,4 +412,29 @@ test("launch_comfyui surfaces a contention warning when it proceeds alongside a 
   expect(body["outcome"]).toBe("launched");
   expect(Array.isArray(body["warnings"])).toBe(true);
   expect((body["warnings"] as unknown[]).length).toBeGreaterThan(0);
+});
+
+test("a missing Deno permission is an operator's to fix, not reported as a server bug", () => {
+  // Measured: a server started without `--allow-sys` answers `list_hosts` with
+  // this the first time it looks for its own configuration directory. Reporting
+  // it as `internal_error` says "this server has a bug", which is false and
+  // sends the operator to the wrong place — the runtime's own message already
+  // names the flag.
+  //
+  // Mutant: delete the `NotCapable` arm in `describeError`. This test dies.
+  const denied = new Error('Requires sys access to "homedir", run again with the --allow-sys flag');
+  denied.name = "NotCapable";
+
+  const body = describeError(denied);
+
+  expect(body.kind).toBe("permission_denied");
+  expect(body.message).toContain("--allow-sys");
+  expect(body.error_name).toBe("NotCapable");
+});
+
+test("an ordinary error is still reported as this server's own fault", () => {
+  // The asymmetry matters: an unrecognised error must NOT be relabelled as the
+  // caller's or the operator's problem, or a genuine bug here sends someone
+  // round a retry loop they can never win.
+  expect(describeError(new TypeError("boom")).kind).toBe("internal_error");
 });

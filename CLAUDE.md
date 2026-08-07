@@ -9,14 +9,16 @@ An MCP server that exposes ComfyUI workflows to MCP clients, driving [comfy-cli]
 ## Commands
 
 ```bash
-deno task test                        # full suite
-deno test tests/describe.test.ts      # one file
+deno task test                              # full suite
+deno task test:one tests/describe.test.ts   # one file (see below — a bare `deno test <file>` fails)
 deno task typecheck                   # tsc --noEmit, via node — see "Toolchain" below
 deno task build                       # -> dist/index.js, runnable under plain `node`
 deno task compile                     # -> dist/mcp-comfyui (self-contained binary, optional)
 ```
 
 **No per-test `--filter` for a file that uses `beforeEach`/`afterEach`/`beforeAll`.** Every test in this project's `tests/support/testing.ts` shim is registered through `@std/testing/bdd`'s `it` (aliased `test`); a file with hooks becomes one wrapping `Deno.test` named `"global"` with each `test()` as a *step*, and `deno test --filter` matches only top-level test names — it cannot reach into steps. `deno test --filter "…" tests/exec.test.ts` therefore runs either the whole file or nothing, never a single case inside it. The file itself is the practical unit (`deno test tests/foo.test.ts`); to isolate one test inside a hooked file, add `test.only(...)` at that call site temporarily (bdd's `it.only`, re-exported through the same shim) and remove it before committing. Files with no hooks at all (`target.test.ts`, `envelope.test.ts`, `index.test.ts`, `describe.test.ts`) register as ordinary top-level tests, and `--filter` reaches them by name.
+
+**A bare `deno test <file>` does not work here** and has not for some time: it type-checks by default, and Deno's bundled TypeScript is a full major behind this project's own — enough to reject `import.meta.dirname` in `tests/describe.test.ts` and the SDK's handler signatures in `src/tools.ts`. Measured against the released 0.5.0 as well, so it is not a regression. `deno task test:one <file>` carries the same `--no-check` and the same permissions as `deno task test`; the authoritative compile gate remains `deno task typecheck`.
 
 There is no lint step and no formatter config; match the surrounding style.
 
