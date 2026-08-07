@@ -984,9 +984,14 @@ export async function mutateHostRegistry(
       hosts.push(entry);
       changes.push({ host: entry.name, field: "host", from: null, to: entry.host });
       changes.push({ host: entry.name, field: "port", from: null, to: entry.port });
-      // The first host in an empty registry is the only sensible default, and
-      // saying nothing would leave `default` pointing at a name that is gone.
-      if (before.present === false || hosts.length === 1) {
+      // The default is deliberately NOT re-pointed at the new host, even when
+      // this is the first `add` on a machine with no registry file. Registering
+      // a remote box must not silently start sending every unqualified call to
+      // it; what was reaching the local Desktop a moment ago must keep reaching
+      // it. Writing the file materialises the previously-implicit `default`
+      // entry alongside the new one, which is what preserves that — and
+      // `set_default` is one call away when re-pointing really is the intent.
+      if (hosts.length === 1) {
         changes.push({ host: "default", field: "default", from: defaultName, to: entry.name });
         defaultName = entry.name;
       }
