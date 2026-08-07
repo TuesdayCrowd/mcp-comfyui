@@ -4,6 +4,44 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **ComfyUI is never launched for an address that is not this machine.** The
+  launch path made one refusal check — is the target address already occupied —
+  and then spawned `comfy launch` locally and unconditionally. Nothing asked whose
+  address the target was. Pointing the server at a remote instance that was not
+  answering therefore probed the remote, started a ComfyUI *here* on the default
+  port, polled the remote address until the five-minute readiness budget expired,
+  reported a timeout, and left the local process running, because `--background`
+  had already detached it. `launchInstance` now refuses any target that is not an
+  address on this machine, before anything is probed or spawned. The check reads
+  the target out of the assembled arguments, so a `--listen` naming another
+  machine is refused too, not only an explicitly configured host. It fails closed:
+  any name but `localhost` that is not literally an address on a local interface
+  is refused rather than resolved through DNS, because a wrong refusal explains
+  itself while a wrong acceptance recreates the orphaned process. `comfy launch`
+  accepts no `--host` and no `--port` — it starts a process wherever `comfy` runs
+  — so launching a remote instance was never possible, only expensive to discover.
+
+### Changed
+
+- **`deno task test` and `deno task compile` now grant
+  `--allow-sys=networkInterfaces`.** The locality check above reads this machine's
+  interface list, which Deno gates behind `--allow-sys`. Anyone compiling their own
+  binary needs this flag; without it the first gated launch throws `NotCapable`.
+  Node and Bun have no permission system and are unaffected, as is
+  `deno run -A jsr:@tuesdaycrowd/mcp-comfyui`.
+
+### Note
+
+- Multi-host support — reaching several ComfyUI instances chosen per call, rather
+  than one fixed at startup — is designed and agreed but **not implemented**. See
+  `docs/plans/2026-08-06-multi-host-design.md`. The launch fix above was pulled out
+  of that work and shipped on its own, because the defect is reachable today by
+  setting `MCP_COMFYUI_HOST` to a remote address.
+
 ## [0.5.0] — 2026-08-06
 
 ### Changed
