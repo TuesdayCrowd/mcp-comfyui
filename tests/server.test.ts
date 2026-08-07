@@ -502,7 +502,7 @@ async function failure(
 
 // --- registration --------------------------------------------------------
 
-test("registers exactly the seven default tools", async () => {
+test("registers exactly the eight default tools", async () => {
   expect(await toolNames(await connect())).toEqual([
     "cancel_job",
     "comfy_status",
@@ -510,6 +510,7 @@ test("registers exactly the seven default tools", async () => {
     "get_job",
     "list_hosts",
     "list_workflows",
+    "manage_hosts",
     "run_workflow",
   ]);
 });
@@ -2659,4 +2660,157 @@ test("an artifact that will not come across is reported without denying the othe
   const outputs = body["outputs"] as Record<string, unknown>;
   expect(Object.keys(outputs["fetched"] as Record<string, string>)).toEqual([good]);
   expect((outputs["fetch_problems"] as Record<string, unknown>[])[0]).toMatchObject({ url: gone });
+});
+
+test("manage_hosts adds a host, backs the file up, and reports what the next call will see", async () => {
+  writeHosts({ default: "mac", hosts: { mac: { host: "127.0.0.1", port: 8188 } } });
+  const client = await connect();
+
+  const body = await ok(client, "manage_hosts", {
+    action: "add",
+    name: "rtx-video",
+    host: REMOTE_ADDRESS,
+    port: 8189,
+    note: "Windows, RTX 4070",
+  });
+
+  expect(body["backup_path"]).toContain(".bak-");
+  expect(readFileSync(body["backup_path"] as string, "utf8")).toContain("8188");
+  expect(body["changes"]).toContainEqual({
+    host: "rtx-video",
+    field: "port",
+    from: null,
+    to: 8189,
+  });
+  // Re-read from disk, so the answer is what the next call will see rather than
+  // what this call believed it wrote.
+  const registry = body["registry"] as Record<string, unknown>;
+  expect((registry["hosts"] as Record<string, unknown>[]).map((entry) => entry["name"])).toEqual([
+    "mac",
+    "rtx-video",
+  ]);
+  expect(await ok(client, "list_hosts")).toMatchObject({ count: 2, default: "mac" });
+});
+
+test("manage_hosts refuses auto_launch for another machine, and writes nothing", async () => {
+  const before = { default: "mac", hosts: { mac: { host: "127.0.0.1", port: 8188 } } };
+  writeHosts(before);
+
+  const error = await failure(await connect(), "manage_hosts", {
+    action: "add",
+    name: "far",
+    host: REMOTE_ADDRESS,
+    auto_launch: true,
+  });
+
+  expect(error["kind"]).toBe("host_not_local");
+  expect(JSON.parse(readFileSync(hostsFile(), "utf8"))).toEqual(before);
+});
+
+test("manage_hosts repairs a file's syntax without touching a single address", async () => {
+  writeFileSync(
+    hostsFile(),
+    `{
+  // the laptop
+  "default": "mac",
+  "hosts": {
+    "mac": { "host": "127.0.0.1", "port": 8188, "vram_gb": 48 },
+  },
+}
+`,
+  );
+  const body = await ok(await connect(), "manage_hosts", { action: "repair" });
+
+  // Empty `changes` IS the guarantee: a repair fixes syntax, and one that
+  // quietly re-pointed a host would be indistinguishable from one that did not.
+  expect(body["changes"]).toEqual([]);
+  expect(body["reformatted"]).toBe(true);
+  const written = JSON.parse(readFileSync(hostsFile(), "utf8"));
+  expect(written.hosts.mac).toMatchObject({ host: "127.0.0.1", port: 8188, vram_gb: 48 });
+});
+
+test("manage_hosts will not 'repair' a file it could not read", async () => {
+  // The dangerous case. Neither parse read this, so the registry held only the
+  // environment's default — rewriting it would replace the operator's hosts
+  // with that one entry and leave the real ones in a .bak- file nobody was told
+  // to look for.
+  const broken = `{"hosts": {"mac": {"host": "127.0.0.1" "port": 8188}}}`;
+  writeFileSync(hostsFile(), broken);
+
+  const error = await failure(await connect(), "manage_hosts", { action: "repair" });
+
+  expect(error["kind"]).toBe("registry_invalid");
+  expect(readFileSync(hostsFile(), "utf8")).toBe(broken);
+});
+
+test("manage_hosts names the argument it needs rather than failing obscurely", async () => {
+  const error = await failure(await connect(), "manage_hosts", { action: "add", name: "x" });
+
+  expect(error["kind"]).toBe("invalid_input");
+  expect(String(error["message"])).toContain("host");
+});
+
+test("manage_hosts set_default changes which host an unqualified call reaches", async () => {
+  const other = serveOtherInstance();
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      other: { host: "127.0.0.1", port: other },
+    },
+  });
+  const client = await connect();
+
+  await ok(client, "manage_hosts", { action: "set_default", name: "other" });
+
+  // The registry is read per call, so this takes effect immediately — no
+  // restart, and no shared state to invalidate.
+  expect(await ok(client, "comfy_status")).toMatchObject({
+    port: other,
+    target: { name: "other" },
+  });
+});
+
+test("a workflow name nothing answers to is a missing workflow, not a network error", async () => {
+  // Found live, against a stopped local ComfyUI: a mistyped workflow name fell
+  // through to the default host's own library, could not reach it, and came
+  // back as `fetch failed` about /api/userdata — a true statement about
+  // something the caller never asked about, in place of the names that would
+  // have worked. A host consulted only as a fallback must not become the story.
+  writeWorkflow("real_one");
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port: deadPort } } });
+
+  const error = await failure(await connect(), "run_workflow", { workflow: "reel_one" });
+
+  expect(error["kind"]).toBe("workflow_not_found");
+  expect(error["known_workflows"]).toEqual(["real_one"]);
+});
+
+test("a host the caller named, that cannot be asked, is reported as the host", async () => {
+  // The other half of the same rule. Here the caller DID name a host, so its
+  // being unreachable is the answer to their question rather than an aside.
+  writeWorkflow("real_one");
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port: deadPort } } });
+
+  const error = await failure(await connect(), "run_workflow", {
+    workflow: "box/whatever",
+    host: "box",
+  });
+
+  expect(error["kind"]).toBe("host_unreachable");
+  expect(String(error["url"])).toContain("/api/userdata");
+});
+
+test("a workflow a named host does not have is a missing workflow", async () => {
+  const port = serveLibraryInstance({ "workflows/here.json": "{}" });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  writeWorkflow("local_one");
+
+  const error = await failure(await connect(), "describe_workflow", {
+    workflow: "box/absent",
+    host: "box",
+  });
+
+  expect(error["kind"]).toBe("workflow_not_found");
 });
