@@ -1,6 +1,6 @@
 {
   "name": "@tuesdaycrowd/mcp-comfyui",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "license": "Unlicense",
   "exports": "./src/index.ts",
   "imports": {
@@ -20,6 +20,7 @@
     "include": [
       "src",
       "README.md",
+      "CHANGELOG.md",
       "UNLICENSE",
       "deno.json"
     ]
