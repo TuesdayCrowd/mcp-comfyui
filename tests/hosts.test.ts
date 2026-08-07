@@ -413,15 +413,24 @@ function mutate(mutation: Parameters<typeof mutateHostRegistry>[0]) {
   return mutateHostRegistry(mutation, { env: {}, path: hostsPath, interfaces: INTERFACES });
 }
 
-test("adding the first host creates the file and makes it the default", async () => {
-  const result = await mutate({ action: "add", name: "mac-local", host: "127.0.0.1", port: 8188 });
+test("adding the first host creates the file without re-pointing the default at it", async () => {
+  const result = await mutate({ action: "add", name: "rtx-video", host: REMOTE, port: 8189 });
 
   expect(result.backupPath).toBeNull(); // nothing existed to back up
   expect(temporaries()).toEqual([]);
-  expect(result.registry.defaultName).toBe("mac-local");
-  expect(result.changes).toContainEqual({ host: "default", field: "default", from: DEFAULT_HOST_NAME, to: "mac-local" });
-  // Re-read from disk, so what is reported is what the next call will see.
-  expect(named(await load(), "mac-local")).toMatchObject({ host: "127.0.0.1", port: 8188 });
+  // The previously-implicit default is materialised beside the new host, and
+  // stays the default. Registering a remote box must not silently start
+  // sending every unqualified call to it.
+  const reloaded = await load();
+  expect(reloaded.defaultName).toBe(DEFAULT_HOST_NAME);
+  expect(reloaded.hosts.map((entry) => entry.name)).toEqual([DEFAULT_HOST_NAME, "rtx-video"]);
+  expect(named(reloaded, DEFAULT_HOST_NAME)).toMatchObject({ host: "127.0.0.1", port: 8188 });
+  expect(named(reloaded, "rtx-video")).toMatchObject({ host: REMOTE, port: 8189 });
+  expect(result.changes.some((change) => change.field === "default")).toBe(false);
+
+  // And re-pointing it is one call away, when that really is the intent.
+  const moved = await mutate({ action: "set_default", name: "rtx-video" });
+  expect(moved.registry.defaultName).toBe("rtx-video");
 });
 
 test("adding a second host leaves the default alone and backs the file up", async () => {

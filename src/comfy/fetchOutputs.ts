@@ -107,15 +107,25 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
   if (handle === null) return failed(`could not write ${path}`);
 
   let written = 0;
+  // `getReader()` rather than `for await (… of response.body)`. Async iteration
+  // over a `ReadableStream` is a comparatively recent addition and this bundle
+  // targets Node 18 upward as well as Deno and Bun (`engines.node >= 18`); the
+  // reader API is the one spelling that exists everywhere `fetch` does. The
+  // same runtime-agnostic discipline that keeps `comfy/exec.ts` on
+  // `node:child_process` rather than `Deno.Command`.
+  const reader = response.body.getReader();
   try {
-    for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
-      written += chunk.byteLength;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      written += value.byteLength;
       if (written > MAX_ARTIFACT_BYTES) {
         throw new Error(`larger than this server's ${MAX_ARTIFACT_BYTES}-byte limit`);
       }
-      await handle.write(chunk);
+      await handle.write(value);
     }
   } catch (cause) {
+    await reader.cancel().catch(() => {});
     await handle.close().catch(() => {});
     // A partial file that looks finished is the one outcome worse than none.
     await rm(path, { force: true }).catch(() => {});
