@@ -1,6 +1,6 @@
 {
   "name": "mcp-comfyui",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "MCP server that finds ComfyUI workflows, learns each one's inputs as typed JSON Schema, and runs them — driving comfy-cli rather than talking to ComfyUI directly",
   "module": "src/index.ts",
