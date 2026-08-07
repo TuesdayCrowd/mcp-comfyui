@@ -79,7 +79,9 @@ These are not style preferences. Each was measured, and each has a test pinning 
 
 **5. stdout is the MCP protocol.** Nothing may `console.log`. Diagnostics go to stderr.
 
-**6. Never launch a second ComfyUI.** Detect first, on both the detection target and the address the startup args name. Auto-launch is on by default, so this fires from ordinary tool handlers — hence the single global in-flight launch in `instance.ts`, deliberately *not* keyed by address. `comfy_status` never launches. A tool that may launch cannot be annotated `readOnlyHint: true`.
+**6. Never launch a second ComfyUI, and never launch for another machine.** Detect first, on both the detection target and the address the startup args name. Auto-launch is on by default, so this fires from ordinary tool handlers — hence the in-flight launch map in `instance.ts`, keyed by resolved `host:port` **per address, not globally**: two launches for the same address are one piece of work and collapse, while two for different addresses are both legitimate and must both proceed. `comfy_status` never launches. A tool that may launch cannot be annotated `readOnlyHint: true`.
+
+`launchInstance` also refuses any target that is not an address on this machine (`refuseRemoteTarget`, using `target.ts`'s `isLocalAddress`). `comfy launch` has no `--host`: it starts a process wherever `comfy` runs. Before that gate existed, aiming the server at a sleeping remote started a ComfyUI *here*, polled the remote for the full five-minute readiness budget, reported a timeout, and left the local process orphaned — `--background` had already detached it. The check fails closed: any host but `localhost` that is not literally an address on a local interface is refused rather than resolved through DNS, because a wrong refusal prints an explanation and a wrong acceptance recreates the orphan.
 
 The full list of verified landmines — each with the measurement behind it — is in [`docs/comfy-cli-ground-truth.md`](docs/comfy-cli-ground-truth.md). **Read it before changing anything that touches the CLI.** Several were found only after the bug they caused; none is inferred.
 

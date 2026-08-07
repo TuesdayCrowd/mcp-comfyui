@@ -3,7 +3,7 @@ import { z } from "zod";
 import { AUTO_LAUNCH_ENV, WORKSPACE_ENV } from "../config.ts";
 import { EnvelopeParseError, snippet } from "./envelope.ts";
 import { ComfyCliError, ComfyUnavailableError, runComfy } from "./exec.ts";
-import { DEFAULT_PORT, authority, resolveHost } from "./target.ts";
+import { DEFAULT_PORT, authority, isLocalAddress, resolveHost } from "./target.ts";
 
 /**
  * Is a ComfyUI answering at the address a launch names, and — only when
@@ -615,6 +615,40 @@ function launchTarget(opts: LaunchOptions, argv: readonly string[]): Target {
   };
 }
 
+/**
+ * Refuse a launch for a machine that is not this one.
+ *
+ * `comfy launch` takes no `--host` and no `--port`: it starts a process on the
+ * machine running `comfy`. So an address belonging to another box can never be
+ * satisfied here, and attempting it is actively worse than refusing. Measured
+ * against a sleeping remote, the attempt starts a ComfyUI on *this* machine's
+ * default port, polls the remote address for the full five-minute readiness
+ * budget, throws {@link LaunchTimeoutError} — and leaves the local process
+ * running, because `--background` detached it before the first poll.
+ *
+ * This is the check nothing owned. `performLaunch`'s probe answers "is this
+ * address occupied?", which is a different question from "is this address mine
+ * to launch?", and every piece around it was individually right: `launchTarget`
+ * reads the real listen address so readiness is polled where the server will
+ * bind, and the in-flight map is keyed by address so two genuinely different
+ * launches proceed. The defect lived in the seam between them.
+ *
+ * Placed on {@link launchInstance} rather than inside `performLaunch` so a
+ * refused address never enters the in-flight map at all, keeping
+ * {@link LaunchArgumentError}'s promise that a rejected launch has no side
+ * effects whatsoever.
+ *
+ * @throws {LaunchArgumentError} the target is not an address on this machine.
+ */
+function refuseRemoteTarget(target: Target): void {
+  if (isLocalAddress(target.host)) return;
+  throw new LaunchArgumentError(
+    `refusing to launch: ${authority(target.host, target.port)} is not an address on this ` +
+      `machine, and \`comfy launch\` can only start ComfyUI locally — it has no --host. ` +
+      `Start ComfyUI on that machine, or aim this server at a local address.`,
+  );
+}
+
 function parsePort(value: string): number {
   const port = Number(value);
   if (!Number.isInteger(port) || port < MIN_PORT || port > MAX_PORT) {
@@ -769,6 +803,7 @@ export async function launchInstance(opts: LaunchOptions = {}): Promise<LaunchRe
   validateComfyuiArgs(argv);
 
   const target = launchTarget(opts, argv);
+  refuseRemoteTarget(target);
   const key = authority(target.host, target.port);
 
   const running = inFlightLaunches.get(key);

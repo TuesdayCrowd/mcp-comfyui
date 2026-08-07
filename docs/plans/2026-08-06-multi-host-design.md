@@ -67,7 +67,7 @@ the same request against a running local instance returned a non-empty list. Its
 `object_info-${host}-${port}.json`. Per-host node definitions are correct today; the
 RTX box's model lists could never have contaminated the Mac's.
 
-## Two defects found while designing
+## Two defects found while designing — both now fixed
 
 **A remote host that does not answer makes this machine launch ComfyUI.**
 `performLaunch` (`src/comfy/instance.ts:842-882`) performs one refusal check —
@@ -85,11 +85,18 @@ nothing owns the question *is this address mine to launch?* Multi-host does not
 create it. Multi-host makes it routine: today it takes a deliberate
 misconfiguration, afterward it takes a box being asleep.
 
-**CLAUDE.md contradicts the code it documents.** It describes "the single global
+**Fixed** by `refuseRemoteTarget` in `instance.ts`, called from `launchInstance`
+before the in-flight map so a refused address produces no side effect at all. Four
+tests pin it, including the `--listen` spelling — `launchTarget` reads the address
+out of the assembled argv, so a gate checking only `opts.host` would miss the very
+argument that decides where the server binds.
+
+**CLAUDE.md contradicted the code it documents.** It described "the single global
 in-flight launch in `instance.ts`, deliberately *not* keyed by address."
 `instance.ts:772` keys the map by `authority(target.host, target.port)`, and the
 comment at `:790-810` argues for that: "One per address, not one globally." The
-code is right. Fix the doc.
+code was right; non-negotiable #6 has been rewritten to match it and to record the
+locality gate.
 
 ## Decisions
 
@@ -110,12 +117,11 @@ Host resolution moves from process start to each call. That single change carrie
 the rest.
 
 One new module, `src/hosts.ts`, sits beside `config.ts` and below `comfy/`.
-Dependency direction stays one-way. It owns four jobs:
+Dependency direction stays one-way. It owns three jobs:
 
 1. Load, validate, and **write** `hosts.json` — the only place a file format lives.
 2. Resolve a name or a raw address to a `Target`.
-3. Answer whether an address belongs to this machine, via `os.networkInterfaces()`.
-4. Repair a file it could not strictly parse.
+3. Repair a file it could not strictly parse.
 
 `config.ts` does not grow this. Its own comment says nothing there should grow a
 file format "until something actually needs one" (`src/config.ts:9-10`); eight hosts
@@ -124,11 +130,20 @@ keeps `config.ts` what it advertises — pure functions over an environment reco
 `MCP_COMFYUI_HOST` and `MCP_COMFYUI_PORT` still set the default host's address, so
 every existing configuration keeps working.
 
-The locality helper earns its own home because two callers need it for unrelated
-reasons: the launch guard asks whether it may spawn a process, and `outputs.ts` asks
-whether it may stat a path. `src/comfy/target.ts:2-10` records what happens
-otherwise — two copies of host logic in this repo diverged once already, over IPv6
-bracket stripping.
+**The locality helper already shipped, ahead of the rest.** It lives in
+`src/comfy/target.ts` as `isLocalAddress`, not in `hosts.ts` as this document first
+proposed, because the launch defect below was fixed on its own and `target.ts` is
+where this repo already keeps the one authoritative answer to a question about host
+addresses (`target.ts:2-10` records why: two copies of host logic diverged once
+already, over IPv6 bracket stripping). `hosts.ts` imports it rather than owning it,
+and `outputs.ts` will import the same function when the locality gate on artifact
+resolution lands.
+
+Note the deployment consequence: `os.networkInterfaces()` needs `--allow-sys` under
+Deno. The `test` and `compile` tasks in `deno.json` now pass
+`--allow-sys=networkInterfaces`. This surfaced only when the suite ran under
+`deno task test` rather than an ad-hoc `--allow-all`; a compiled binary without that
+flag would have thrown `NotCapable` the first time it gated a launch.
 
 `ToolConfig`'s flat `host`/`port` pair becomes a registry plus a default name. Each
 handler resolves its target when it runs.

@@ -844,6 +844,85 @@ test("a port outside the TCP range is refused before anything is spawned", async
   expect(existsSync(argvOut)).toBe(false);
 });
 
+// --- launching is only ever ours to do on this machine ---------------------
+
+/**
+ * `comfy launch` has no --host: it starts a process HERE. Attempting one for a
+ * remote address starts a ComfyUI on this machine, polls the remote until the
+ * readiness budget expires, reports a timeout, and leaves the process running,
+ * because --background already detached it.
+ *
+ * Addresses below are RFC 5737 TEST-NET-1, reserved for documentation, so no
+ * ComfyUI can answer them and this file's "never contact a real instance" rule
+ * holds. Budgets are small on purpose: run against the unfixed code these cases
+ * poll for the full five-minute default, which is how the defect was confirmed.
+ */
+const REMOTE_HOST = "192.0.2.90";
+
+test("a launch aimed at another machine's address is refused, not attempted", async () => {
+  const argvOut = armCli("launch");
+
+  const err = await rejection(
+    launchInstance({ host: REMOTE_HOST, port: 8189, timeoutMs: 500, pollIntervalMs: 25 }),
+  );
+
+  expect(err).toBeInstanceOf(LaunchArgumentError);
+  expect((err as Error).message).toContain(REMOTE_HOST);
+  expect(existsSync(argvOut)).toBe(false); // refused before anything was spawned
+  expect(requests).toEqual([]); // and before anything was probed
+});
+
+test("a --listen naming another machine is refused too, since that is the real target", async () => {
+  // launchTarget reads the address out of the assembled argv, so --listen wins
+  // over opts.host. A gate that only checked opts.host would miss exactly the
+  // argument that decides where the server binds.
+  const port = await closedPort();
+  const argvOut = armCli("launch");
+
+  const err = await rejection(
+    launchInstance({ port, args: { listen: REMOTE_HOST }, timeoutMs: 500, pollIntervalMs: 25 }),
+  );
+
+  expect(err).toBeInstanceOf(LaunchArgumentError);
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("auto-launch does not fire for a remote host that is simply not answering", async () => {
+  // The path that actually bites: a tool handler calls ensureInstance, the box
+  // is asleep, and nothing before this fix asked whose address it was.
+  const argvOut = armCli("launch");
+
+  const err = await rejection(
+    ensureInstance({
+      host: REMOTE_HOST,
+      port: 8188,
+      probeTimeoutMs: 50,
+      timeoutMs: 500,
+      pollIntervalMs: 25,
+    }),
+  );
+
+  expect(err).toBeInstanceOf(LaunchArgumentError);
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("a loopback launch is untouched by the locality gate", async () => {
+  // The guard must refuse a foreign address without costing the ordinary case
+  // anything — every existing launch in this file goes through it.
+  const detectPort = await closedPort();
+  const targetPort = serveReadyAfter(1);
+  armCli("launch");
+
+  const result = await launchInstance({
+    port: detectPort,
+    args: { port: targetPort },
+    timeoutMs: 2_000,
+    pollIntervalMs: 10,
+  });
+
+  expect(result.outcome).toBe("launched");
+});
+
 // --- the workspace comfy launches from ------------------------------------
 
 test("a configured workspace is a root flag, before the subcommand", async () => {
