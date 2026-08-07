@@ -16,13 +16,22 @@ deno task build                       # -> dist/index.js, runnable under plain `
 deno task compile                     # -> dist/mcp-comfyui (self-contained binary, optional)
 ```
 
-**No per-test `--filter` for a file that uses `beforeEach`/`afterEach`/`beforeAll`.** Every test in this project's `tests/support/testing.ts` shim is registered through `@std/testing/bdd`'s `it` (aliased `test`); a file with hooks becomes one wrapping `Deno.test` named `"global"` with each `test()` as a *step*, and `deno test --filter` matches only top-level test names — it cannot reach into steps. `deno test --filter "…" tests/exec.test.ts` therefore runs either the whole file or nothing, never a single case inside it. The file itself is the practical unit (`deno test tests/foo.test.ts`); to isolate one test inside a hooked file, add `test.only(...)` at that call site temporarily (bdd's `it.only`, re-exported through the same shim) and remove it before committing. Files with no hooks at all (`target.test.ts`, `envelope.test.ts`, `index.test.ts`, `describe.test.ts`) register as ordinary top-level tests and `--filter` reaches them by name exactly as `bun test --test-name-pattern` used to.
+**No per-test `--filter` for a file that uses `beforeEach`/`afterEach`/`beforeAll`.** Every test in this project's `tests/support/testing.ts` shim is registered through `@std/testing/bdd`'s `it` (aliased `test`); a file with hooks becomes one wrapping `Deno.test` named `"global"` with each `test()` as a *step*, and `deno test --filter` matches only top-level test names — it cannot reach into steps. `deno test --filter "…" tests/exec.test.ts` therefore runs either the whole file or nothing, never a single case inside it. The file itself is the practical unit (`deno test tests/foo.test.ts`); to isolate one test inside a hooked file, add `test.only(...)` at that call site temporarily (bdd's `it.only`, re-exported through the same shim) and remove it before committing. Files with no hooks at all (`target.test.ts`, `envelope.test.ts`, `index.test.ts`, `describe.test.ts`) register as ordinary top-level tests, and `--filter` reaches them by name.
 
 There is no lint step and no formatter config; match the surrounding style.
 
 ## Toolchain
 
-Deno 2 runs the test suite and builds `dist/index.js` (via `deno bundle`); the artifact itself ships for **Node** (`engines.node >= 18` in `package.json`) and is what `npx -y mcp-comfyui` actually runs — Deno never appears at runtime. `src/comfy/exec.ts` deliberately still spawns `comfy` through `node:child_process`, not `Deno.Command`, because that is what keeps `dist/index.js` runtime-agnostic; do not "modernize" it to a Deno-only API. `package.json` stays valid for `npm publish` (`bin`, `files`, `engines`, `prepublishOnly`) and `deno.json` stays valid for `deno publish`/`jsr publish` — the two manifests serve different distribution channels and both are load-bearing. Bun is not part of the toolchain anymore, but it is still a supported *runtime* for the published package (`bunx mcp-comfyui` works, same as `npx`/`deno run`), and nothing here should say otherwise.
+Deno 2 runs the test suite and builds `dist/index.js` (via `deno bundle`); the artifact itself ships for **Node** (`engines.node >= 18` in `package.json`) and is what an eventual `npx -y mcp-comfyui` would run — Deno never appears at runtime. `src/comfy/exec.ts` deliberately still spawns `comfy` through `node:child_process`, not `Deno.Command`, because that is what keeps `dist/index.js` runtime-agnostic; do not "modernize" it to a Deno-only API. `package.json` stays valid for `npm publish` (`bin`, `files`, `engines`, `prepublishOnly`) and `deno.json` stays valid for `deno publish`/`jsr publish` — the two manifests serve different distribution channels and both are load-bearing. Bun is not part of the toolchain anymore, but it remains a supported *runtime*: `bun dist/index.js` runs the server, and nothing here should say otherwise.
+
+**What is actually published, as of 2026-08-06** — verify before writing an install instruction, because the two channels are not symmetric:
+
+| Channel | State | Consequence |
+|---|---|---|
+| JSR `@tuesdaycrowd/mcp-comfyui` | published, 0.1.0 | `deno run -A jsr:@tuesdaycrowd/mcp-comfyui` works |
+| npm `mcp-comfyui` | **never published** (404) | `npx -y mcp-comfyui` and `bunx mcp-comfyui` both fail |
+
+JSR's npm-compat mirror (`npx jsr add …` → `@jsr/tuesdaycrowd__mcp-comfyui`) is **not** a substitute for npm publish: `deno.json` has no `bin` field to translate, so the mirrored package installs with `bin: null` and provides no command. Node and Bun can still run it by explicit path (`node node_modules/@tuesdaycrowd/mcp-comfyui/src/index.js` — verified under both). Publishing to npm requires the owner's credentials and has not been done.
 
 `deno.json`'s own type-check (`deno check` / `deno test`'s default checking) has a known false-positive gap against this project's `@modelcontextprotocol/sdk` + zod 4 combination — Deno 2.9.4 bundles TypeScript 6.0.3, and this project's own `typescript` devDependency is a full major ahead. `deno task test` therefore runs with `--no-check`; the authoritative compile gate for what ships is `deno task typecheck`, which is `tsc --noEmit` under `node`, using this project's own pinned TypeScript, and passes with zero errors. Re-run it (not `deno check`) before trusting a "compiles" claim about `src/`.
 
@@ -85,7 +94,7 @@ Rules earned by getting each of these wrong in this repo, usually more than once
 **Shell discipline.** Every one of these cost a wasted turn:
 
 - More than one pipe, or any heredoc → **write a script file and run the file.** Inlining is where backtick interpolation and quoting failures come from.
-- **Never post-process `but status` or `deno test` through `grep`/`awk`.** `but status -fv` prints box-drawing characters that become garbage "IDs"; a piped `deno test | grep -A` buffers and gets backgrounded exactly like `bun test` did. Write output to a file, then read the file.
+- **Never post-process `but status` or `deno test` through `grep`/`awk`.** `but status -fv` prints box-drawing characters that become garbage "IDs"; a piped `deno test | grep -A` buffers and gets backgrounded. Write output to a file, then read the file.
 - **Pass data to a child process explicitly**, never through an ambient shell variable — `FOO=x deno eval '…Deno.env.get("FOO")…'` in one compound command does not do what it looks like.
 - **Never run two `deno test` invocations at once.** They contend, 5-second budgets blow, and you will diagnose your own contention as a defect.
 - Check a command exists before scripting around it (`but mark` does not).

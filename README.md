@@ -27,33 +27,38 @@ That is the difference between a model guessing `Euler` and a model knowing the 
 
 ## Requirements
 
-- [Node.js](https://nodejs.org) 18 or later — verified working on 18, 20, 22, 24 and 26. Bun and Deno run it too (`bunx mcp-comfyui`, `deno run -A npm:mcp-comfyui`), since the server uses only `node:` builtins.
+- A JavaScript runtime. [Deno](https://deno.com) 2.x gives the one-command install below; [Node.js](https://nodejs.org) 18 or later (verified on 18, 20, 22, 24 and 26) and Bun both run the server too — it uses only `node:` builtins — via the paths under *Node and Bun*.
 - `comfy` on your PATH — `uv tool install comfy-cli` (do **not** use the Homebrew tap; it pins 0.0.29, which predates every command this server needs)
 - A ComfyUI instance, running or launchable
 
 ## Install
 
-```bash
-claude mcp add comfyui -- npx -y mcp-comfyui
-```
+### Deno — one command
 
-That's it — `npx` fetches and runs the package, no separate build step. Verify Claude can see it:
-
-```bash
-claude mcp list
-```
-
-### Deno
-
-The same server is published to [JSR](https://jsr.io/@tuesdaycrowd/mcp-comfyui) as TypeScript source:
+The server is published to [JSR](https://jsr.io/@tuesdaycrowd/mcp-comfyui) as TypeScript source:
 
 ```bash
 claude mcp add comfyui -- deno run -A jsr:@tuesdaycrowd/mcp-comfyui
 ```
 
+Nothing to clone, nothing to build. Verify Claude can see it:
+
+```bash
+claude mcp list
+```
+
 Deno needs all five permissions — it spawns `comfy`, reads workflow files, writes temp copies, talks to `127.0.0.1:8188`, and reads its configuration — so `-A` is the practical form. The long spelling is `--allow-run --allow-read --allow-write --allow-net --allow-env`.
 
-`bunx mcp-comfyui` works too, from the same npm package.
+### Node and Bun
+
+There is no `npx mcp-comfyui` / `bunx mcp-comfyui` one-liner: this project is not published to npm, and JSR's npm-compatibility mirror serves modules rather than executables, so the package it exposes carries no `bin`. Both runtimes can still run the JSR build — install it as a dependency and point at the entry directly:
+
+```bash
+npx jsr add @tuesdaycrowd/mcp-comfyui     # or: bunx jsr add @tuesdaycrowd/mcp-comfyui
+claude mcp add comfyui -- node "$PWD/node_modules/@tuesdaycrowd/mcp-comfyui/src/index.js"
+```
+
+That entry runs correctly under both `node` and `bun`, but it binds the server to one project directory. *From source* below avoids that.
 
 ### From source
 
