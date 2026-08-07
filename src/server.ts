@@ -21,10 +21,29 @@ import { registerTools, toolConfig } from "./tools.ts";
  * only check that actually holds this.
  */
 
+/**
+ * This server's version, as it appears in a client's server list.
+ *
+ * **Kept in step with `deno.json` by a test, not by an import.** Importing the
+ * manifest (`import manifest from "../deno.json" with { type: "json" }`) does
+ * work — measured, including through `deno bundle` into a file that runs under
+ * `node` with no `deno.json` anywhere near it, because the bundler inlines it.
+ * It is still not what is used here, because this package ships through three
+ * channels and that trick is only verified on one of them: JSR serves `src/` as
+ * TypeScript to Deno, JSR's npm mirror serves it transpiled to Node, and
+ * `dist/index.js` is the bundle. Import attributes need Node 18.20, and
+ * `engines.node` says 18.
+ *
+ * So it is a literal, and `tests/server.test.ts` fails if it and `deno.json`
+ * disagree. A release bumps both — `deno bump-version` only knows about the
+ * manifest — and forgetting is loud rather than silent.
+ */
+export const SERVER_VERSION = "0.6.0";
+
 /** Identity as it appears in a client's server list. */
 const SERVER_INFO = {
   name: "mcp-comfyui",
-  version: "0.1.0",
+  version: SERVER_VERSION,
   title: "ComfyUI",
 } as const;
 

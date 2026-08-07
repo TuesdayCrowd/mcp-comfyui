@@ -29,6 +29,25 @@ import { spawnSync } from "node:child_process";
 const OUTFILE = "dist/index.js";
 const SHEBANG = "#!/usr/bin/env node\n";
 
+/**
+ * `dist/` describes its own module format.
+ *
+ * `dist/index.js` is ESM, and Node decides whether a `.js` file is ESM from the
+ * **nearest** `package.json` — so without this it depends on a manifest two
+ * directories up that is never shipped beside it. That worked while the repo
+ * root had one; it stopped being true the moment this project consolidated on
+ * `deno.json`, and it was always fragile for anyone copying the file elsewhere.
+ *
+ * Measured, and the reason this is not merely tidiness: Node 22.7 and later
+ * detect module syntax on their own, so the missing manifest is invisible
+ * there — `node dist/index.js` simply works. Node 18 and 20, which
+ * `engines.node` has always claimed, do not: they fail with
+ * `SyntaxError: Cannot use import statement outside a module`. A defect that
+ * only appears on the older half of the supported range is exactly the kind
+ * that ships.
+ */
+const MANIFEST = "dist/package.json";
+
 mkdirSync("dist", { recursive: true });
 
 const build = spawnSync(
@@ -48,5 +67,7 @@ writeFileSync(OUTFILE, SHEBANG + body);
 // runnable directly (`./dist/index.js`) and for `tests/server.test.ts`-style
 // checks that stat it before any `npm install` has touched it.
 chmodSync(OUTFILE, 0o755);
+
+writeFileSync(MANIFEST, `${JSON.stringify({ type: "module" }, null, 2)}\n`);
 
 console.log(`built ${OUTFILE}`);

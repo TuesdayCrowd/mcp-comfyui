@@ -14,7 +14,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "../src/server.ts";
+import { createServer, SERVER_VERSION } from "../src/server.ts";
 import { toolConfig } from "../src/tools.ts";
 import { clearJobLedger } from "../src/jobLedger.ts";
 
@@ -2958,4 +2958,53 @@ test("a decoy address in a REMOTE workflow is refused before anything is spawned
   expect(addresses[0]).toMatchObject({ address: "3.text" });
   expect(existsSync(argvOut)).toBe(false);
   expect(leakedTempDirs()).toEqual([]);
+});
+
+test("the version reported to clients is the version this package ships", async () => {
+  // `SERVER_INFO.version` had drifted to 0.1.0 while the package was at 0.5.0 —
+  // for four releases, because nothing checked. It is a literal rather than an
+  // import of the manifest (see `src/server.ts`'s SERVER_VERSION for why the
+  // import, which does work, is not used), so this test is what keeps the two
+  // in step: `deno bump-version` only knows about deno.json.
+  //
+  // Mutant: change either number. This test dies.
+  const manifest = JSON.parse(readFileSync(join(REPO_ROOT, "deno.json"), "utf8"));
+  expect(SERVER_VERSION).toBe(manifest.version);
+
+  // And it really is what a client is told, not merely a constant that agrees
+  // with the manifest in private.
+  const client = await connect();
+  expect(client.getServerVersion()).toMatchObject({
+    name: "mcp-comfyui",
+    version: manifest.version,
+  });
+});
+
+test("the build makes dist/ describe its own module format", async () => {
+  // `dist/index.js` is ESM, and Node decides whether a `.js` file is ESM from
+  // the NEAREST package.json. This project has none at its root any more, so
+  // without the one the build writes, `node dist/index.js` fails on Node 18
+  // and 20 with `Cannot use import statement outside a module` — while working
+  // fine on 22.7 and later, which detect module syntax on their own. A defect
+  // visible only on the older half of the supported range is exactly the kind
+  // that ships.
+  //
+  // Mutant: delete the `writeFileSync(MANIFEST, …)` line in scripts/build.mjs.
+  // This test dies.
+  await buildDist();
+
+  const manifest = join(REPO_ROOT, "dist", "package.json");
+  expect(existsSync(manifest)).toBe(true);
+  expect(JSON.parse(readFileSync(manifest, "utf8"))).toEqual({ type: "module" });
+
+  // And the artifact really does run under a Node that will not guess.
+  const child = new Deno.Command("node", {
+    args: ["--no-experimental-detect-module", DIST_ENTRY],
+    stdin: "null",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  const { code, stderr } = await child.output();
+  expect(new TextDecoder().decode(stderr)).not.toContain("outside a module");
+  expect(code).toBe(0);
 });

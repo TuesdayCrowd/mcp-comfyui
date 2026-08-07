@@ -4,7 +4,7 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] — 2026-08-07
 
 ### Added
 
@@ -59,6 +59,32 @@ All notable changes to this project are recorded here. The format follows
   below: that one refused a launch once the address was known, and this stops
   the attempt being made at all, with a message that does not offer
   `MCP_COMFYUI_AUTO_LAUNCH=1` as a fix for something that setting cannot fix.
+- **`package.json` is gone; `deno.json` is the only manifest.** Measurement
+  found exactly two load-bearing things in it, and both have better homes.
+  `typescript` and `@types/node` are now `npm:` entries in `deno.json`'s own
+  `imports`, which `nodeModulesDir: "auto"` materialises for `tsc` — verified
+  from a clean room with `node_modules` and `deno.lock` both deleted. And
+  `scripts/build.mjs` now writes `dist/package.json` holding
+  `{"type": "module"}`, which is strictly better than depending on a manifest
+  two directories up that never shipped beside the artifact: Node decides
+  whether a `.js` file is ESM from the *nearest* `package.json`, and without
+  one `node dist/index.js` fails on **Node 18 and 20** with `Cannot use import
+  statement outside a module` while working fine on 22.7+, which detect module
+  syntax on their own. Everything else the file held — `bin`, `files`,
+  `prepublishOnly`, `scripts`, and the npm-registry metadata — served a channel
+  this project does not publish to, and its duplicate `version` field had
+  already caused two silent desyncs.
+- **The MCP SDK is mapped bare rather than by prefix.** The old
+  `"@modelcontextprotocol/sdk/": "npm:…@1.30.0/"` only ever resolved because
+  `package.json` listed the SDK and Deno went through `node_modules`; without
+  it, subpath imports fail with "could not be URL-parsed relative to the URL
+  prefix". A bare `"@modelcontextprotocol/sdk": "npm:…@1.30.0"` resolves them
+  through the package's own `exports`.
+- **The version this server reports to clients is the version it ships.**
+  `SERVER_INFO.version` had said `0.1.0` since the beginning — through four
+  releases — because nothing checked it. It now matches `deno.json`, and a test
+  fails if the two ever disagree again. `deno bump-version` only knows about the
+  manifest, so a release bumps both.
 - **A missing Deno permission is no longer reported as a bug in this server.**
   A `NotCapable` error reached the tool layer unclassified and came back as
   `internal_error`, which says "this server has a bug" — false, and the wrong

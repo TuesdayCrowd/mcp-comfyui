@@ -33,7 +33,14 @@ Deno 2 runs the test suite and builds `dist/index.js` (via `deno bundle`). That 
 | JSR `@tuesdaycrowd/mcp-comfyui` | published — `deno run -A jsr:@tuesdaycrowd/mcp-comfyui` |
 | npm `mcp-comfyui` | **not published, and will not be** (registry returns 404) |
 
-So `npx -y mcp-comfyui` and `bunx mcp-comfyui` do not resolve and never will. Do not write them into a doc, a README, or an install instruction. `deno.json` is the manifest that ships; `package.json` survives only to pin devDependencies for `tsc` and to give Deno's `nodeModulesDir: "auto"` something to resolve `npm:` specifiers against — its `bin`/`files`/`prepublishOnly` fields are inert leftovers of the npm channel, not an intent to use it.
+So `npx -y mcp-comfyui` and `bunx mcp-comfyui` do not resolve and never will. Do not write them into a doc, a README, or an install instruction.
+
+**`deno.json` is the only manifest. There is no `package.json`** — it was deleted in 0.6.0, once measurement showed only two things in it were load-bearing and both had better homes. `typescript` and `@types/node` are now `npm:` entries in `deno.json`'s own `imports`, which `nodeModulesDir: "auto"` materialises into `node_modules` for `tsc` — verified from a clean room, with `node_modules` and `deno.lock` both deleted. Everything else it held (`bin`, `files`, `prepublishOnly`, `scripts`, `description`, `repository`, `keywords`) was npm-registry metadata for a channel this project does not use, and the duplicate `version` field had already caused two silent desyncs.
+
+Two things that came out of that and must not be undone:
+
+- **The SDK is mapped bare, not by prefix.** `"@modelcontextprotocol/sdk": "npm:@modelcontextprotocol/sdk@1.30.0"`, so subpaths like `@modelcontextprotocol/sdk/types.js` resolve through the package's own `exports`. The old trailing-slash prefix mapping (`"…/sdk/": "npm:…@1.30.0/"`) only ever worked because `package.json` listed the SDK as a dependency and Deno resolved it through `node_modules` instead; with the manifest gone it fails outright with "could not be URL-parsed relative to the URL prefix".
+- **`scripts/build.mjs` writes `dist/package.json` holding `{"type":"module"}`.** Node decides whether a `.js` file is ESM from the *nearest* `package.json`, and `dist/index.js` no longer has one above it. Node 22.7+ detects module syntax by itself so this is invisible there; **Node 18 and 20 fail** with `Cannot use import statement outside a module`. `tests/server.test.ts` pins both the file and a real `node --no-experimental-detect-module` run.
 
 Node and Bun are still supported, via JSR's npm-compat mirror: `npx jsr add @tuesdaycrowd/mcp-comfyui` installs `@jsr/tuesdaycrowd__mcp-comfyui`, which carries `bin: null` — `deno.json` has no `bin` field to translate — so it provides no command and must be run by explicit path (`node node_modules/@tuesdaycrowd/mcp-comfyui/src/index.js`, verified under both node and bun). That indirection is permanent; treat it as the Node/Bun story rather than a workaround awaiting a fix.
 
