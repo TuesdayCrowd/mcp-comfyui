@@ -51,14 +51,16 @@ Deno needs all five permissions — it spawns `comfy`, reads workflow files, wri
 
 ### Node and Bun
 
-There is no `npx mcp-comfyui` / `bunx mcp-comfyui` one-liner: this project is not published to npm, and JSR's npm-compatibility mirror serves modules rather than executables, so the package it exposes carries no `bin`. Both runtimes can still run the JSR build — install it as a dependency and point at the entry directly:
+This server is distributed through JSR only — there is no `npx mcp-comfyui` or `bunx mcp-comfyui`, by choice rather than by omission. Node and Bun install it through JSR's npm-compatibility registry instead:
 
 ```bash
 npx jsr add @tuesdaycrowd/mcp-comfyui     # or: bunx jsr add @tuesdaycrowd/mcp-comfyui
 claude mcp add comfyui -- node "$PWD/node_modules/@tuesdaycrowd/mcp-comfyui/src/index.js"
 ```
 
-That entry runs correctly under both `node` and `bun`, but it binds the server to one project directory. *From source* below avoids that.
+The entry path is explicit because a JSR package declares no executable — JSR ships modules, so there is no `bin` for the mirror to translate into a command. The module itself runs correctly under both `node` and `bun`; only the invocation is longer.
+
+The cost is that the server is pinned to whichever directory you installed it in. *From source* avoids that, at the price of a build step.
 
 ### From source
 

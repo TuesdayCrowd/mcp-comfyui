@@ -22,16 +22,18 @@ There is no lint step and no formatter config; match the surrounding style.
 
 ## Toolchain
 
-Deno 2 runs the test suite and builds `dist/index.js` (via `deno bundle`); the artifact itself ships for **Node** (`engines.node >= 18` in `package.json`) and is what an eventual `npx -y mcp-comfyui` would run — Deno never appears at runtime. `src/comfy/exec.ts` deliberately still spawns `comfy` through `node:child_process`, not `Deno.Command`, because that is what keeps `dist/index.js` runtime-agnostic; do not "modernize" it to a Deno-only API. `package.json` stays valid for `npm publish` (`bin`, `files`, `engines`, `prepublishOnly`) and `deno.json` stays valid for `deno publish`/`jsr publish` — the two manifests serve different distribution channels and both are load-bearing. Bun is not part of the toolchain anymore, but it remains a supported *runtime*: `bun dist/index.js` runs the server, and nothing here should say otherwise.
+Deno 2 runs the test suite and builds `dist/index.js` (via `deno bundle`). That artifact targets **Node** (`engines.node >= 18`) and backs the from-source install and `deno task compile`; Deno never appears at runtime. `src/comfy/exec.ts` deliberately still spawns `comfy` through `node:child_process`, not `Deno.Command`, because that is what keeps `dist/index.js` runtime-agnostic; do not "modernize" it to a Deno-only API. Bun is not part of the toolchain, but it remains a supported *runtime*: `bun dist/index.js` runs the server, and nothing here should say otherwise.
 
-**What is actually published, as of 2026-08-06** — verify before writing an install instruction, because the two channels are not symmetric:
+**Distribution is JSR only. This is a decision, not a gap — do not "fix" it by publishing to npm.**
 
-| Channel | State | Consequence |
-|---|---|---|
-| JSR `@tuesdaycrowd/mcp-comfyui` | published, 0.1.0 | `deno run -A jsr:@tuesdaycrowd/mcp-comfyui` works |
-| npm `mcp-comfyui` | **never published** (404) | `npx -y mcp-comfyui` and `bunx mcp-comfyui` both fail |
+| Channel | State |
+|---|---|
+| JSR `@tuesdaycrowd/mcp-comfyui` | published — `deno run -A jsr:@tuesdaycrowd/mcp-comfyui` |
+| npm `mcp-comfyui` | **not published, and will not be** (registry returns 404) |
 
-JSR's npm-compat mirror (`npx jsr add …` → `@jsr/tuesdaycrowd__mcp-comfyui`) is **not** a substitute for npm publish: `deno.json` has no `bin` field to translate, so the mirrored package installs with `bin: null` and provides no command. Node and Bun can still run it by explicit path (`node node_modules/@tuesdaycrowd/mcp-comfyui/src/index.js` — verified under both). Publishing to npm requires the owner's credentials and has not been done.
+So `npx -y mcp-comfyui` and `bunx mcp-comfyui` do not resolve and never will. Do not write them into a doc, a README, or an install instruction. `deno.json` is the manifest that ships; `package.json` survives only to pin devDependencies for `tsc` and to give Deno's `nodeModulesDir: "auto"` something to resolve `npm:` specifiers against — its `bin`/`files`/`prepublishOnly` fields are inert leftovers of the npm channel, not an intent to use it.
+
+Node and Bun are still supported, via JSR's npm-compat mirror: `npx jsr add @tuesdaycrowd/mcp-comfyui` installs `@jsr/tuesdaycrowd__mcp-comfyui`, which carries `bin: null` — `deno.json` has no `bin` field to translate — so it provides no command and must be run by explicit path (`node node_modules/@tuesdaycrowd/mcp-comfyui/src/index.js`, verified under both node and bun). That indirection is permanent; treat it as the Node/Bun story rather than a workaround awaiting a fix.
 
 `deno.json`'s own type-check (`deno check` / `deno test`'s default checking) has a known false-positive gap against this project's `@modelcontextprotocol/sdk` + zod 4 combination — Deno 2.9.4 bundles TypeScript 6.0.3, and this project's own `typescript` devDependency is a full major ahead. `deno task test` therefore runs with `--no-check`; the authoritative compile gate for what ships is `deno task typecheck`, which is `tsc --noEmit` under `node`, using this project's own pinned TypeScript, and passes with zero errors. Re-run it (not `deno check`) before trusting a "compiles" claim about `src/`.
 
