@@ -10,6 +10,7 @@ import {
 } from "./comfy/instance.ts";
 import { JobPayloadError } from "./comfy/jobs.ts";
 import { ObjectInfoCacheWriteError, ObjectInfoFetchError } from "./comfy/objectInfo.ts";
+import { UserdataError } from "./comfy/userdata.ts";
 import {
   HostNotLocalError,
   RegistryInvalidError,
@@ -216,6 +217,20 @@ export class WorkflowNotFoundError extends Error {
   }
 }
 
+/**
+ * An argument this layer could not use, where the schema could not have said
+ * so.
+ *
+ * `manage_hosts` is the case: `name` is required for four of its five actions
+ * and `host` for one, and expressing that in the schema would mean a
+ * discriminated union of five shapes — harder for a model to fill in than one
+ * flat object, in exchange for a check whose message can simply name the
+ * missing field.
+ */
+export class ToolArgumentError extends Error {
+  override readonly name = "ToolArgumentError";
+}
+
 /** One address `run_workflow` refused, and what actually supplies its value. */
 export interface InertSlotErrorEntry {
   address: string;
@@ -376,7 +391,7 @@ export function describeError(err: unknown): ToolErrorBody {
   if (err instanceof RemoteLaunchRefusedError) {
     return { kind: "host_not_local", message: err.message, host: err.address };
   }
-  if (err instanceof LaunchArgumentError) {
+  if (err instanceof LaunchArgumentError || err instanceof ToolArgumentError) {
     return { kind: "invalid_input", message: err.message };
   }
 
@@ -426,6 +441,20 @@ export function describeError(err: unknown): ToolErrorBody {
       code: present(err.code),
       workflow_path: err.workflowPath,
     };
+  }
+
+  // A remote instance's own workflow library. Three different failures wear one
+  // type here because the operator's question is the same — which instance, and
+  // what did it say — and `status` is what tells them apart: nothing answered,
+  // the file is not there, or it answered with something unusable.
+  if (err instanceof UserdataError) {
+    if (err.status === null) {
+      return { kind: "host_unreachable", message: err.message, url: err.url };
+    }
+    if (err.status === 404) {
+      return { kind: "workflow_not_found", message: err.message };
+    }
+    return { kind: "workflow_file", message: err.message, workflow_path: err.url };
   }
 
   if (err instanceof ObjectInfoFetchError) {

@@ -1,6 +1,10 @@
 # Multi-host support
 
-**Status:** design agreed, not implemented
+**Status:** implemented on 2026-08-07 — see `CHANGELOG.md` and the `multi-host`
+branch. This document is kept as the record of the decisions and the ground
+truth behind them, not as a description of the code; where the two differ, the
+code and `CLAUDE.md` are current. Four places where the implementation
+deliberately went further or narrower than this design are noted inline below.
 **Date:** 2026-08-06
 
 The server talks to one ComfyUI, chosen when the process starts. It must talk to
@@ -291,3 +295,46 @@ Construct these mutants and confirm the test dies:
 - Mounting or syncing remote filesystems. Where a share exists, the operator mounts
   it; the server does not manage it.
 - Failing a run over to another host automatically. Host choice stays the caller's.
+
+## Where the implementation differs from this document
+
+Four deliberate departures, recorded so the difference is a decision rather than
+a drift.
+
+**A ledger miss falls through to the only host, when there is exactly one.**
+This document's decision 5, read literally, refuses every miss. That would break
+every single-host installation — which is every installation that predates the
+registry — for a distinction that does not exist on one: the default host on a
+two-host registry is a guess with a real chance of a confidently wrong
+`prompt_not_found`, while the only host on a one-host registry is not a guess at
+all. The mutant this document asks for ("fall back to the default host on a
+miss") still dies, because it dies on the two-host case.
+
+**`fetch_outputs` is on `get_job` as well as `run_workflow`.** The tool table
+here names only `run_workflow`. But a run submitted without `wait: true` returns
+no outputs at all, and that is the default — so on `run_workflow` alone the
+parameter would miss the common case entirely. Same three lines, both tools.
+
+**A bare hostname is not accepted as a raw address.** This document says "raw
+address accepted" without qualifying it. Anything is a syntactically valid
+hostname, including `rtx-vidoe`, so accepting one turns a mistyped registry name
+into a DNS lookup and then into "unreachable" — with the correct spelling
+sitting unmentioned in the registry the caller was already talking to. An
+address must be an IP literal, or `localhost`, or carry an explicit port. Every
+raw address a person actually types satisfies one of those.
+
+**`repair` refuses a file no parse could read.** This document pairs a tolerant
+read with "an explicit repair action", which is right, but the two must be the
+*same* file. A registry neither parse could read yields no entries — the loader
+falls back to the single environment host — so rewriting it would not repair the
+registry, it would replace it with one entry and leave the operator's real hosts
+in a `.bak-` file nobody was told to look for. Repair is for the file the
+tolerant parse rescued.
+
+Two smaller notes. The design's `fake-comfy` mode "that reads `--host` from
+argv" was not needed: two hosts in one test are two ports on loopback, and the
+CLI fixture stays blind to `--host` while the *fixtures* differ by port. And the
+new mode that was needed is `run_capture`, which keeps the file `comfy run` was
+handed — the prepared copy is deleted when a run returns, so it is the only way
+to assert on the bytes that reached the CLI, which is what pins landmine #1 for
+a workflow that arrived over HTTP.

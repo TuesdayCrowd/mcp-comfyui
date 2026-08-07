@@ -6,7 +6,57 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Several ComfyUI instances, chosen per call.** The server used to talk to one
+  address, fixed when the process started; retargeting meant editing an MCP
+  client's config block and restarting. Every tool now takes an optional `host`
+  — a name from a registry, or a raw address such as `100.86.199.90:8189` —
+  and omitting it uses the default, so every existing configuration and every
+  existing call behaves exactly as it did. Two new tools: `list_hosts` reads
+  the registry, `manage_hosts` writes it.
+- **A host registry at `~/.config/mcp-comfyui/hosts.json`**, overridable with
+  `MCP_COMFYUI_HOSTS_FILE`. It records each host's address, a note, and whether
+  this server may start it. `MCP_COMFYUI_HOST`/`_PORT` still describe the
+  default host and are the whole configuration when there is no file. Keys the
+  server does not recognise survive every rewrite, on the same append-only
+  reasoning that keeps the CLI's own registries open. A file that will not parse
+  leaves the default host working — its address comes from the environment, not
+  the file — and fails every *named* resolution loudly, because routing a video
+  job to the laptop over a missing comma is worse than refusing.
+- **A host's own saved workflows.** `list_workflows` with a `host` also lists
+  what that ComfyUI has saved, over its userdata HTTP API, tagged
+  `remote:<name>`. `describe_workflow` and `run_workflow` accept those handles:
+  the file's exact bytes are fetched and handed to `comfy` unparsed, so a 2^64−1
+  seed survives the trip for the same reason it survives the local byte-copy.
+  Your local library still runs on any host, which remains the ordinary case.
+- **`fetch_outputs`** on `run_workflow` and `get_job`, which copies a run's
+  artifacts to this machine and reports where each landed. Off by default: a run
+  here already has its files here, and a video workflow's outputs can be
+  hundreds of megabytes to move.
+
 ### Fixed
+
+- **A remote instance's artifacts are no longer reported as files on this
+  machine.** `local_paths` resolved a `/view` URL against the output directory
+  the running instance reported, and then asked whether that path existed —
+  *here*. Two Unix machines sharing a layout (`/home/me/ComfyUI/output` on both)
+  would therefore have handed back a local path naming a completely different
+  image. The live remote this was found against hid it by accident, being
+  Windows: `F:\Dev\ComfyUI\output` is not an absolute path under POSIX, so the
+  containment check declined it for the wrong reason. Resolution now requires
+  the instance to be on this machine.
+- **A host on another machine is never launched for.** Auto-launch aimed at a
+  remote that is not answering now reports it. This completes the locality gate
+  below: that one refused a launch once the address was known, and this stops
+  the attempt being made at all, with a message that does not offer
+  `MCP_COMFYUI_AUTO_LAUNCH=1` as a fix for something that setting cannot fix.
+- **`deno task compile` and `deno task test` now grant `--allow-sys=homedir`.**
+  Pre-existing, and unrelated to multi-host except that the registry surfaced
+  it: `comfy/objectInfo.ts` has called `homedir()` for its default cache
+  directory since long before this, so a self-compiled binary run without
+  `MCP_COMFYUI_CACHE_DIR` would have thrown `NotCapable` on its first
+  `describe_workflow`.
 
 - **ComfyUI is never launched for an address that is not this machine.** The
   launch path made one refusal check — is the target address already occupied —
@@ -34,13 +84,6 @@ All notable changes to this project are recorded here. The format follows
   Node and Bun have no permission system and are unaffected, as is
   `deno run -A jsr:@tuesdaycrowd/mcp-comfyui`.
 
-### Note
-
-- Multi-host support — reaching several ComfyUI instances chosen per call, rather
-  than one fixed at startup — is designed and agreed but **not implemented**. See
-  `docs/plans/2026-08-06-multi-host-design.md`. The launch fix above was pulled out
-  of that work and shipped on its own, because the defect is reachable today by
-  setting `MCP_COMFYUI_HOST` to a remote address.
 
 ## [0.5.0] — 2026-08-06
 

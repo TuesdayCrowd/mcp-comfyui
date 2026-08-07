@@ -83,7 +83,8 @@ A `deno task compile` task is also available if a self-contained platform binary
 | `MCP_COMFYUI_AUTO_LAUNCH` | **on** | May the server start ComfyUI when a tool needs one and nothing answers? |
 | `MCP_COMFYUI_ALLOW_LAUNCH` | off | May a *model* start one, with startup flags of its own? Registers `launch_comfyui` |
 | `MCP_COMFYUI_WORKSPACE` | unset | ComfyUI directory to launch from |
-| `MCP_COMFYUI_HOST` / `_PORT` | `127.0.0.1` / `8188` | Where ComfyUI is |
+| `MCP_COMFYUI_HOST` / `_PORT` | `127.0.0.1` / `8188` | Where the **default** ComfyUI is |
+| `MCP_COMFYUI_HOSTS_FILE` | `~/.config/mcp-comfyui/hosts.json` | The host registry, for more than one ComfyUI |
 | `MCP_COMFYUI_CACHE_DIR` | `~/.cache/mcp-comfyui` | `/object_info` cache |
 | `COMFY_BIN` | `comfy` | Path to the `comfy` binary |
 
@@ -102,6 +103,39 @@ MCP_COMFYUI_WORKSPACE=/path/to/ComfyUI     # the directory containing main.py
 There is deliberately no auto-discovery. Picking between several installs by name is exactly how you end up launching the wrong ComfyUI against the right models.
 
 This setting affects **launching only**. It does not change how artifacts are reported — see below.
+
+## More than one ComfyUI
+
+Every tool takes an optional `host`. Omit it and you get the default, which is what `MCP_COMFYUI_HOST`/`_PORT` describe — so if you run one ComfyUI, nothing below concerns you and nothing has changed.
+
+To name several, write `~/.config/mcp-comfyui/hosts.json`:
+
+```json
+{
+  "default": "mac-local",
+  "hosts": {
+    "mac-local": { "host": "127.0.0.1", "port": 8188, "auto_launch": true,
+                   "note": "Desktop, MPS 48GB" },
+    "rtx-video": { "host": "100.86.199.90", "port": 8189, "auto_launch": false,
+                   "note": "Windows, RTX 4070 12GB, video" }
+  }
+}
+```
+
+Then `describe_workflow {workflow: "portrait", host: "rtx-video"}` describes that workflow against *that* box's installed models, and `run_workflow` runs it there. `list_hosts` reports the registry; `manage_hosts` edits it, backing the old file up to `hosts.json.bak-<timestamp>` first. Keys the server doesn't recognise survive every rewrite.
+
+A `host` may also be a raw address — `100.86.199.90:8189` — which needs no registry entry. It has to carry an explicit port unless it's an IP literal or `localhost`: a bare word with no port is reported as an unknown *host name*, with the names that would have worked, because otherwise a mistyped `rtx-video` becomes a DNS lookup and comes back as "unreachable".
+
+**Workflows come from two places.** Your local library (the directories `MCP_COMFYUI_WORKFLOW_DIRS` names) can be run on any host — that is the ordinary case. A host's *own* saved workflows are listed too when you pass `host` to `list_workflows`, tagged `remote:<name>` and named `rtx-video/portrait`; running one fetches its exact bytes over ComfyUI's userdata API and hands them to `comfy` unparsed, so a 2^64−1 seed survives the trip.
+
+### What multi-host does not do
+
+These don't degrade gracefully; they don't exist.
+
+- **A remote ComfyUI cannot be launched.** `comfy launch` starts ComfyUI on whichever machine runs `comfy` — it has no `--host`. So a host that isn't answering is reported, never started, and `auto_launch: true` on a non-local address is refused when you write it. Before this was enforced, pointing the server at a sleeping remote started a ComfyUI *here*, polled the remote for five minutes, reported a timeout, and left the local process running.
+- **Artifacts stay on the machine that made them.** `local_paths` keeps one meaning: a file this machine can open. A run on another host has none, and `outputs.urls` is the way in — pass `fetch_outputs: true` to copy them here.
+- **A job belongs to the host that ran it.** The server remembers where it sent each run, so `get_job` normally needs no `host`. It does not guess: asking the wrong ComfyUI about a real job answers `prompt_not_found`, which is exactly what it answers for a job that never existed, so a guess would be a confident wrong answer rather than a detectable one. With two or more hosts and no record, you are asked which.
+- **Attribution does not survive a restart.** The ledger is in memory. Poll a job from before a restart, or one started in the ComfyUI web interface, and name its host.
 
 ## Where your images are
 
@@ -130,7 +164,11 @@ Every artifact appears exactly once in `files` or `urls`. For a URL, look it up 
 | `run_workflow` | | Apply inputs and execute |
 | `get_job` | ✓ | Poll a job by `prompt_id` |
 | `cancel_job` | | Stop a running job |
+| `list_hosts` | ✓ | The ComfyUI instances this server can be pointed at |
+| `manage_hosts` | | Add, change, remove or repair entries in the host registry |
 | `launch_comfyui` | | Start ComfyUI with explicit flags — only when `MCP_COMFYUI_ALLOW_LAUNCH=1` |
+
+Every tool above except `list_hosts` and `manage_hosts` takes an optional `host`; omitting it uses the default.
 
 The intended order is `list_workflows` → `describe_workflow` → `run_workflow`. Inputs are keyed by slot address (`3.seed`, `6.text`), which `describe_workflow` gives you.
 

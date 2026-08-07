@@ -38,12 +38,19 @@ import {
   HOSTS_FILE_ENV,
   RemoteHostUnavailableError,
   loadHostRegistry,
+  mutateHostRegistry,
   resolveHostRef,
+  type HostMutation,
   type HostRegistry,
   type ResolvedHost,
 } from "./hosts.ts";
 import { recordJobHost, resolveJobTarget, type JobTarget } from "./jobLedger.ts";
-import { InertSlotError, toolAnswer, WorkflowNotFoundError } from "./toolResult.ts";
+import {
+  InertSlotError,
+  toolAnswer,
+  ToolArgumentError,
+  WorkflowNotFoundError,
+} from "./toolResult.ts";
 import { describeSlots } from "./workflows/describe.ts";
 import {
   discoverWorkflows,
@@ -334,6 +341,7 @@ async function resolveWorkflow(
   handle: string,
   config: ToolConfig,
   target: ResolvedHost,
+  hostWasNamed: boolean,
 ): Promise<ResolvedWorkflow> {
   const { workflows } = await discoverWorkflows({ env: config.env });
 
@@ -348,7 +356,7 @@ async function resolveWorkflow(
   // what `host` is for — so the local library is searched first, and this
   // costs a round trip only for a name it did not have.
   if (!isAbsolute(handle)) {
-    const remote = await resolveRemoteWorkflow(handle, target);
+    const remote = await resolveRemoteWorkflow(handle, target, hostWasNamed);
     if (remote !== null) return remote;
   }
 
@@ -371,15 +379,29 @@ async function resolveWorkflow(
  *
  * Returns `null` rather than throwing when the host has no such workflow, so
  * the caller reports one `workflow_not_found` naming the local library rather
- * than two different errors for the same mistake. A host that could not be
- * *asked* is different and does throw — that is a fact about the host, not
- * about the handle.
+ * than two different errors for the same mistake.
+ *
+ * **A host that could not be asked depends on who asked.** If the caller named
+ * a `host`, its being unreachable is the answer to their question and is
+ * reported. If they named none, this host is only being consulted as a
+ * fallback for a handle the local library did not have — found live, against a
+ * stopped local ComfyUI: `run_workflow {workflow: "typo"}` came back as a
+ * `fetch failed` about `/api/userdata`, which is a true statement about
+ * something the caller never asked about, in place of the `workflow_not_found`
+ * naming the 27 workflows that would have worked.
  */
 async function resolveRemoteWorkflow(
   handle: string,
   target: ResolvedHost,
+  hostWasNamed: boolean,
 ): Promise<ResolvedWorkflow | null> {
-  const workflows = await listRemoteWorkflows(address(target));
+  let workflows: Awaited<ReturnType<typeof listRemoteWorkflows>>;
+  try {
+    workflows = await listRemoteWorkflows(address(target));
+  } catch (err) {
+    if (hostWasNamed) throw err;
+    return null;
+  }
   if (workflows.length === 0) return null;
 
   const prefix = `${target.label}/`;
@@ -1120,7 +1142,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
     async ({ workflow, host }) =>
       toolAnswer(async () => {
         const target = await resolveTarget(config, host);
-        const resolved = await resolveWorkflow(workflow, config, target);
+        const resolved = await resolveWorkflow(workflow, config, target, host !== undefined);
         const location = { ...address(target), cacheDir: config.cacheDir };
         // Fetched and cached in one step, then the *path* is handed to the CLI:
         // the join below needs the parsed document, and `slots --input` needs
@@ -1223,7 +1245,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
     async ({ workflow, inputs, wait, timeout_seconds, host, fetch_outputs }) =>
       toolAnswer(async () => {
         const target = await resolveTarget(config, host);
-        const resolved = await resolveWorkflow(workflow, config, target);
+        const resolved = await resolveWorkflow(workflow, config, target, host !== undefined);
         // Before anything else, and independent of the CLI entirely: a decoy
         // address writes its value nowhere ComfyUI reads it, so nothing below
         // this line — no CLI spawn, no launch, no submit — may run for a call
@@ -1372,7 +1394,158 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
       }),
   );
 
+  registerManageHosts(server, config);
   if (config.allowLaunch) registerLaunch(server, config);
+}
+
+/**
+ * The one tool that writes.
+ *
+ * A single tool with an `action` rather than five tools, because they share a
+ * file, a backup, a validation pass and a set of refusals — five tools would be
+ * five copies of all of that, and a model choosing between five names that all
+ * edit the same file has a worse job than one filling in a field.
+ *
+ * It takes the registry's *path* from configuration and re-reads the file
+ * itself, rather than being handed a loaded registry: the one action that
+ * repairs `hosts.json` cannot require `hosts.json` to have loaded.
+ */
+function registerManageHosts(server: McpServer, config: ToolConfig): void {
+  server.registerTool(
+    "manage_hosts",
+    {
+      title: "Edit the ComfyUI host registry",
+      description:
+        "Add, change, remove or re-point the named ComfyUI hosts that list_hosts reports, by " +
+        "rewriting the registry file. `add` needs a `name` and a `host`; `update` changes only " +
+        "the fields given; `remove` deletes an entry and moves `default` if it pointed there; " +
+        "`set_default` chooses which host a call with no `host` uses; `repair` rewrites a file " +
+        "that has comments or trailing commas in it as strict JSON, changing no address, no port " +
+        "and no default — `changes` comes back empty, which is the proof. " +
+        "`auto_launch` may only be true for an address on THIS machine: `comfy launch` starts " +
+        "ComfyUI wherever this server runs and has no way to reach another box, so asking for it " +
+        "on a remote address is refused here rather than silently ignored later. " +
+        "Every change copies the previous file to `hosts.json.bak-<timestamp>` first and reports " +
+        "that path, writes through a temp file so no reader can see half a registry, and answers " +
+        "with the registry re-read from disk — so what comes back is what the next call will see. " +
+        "A wrong edit is undone with `mv`.",
+      inputSchema: {
+        action: z
+          .enum(["add", "update", "remove", "set_default", "repair"])
+          .describe("What to do. `repair` needs no other argument."),
+        name: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("The host to act on. Required for everything but `repair`."),
+        host: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "The address to connect to, e.g. \"127.0.0.1\" or \"100.86.199.90\". Required for " +
+              "`add`. A wildcard bind address such as 0.0.0.0 is rewritten to loopback, because " +
+              "it is where a server listens and not somewhere anything can connect.",
+          ),
+        port: z.number().int().min(MIN_PORT).max(MAX_PORT).optional().describe("Defaults to 8188."),
+        auto_launch: z
+          .boolean()
+          .optional()
+          .describe(
+            "May this server start ComfyUI for this host when nothing answers? Only ever true " +
+              "for an address on this machine. Defaults to whether the address is local.",
+          ),
+        note: z
+          .string()
+          .optional()
+          .describe("A label for the box, e.g. \"Windows, RTX 4070 12GB, video\". Yours to use."),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (args) =>
+      toolAnswer(async () => {
+        const result = await mutateHostRegistry(mutationOf(args), {
+          env: config.env,
+          defaultAddress: { host: config.host, port: config.port },
+        });
+        return {
+          action: args.action,
+          path: result.path,
+          backup_path: result.backupPath,
+          changes: result.changes,
+          // A repair changes the file's text and nothing about its meaning, and
+          // saying so out loud is the reassurance the action exists to give.
+          reformatted: result.rewritten && result.changes.length === 0,
+          registry: {
+            default: result.registry.defaultName,
+            count: result.registry.hosts.length,
+            hosts: result.registry.hosts.map((entry) => ({
+              name: entry.name,
+              address: `${entry.host}:${entry.port}`,
+              local: entry.local,
+              auto_launch: entry.autoLaunch,
+              note: entry.note,
+              is_default: entry.name === result.registry.defaultName,
+            })),
+            warnings: result.registry.warnings,
+          },
+        };
+      }),
+  );
+}
+
+/**
+ * The tool's flat arguments as one mutation.
+ *
+ * The `name` and `host` requirements are checked here rather than in the schema
+ * because they differ per action, and a schema that made them conditional would
+ * be a discriminated union of five shapes — harder for a model to fill in than
+ * one flat object, for a check whose message can simply say which field is
+ * missing.
+ */
+function mutationOf(args: {
+  action: "add" | "update" | "remove" | "set_default" | "repair";
+  name?: string;
+  host?: string;
+  port?: number;
+  auto_launch?: boolean;
+  note?: string;
+}): HostMutation {
+  if (args.action === "repair") return { action: "repair" };
+
+  const name = args.name;
+  if (name === undefined) {
+    throw new ToolArgumentError(`action ${JSON.stringify(args.action)} needs a \`name\`.`);
+  }
+  if (args.action === "remove") return { action: "remove", name };
+  if (args.action === "set_default") return { action: "set_default", name };
+
+  if (args.action === "add") {
+    if (args.host === undefined) {
+      throw new ToolArgumentError("action \"add\" needs a `host` — the address to connect to.");
+    }
+    return {
+      action: "add",
+      name,
+      host: args.host,
+      port: args.port,
+      autoLaunch: args.auto_launch,
+      note: args.note,
+    };
+  }
+  return {
+    action: "update",
+    name,
+    host: args.host,
+    port: args.port,
+    autoLaunch: args.auto_launch,
+    note: args.note,
+  };
 }
 
 /**
