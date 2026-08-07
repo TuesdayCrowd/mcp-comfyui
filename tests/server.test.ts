@@ -171,6 +171,7 @@ const MANAGED_ENV = [
   "FAKE_COMFY_JOBS_CANCEL_FILE",
   "FAKE_COMFY_JOBS_CANCEL_ERROR",
   "FAKE_COMFY_DISPATCH_LOG",
+  "FAKE_COMFY_WORKFLOW_COPY",
   "MCP_COMFYUI_WORKFLOW_DIRS",
   "MCP_COMFYUI_CACHE_DIR",
   "MCP_COMFYUI_HOST",
@@ -2429,4 +2430,233 @@ test("a registry that will not parse leaves the default working and refuses name
   expect(error["kind"]).toBe("registry_invalid");
   expect(error["registry_path"]).toBe(hostsFile());
   expect(error["line"]).toBe(1);
+});
+
+/**
+ * A ComfyUI that also serves its own saved workflows, the way a remote does.
+ *
+ * `/api/userdata` and `/api/userdata/{file}` are answered exactly as ComfyUI
+ * answers them — see `tests/userdata.test.ts` for where that shape comes from —
+ * so a test can exercise the whole path from `list_workflows` through a run
+ * without a real instance anywhere.
+ */
+function serveLibraryInstance(files: Record<string, string>): number {
+  const bound = denoServe((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/system_stats") {
+      return new Response(JSON.stringify(SYSTEM_STATS), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname === "/api/userdata") {
+      return Response.json(
+        Object.entries(files).map(([path, body]) => ({
+          path,
+          size: new TextEncoder().encode(body).byteLength,
+          modified: 1786069244638,
+        })),
+      );
+    }
+    if (url.pathname.startsWith("/api/userdata/")) {
+      const name = decodeURIComponent(url.pathname.slice("/api/userdata/".length));
+      const body = files[name];
+      return body === undefined
+        ? new Response("", { status: 404 })
+        : new Response(body, { headers: { "content-type": "application/json" } });
+    }
+    return new Response("nf", { status: 404 });
+  });
+  servers.push(bound);
+  return portOf(bound);
+}
+
+test("list_workflows shows a host's own library beside the local one, tagged", async () => {
+  writeWorkflow("local_only");
+  const port = serveLibraryInstance({ "workflows/portrait.json": `{"nodes":[],"links":[]}` });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+
+  const bare = await ok(await connect(), "list_workflows");
+  expect((bare["workflows"] as Record<string, unknown>[]).map((w) => w["name"])).toEqual(["local_only"]);
+  // No host named, no remote call: the default host is usually this machine,
+  // whose workflows directory is very likely already a configured root.
+  expect(bare["host"]).toBeUndefined();
+
+  const both = await ok(await connect(), "list_workflows", { host: "box" });
+  const entries = both["workflows"] as Record<string, unknown>[];
+  expect(entries.map((entry) => entry["name"])).toEqual(["local_only", "box/portrait"]);
+  expect(entries[0]).toMatchObject({ source: "local", format: "frontend" });
+  expect(entries[1]).toMatchObject({
+    source: "remote:box",
+    path: "workflows/portrait.json",
+    format: "unknown",
+    size_bytes: 23,
+  });
+  expect(both["count"]).toBe(2);
+});
+
+test("list_workflows still lists the local library when the host cannot be asked", async () => {
+  // `workflows/discover.ts`'s promise, one layer out: denying somebody their
+  // local workflows because a remote box is asleep is the wrong trade.
+  writeWorkflow("local_only");
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port: deadPort } } });
+
+  const body = await ok(await connect(), "list_workflows", { host: "box" });
+
+  expect((body["workflows"] as unknown[]).length).toBe(1);
+  expect(body["remote_unreadable"]).toMatchObject({ host: "box" });
+});
+
+test("a workflow that exists only on a host runs there, byte-exact", async () => {
+  // Landmine #1 over HTTP. The local path is a byte copy and has been pinned
+  // since the beginning; this is the first route where a graph arrives from a
+  // network. `run_capture` keeps the file `comfy run` was handed, because the
+  // prepared copy is deleted the moment the run returns — so there would
+  // otherwise be nothing left to compare against.
+  //
+  // Mutant: make `resolveRemoteWorkflow` hand back
+  // `JSON.parse`-then-`JSON.stringify` of the fetched bytes instead of the
+  // bytes. This test dies on the exact digits.
+  const graph = `{"nodes":[{"id":3,"type":"KSampler","widgets_values":[${HUGE_SEED}]}],"links":[]}`;
+  const port = serveLibraryInstance({ "workflows/seeded.json": graph });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  const copy = join(workdir, "submitted.json");
+  const log = join(workdir, "dispatch.log");
+  process.env.FAKE_COMFY_RUN_MODE = "run_capture";
+  process.env.FAKE_COMFY_WORKFLOW_COPY = copy;
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "box/seeded",
+    inputs: { "3.cfg": 7 },
+  });
+
+  expect(body["workflow"]).toMatchObject({ name: "box/seeded", source: "remote" });
+  // The graph that reached the CLI still opens with the exact bytes the host
+  // served. (The fake `set-slot` appends its markers after them.)
+  expect(readFileSync(copy, "utf8").startsWith(graph)).toBe(true);
+  expect(readFileSync(copy, "utf8")).toContain(HUGE_SEED);
+  expect(readFileSync(copy, "utf8")).not.toContain("18446744073709552000");
+
+  // Flag POSITION, not merely presence: `--json` is a Typer root flag and
+  // precedes the subcommand, while `--host` is the subcommand's own and
+  // follows it. Both orderings now appear in one argv.
+  const lines = readFileSync(log, "utf8").trim().split("\n");
+  const setSlot = (lines.find((line) => line.includes("set-slot")) as string).split(" ");
+  expect(setSlot.indexOf("--json")).toBe(-1); // set-slot is not a --json command
+  expect(setSlot.indexOf("set-slot")).toBeLessThan(setSlot.indexOf("--host"));
+  const run = (lines.find((line) => line.includes(" run ")) as string).split(" ");
+  expect(run.indexOf("--json")).toBeGreaterThan(run.indexOf("run"));
+  expect(run.indexOf("run")).toBeLessThan(run.indexOf("--host"));
+  expect(run[run.indexOf("--port") + 1]).toBe(String(port));
+});
+
+test("a local workflow is still run without a copy of anything being fetched", async () => {
+  // The ordinary case, and the one `host` is mostly for: the workflow comes
+  // from the local library and is RUN on another instance.
+  const path = writeWorkflow("flow");
+  const port = serveLibraryInstance({ "workflows/other.json": "{}" });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "flow", host: "box" });
+
+  expect(body["workflow"]).toMatchObject({ name: "flow", path, source: "local" });
+  expect(body["target"]).toMatchObject({ name: "box" });
+});
+
+test("describe_workflow reads a host's own workflow without leaving a temp copy behind", async () => {
+  const graph = `{"nodes":[{"id":3,"type":"KSampler"}],"links":[]}`;
+  const port = serveLibraryInstance({ "workflows/remote_flow.json": graph });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  serveSlots();
+  // Per host and port, which is the whole point of the cache being keyed that
+  // way: two ComfyUIs with different models installed must never answer for
+  // each other. The library instance is on its own port, so its cache is its
+  // own file.
+  copyFileSync(OBJECT_INFO_SAMPLE, join(cacheDir, `object_info-127.0.0.1-${port}.json`));
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "box/remote_flow" });
+
+  expect(body["workflow"]).toMatchObject({ name: "box/remote_flow", source: "remote" });
+  expect(body["slot_count"]).toBeGreaterThan(0);
+  // The staged copy is the caller's to delete, and describe_workflow is the
+  // caller. `leakedTempDirs` is checked in afterEach for every test here.
+  expect(leakedTempDirs()).toEqual([]);
+});
+
+/**
+ * An instance that both reports an output directory and serves the files in it
+ * over `/view` — which `serveInstanceWritingTo` deliberately does not, because
+ * every test before this one only ever asked whether a URL resolved to a path,
+ * never fetched one.
+ */
+function serveArtifactInstance(outputDir: string, files: Record<string, string>): number {
+  const bound = denoServe((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/system_stats") {
+      const argv = ["ComfyUI/main.py", "--output-directory", outputDir];
+      return new Response(JSON.stringify({ ...SYSTEM_STATS, system: { ...SYSTEM_STATS.system, argv } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname === "/view") {
+      const body = files[url.searchParams.get("filename") ?? ""];
+      return body === undefined
+        ? new Response("", { status: 404 })
+        : new Response(body, { headers: { "content-type": "image/png" } });
+    }
+    return new Response("nf", { status: 404 });
+  });
+  servers.push(bound);
+  const port = portOf(bound);
+  process.env.MCP_COMFYUI_PORT = String(port);
+  return port;
+}
+
+test("fetch_outputs brings a run's artifacts here, and says where each one landed", async () => {
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "made_00001_.png"), "png bytes");
+  const port = serveArtifactInstance(outputDir, { "made_00001_.png": "png bytes" });
+  const url = viewUrl(port, { filename: "made_00001_.png", subfolder: "", type: "output" });
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: [url] }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const off = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+  // Absent unless asked for, so an empty `fetched` can only ever mean "asked
+  // for, and none came across".
+  expect((off["outputs"] as Record<string, unknown>)["fetched"]).toBeUndefined();
+
+  const on = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, fetch_outputs: true });
+  const outputs = on["outputs"] as Record<string, Record<string, string>>;
+  expect(outputs["fetch_problems"]).toEqual([]);
+  const landed = outputs["fetched"]?.[url] as string;
+  expect(landed).toContain(PROMPT_ID);
+  expect(readFileSync(landed, "utf8")).toBe("png bytes");
+});
+
+test("an artifact that will not come across is reported without denying the others", async () => {
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "good.png"), "good bytes");
+  const port = serveArtifactInstance(outputDir, { "good.png": "good bytes" });
+  const good = viewUrl(port, { filename: "good.png", subfolder: "", type: "output" });
+  const gone = viewUrl(port, { filename: "gone.png", subfolder: "", type: "output" });
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: [good, gone] }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, fetch_outputs: true });
+
+  const outputs = body["outputs"] as Record<string, unknown>;
+  expect(Object.keys(outputs["fetched"] as Record<string, string>)).toEqual([good]);
+  expect((outputs["fetch_problems"] as Record<string, unknown>[])[0]).toMatchObject({ url: gone });
 });

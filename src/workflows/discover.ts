@@ -748,6 +748,24 @@ export async function inertInputsOfFile(path: string): Promise<Map<string, Inert
   } catch {
     return new Map();
   }
+  return inertInputsOfText(text);
+}
+
+/**
+ * {@link inertInputsOf} over a workflow's text, for a graph that never became a
+ * file on this machine — one fetched from a remote instance's own library.
+ *
+ * The `JSON.parse` here is **not** landmine #1. That landmine is about parsing
+ * a graph and then writing it back out, which rounds every integer above 2^53
+ * on the way through; this reads the link topology and throws the parsed object
+ * away. The bytes that reach `comfy` are the bytes that arrived, untouched —
+ * see `workflows/setSlots.ts`'s `contents`.
+ *
+ * Never throws, on the same terms as {@link inertInputsOfFile}: this only ever
+ * ADDS a refusal reason, and the CLI call right after it is what diagnoses a
+ * graph that is not one.
+ */
+export function inertInputsOfText(text: string): Map<string, InertInput> {
   let value: unknown;
   try {
     value = JSON.parse(text);
