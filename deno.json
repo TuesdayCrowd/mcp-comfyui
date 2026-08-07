@@ -12,6 +12,7 @@
   },
   "tasks": {
     "test": "deno test --no-check --allow-read --allow-write --allow-env --allow-run --allow-sys=networkInterfaces,homedir --allow-net=127.0.0.1,[::1],192.0.2.1 tests/",
+    "test:one": "deno test --no-check --allow-read --allow-write --allow-env --allow-run --allow-sys=networkInterfaces,homedir --allow-net=127.0.0.1,[::1],192.0.2.1",
     "build": "node scripts/build.mjs",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
     "compile": "deno compile --no-check --node-modules-dir=none --exclude-unused-npm --allow-read --allow-write --allow-env --allow-run --allow-sys=networkInterfaces,homedir --allow-net --output dist/mcp-comfyui src/index.ts"

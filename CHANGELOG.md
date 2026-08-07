@@ -59,6 +59,25 @@ All notable changes to this project are recorded here. The format follows
   below: that one refused a launch once the address was known, and this stops
   the attempt being made at all, with a message that does not offer
   `MCP_COMFYUI_AUTO_LAUNCH=1` as a fix for something that setting cannot fix.
+- **A missing Deno permission is no longer reported as a bug in this server.**
+  A `NotCapable` error reached the tool layer unclassified and came back as
+  `internal_error`, which says "this server has a bug" — false, and the wrong
+  place to send anyone, since the runtime's own message already names the flag.
+  It is now `permission_denied` and carries the full flag list. Deno only; Node
+  and Bun have no permission system.
+- **The README's own permission list was wrong**, and had been: it omitted
+  `--allow-sys`. Measured — a server started with exactly the documented flags
+  dies with `NotCapable` on the first call that looks for its configuration
+  directory. It also still claimed concurrent launches "share a single launch
+  … however many addresses are involved", which the code has not done for some
+  time: the in-flight map is keyed by address, so two different addresses both
+  proceed.
+- **`deno task test:one <file>` runs a single test file.** A bare
+  `deno test <file>`, which both the README and CLAUDE.md documented, type-checks
+  by default and fails — Deno's bundled TypeScript is a full major behind this
+  project's own, enough to reject `import.meta.dirname` and the MCP SDK's
+  handler signatures. Verified against the released 0.5.0 too, so this is a
+  documentation defect rather than a regression.
 - **`deno task compile` and `deno task test` now grant `--allow-sys=homedir`.**
   Pre-existing, and unrelated to multi-host except that the registry surfaced
   it: `comfy/objectInfo.ts` has called `homedir()` for its default cache

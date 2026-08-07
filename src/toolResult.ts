@@ -127,6 +127,12 @@ export type ToolErrorKind =
   | "registry_invalid"
   /** Which ComfyUI a job is on could not be established, and guessing is worse. */
   | "job_host_unknown"
+  /**
+   * The runtime refused this process a capability it needs. Deno only — Node
+   * and Bun have no permission system — and always an operator's to fix, by
+   * adding a flag.
+   */
+  | "permission_denied"
   /** A fault in this server. Reported as such rather than blamed on the caller. */
   | "internal_error";
 
@@ -490,6 +496,28 @@ export function describeError(err: unknown): ToolErrorBody {
   }
   if (err instanceof InstanceUnavailableError) {
     return { kind: "comfyui_not_running", message: err.message, url: err.url };
+  }
+
+  // Before the fallback, and the reason it is worth an arm of its own: a missing
+  // `--allow-*` flag is an operator's to fix — the runtime's own message even
+  // names the flag — and `internal_error` would report it as "this server has a
+  // bug", which is both false and the wrong place to send anyone. Measured: a
+  // server started without `--allow-sys` answers `list_hosts` this way the
+  // first time it looks for its own configuration directory.
+  //
+  // Matched on the NAME, not with `instanceof Deno.errors.NotCapable`: this
+  // bundle runs under Node and Bun too, where the `Deno` global does not exist
+  // and the reference would throw while classifying somebody else's error.
+  if (err instanceof Error && err.name === "NotCapable") {
+    return {
+      kind: "permission_denied",
+      message:
+        `${err.message}\n` +
+        `This server is running under Deno without a permission it needs. The full set is ` +
+        `--allow-run --allow-read --allow-write --allow-net --allow-env ` +
+        `--allow-sys=homedir,networkInterfaces, or -A for all of them.`,
+      error_name: err.name,
+    };
   }
 
   return {
