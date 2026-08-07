@@ -184,16 +184,17 @@ async function main(): Promise<void> {
  * v26.5.1, including through the shebang'd, symlinked file npm's `bin`
  * mechanism installs). It is reimplemented here rather than used directly
  * because this project's supported range (`engines.node >= 18`) reaches back
- * before `import.meta.main` existed, and — historically, back when `bun build
- * --target=node` was this project's bundler — because that bundler rewrote
+ * before `import.meta.main` existed, so the manual comparison below has to
+ * carry the weight for pre-24 Node regardless of anything a bundler might do
+ * to `import.meta.main` itself. (This project's bundler before the Deno
+ * migration, `bun build --target=node`, in fact used to rewrite
  * `import.meta.main` into `__require.main == __require.module`, a reference
- * to a binding its own ESM output never defined. `deno bundle`, the bundler
- * now, does not touch `import.meta.main` at all — but it also does not need
- * to, since the manual comparison below still has to carry the weight for
- * pre-24 Node either way. `import.meta.url` and `node:fs`/`node:url` are
- * ordinary runtime values no bundler this project has used has ever rewritten
- * specially, so this survives a build unchanged (checked directly against the
- * built `dist/index.js`).
+ * to a binding its own ESM output never defined — one more reason, now moot,
+ * not to trust it blindly.) `deno bundle`, the bundler now, does not touch
+ * `import.meta.main` at all, and `import.meta.url` and `node:fs`/`node:url`
+ * are ordinary runtime values no bundler this project has used has ever
+ * rewritten specially, so this survives a build unchanged (checked directly
+ * against the built `dist/index.js`).
  *
  * `realpathSync` on `process.argv[1]` matters as much as `import.meta.url`
  * itself: Node resolves the entry module's URL through any symlink, but
@@ -202,12 +203,14 @@ async function main(): Promise<void> {
  * read a normal `npx`/global install as "merely imported" and never start.
  *
  * The `catch` matters too, for the same reason it always has: a runtime whose
- * `process.argv[1]` is a path with nothing real on disk at that exact spot
- * (verified directly for Bun's `bun build --compile`, back when that was this
- * project's optional standalone binary: both paths were the virtual
- * `/$bunfs/root/<name>`, and `realpathSync` threw `ENOENT` on it). There is
- * nothing to resolve in that case; if the two paths already match textually,
- * that is answer enough.
+ * `process.argv[1]` is a path with nothing real on disk at that exact spot.
+ * Historical origin of this guard: verified directly for `bun build
+ * --compile`, back when that was this project's optional standalone binary —
+ * both paths were the virtual `/$bunfs/root/<name>`, and `realpathSync` threw
+ * `ENOENT` on it. (The current standalone binary, `deno compile`, is handled
+ * separately above, via `import.meta.main`, and never reaches this branch at
+ * all.) There is nothing to resolve in that case; if the two paths already
+ * match textually, that is answer enough.
  */
 function isMainModule(): boolean {
   // A remote specifier — `deno run jsr:@scope/pkg` or an https: URL. There is

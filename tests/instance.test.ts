@@ -70,11 +70,11 @@ const FAKE_COMFY_LOGGING = join(import.meta.dirname, "fixtures", "fake-comfy-dis
 type Handler = (request: Request) => Response | Promise<Response>;
 
 /**
- * `Bun.serve`-shaped wrapper over `Deno.serve`, matching `tests/objectInfo.test.ts`:
- * `stop(true)` aborts the creating `signal` rather than awaiting `.shutdown()`,
- * which — unlike `.shutdown()` — resolves immediately even against a handler
- * that never returns (measured directly; several tests below install exactly
- * one such handler).
+ * A `{port, stop}` pair wrapping the raw `Deno.HttpServer`, matching
+ * `tests/objectInfo.test.ts`: `stop(true)` aborts the creating `signal`
+ * rather than awaiting `.shutdown()`, which — unlike `.shutdown()` —
+ * resolves immediately even against a handler that never returns (measured
+ * directly; several tests below install exactly one such handler).
  */
 interface TestServer {
   readonly port: number;

@@ -215,16 +215,16 @@ const KNOWN_FILE_ERRORS: Record<string, string> = {
  *
  * A stat of `workflowPath` is checked **before** the OS's own errno, and
  * overrides it: finding 3 is that the errno for "the source is a directory"
- * is not stable across platforms. Linux's `copyfile` reports `EISDIR`, which
- * {@link KNOWN_FILE_ERRORS} already covered — but Bun's on this macOS reports
- * `ENOTSUP` instead, measured directly: `copyFileSync(aDirectory, tmp)`
- * throws `ENOTSUP: operation not supported on socket, copyfile '<dir>' ->
- * '<tmp>'`. `ENOTSUP` is not a code this map recognises, so it used to fall
- * through to that raw fs message — which quotes the destination as well as
- * the source, i.e. exactly the UUID temp path this class's own doc comment
- * says it exists to hide. A direct stat sidesteps the question of which
- * errno a given platform happens to choose for the same underlying fact, so
- * the directory case is clean regardless of it.
+ * is not stable even across the two runtimes this project supports. Measured
+ * directly on this machine: Node's `copyFileSync(aDirectory, tmp)` throws
+ * `ENOTSUP: operation not supported on socket, copyfile '<dir>' -> '<tmp>'`,
+ * while Deno's throws `EISDIR` instead — the one {@link KNOWN_FILE_ERRORS}
+ * already covers. `ENOTSUP` is not a code this map recognises, so under Node
+ * it used to fall through to the raw fs message — which quotes the
+ * destination as well as the source, i.e. exactly the UUID temp path this
+ * class's own doc comment says it exists to hide. A direct stat sidesteps
+ * the question of which errno a given runtime happens to choose for the
+ * same underlying fact, so the directory case is clean regardless of it.
  */
 function errorCode(workflowPath: string, cause: unknown): string | null {
   if (isDirectory(workflowPath)) return "EISDIR";

@@ -40,10 +40,11 @@ let deadPort: number;
 let launchServers: TestServer[] = [];
 
 /**
- * `Bun.serve`-shaped wrapper over `Deno.serve`, matching `tests/objectInfo.test.ts`:
- * `stop(true)` aborts the creating `signal` rather than awaiting `.shutdown()`,
- * which — unlike `.shutdown()` — resolves immediately even against a handler
- * that never returns (measured directly).
+ * A `{port, stop}` pair wrapping the raw `Deno.HttpServer`, matching
+ * `tests/objectInfo.test.ts`: `stop(true)` aborts the creating `signal`
+ * rather than awaiting `.shutdown()`, which — unlike `.shutdown()` —
+ * resolves immediately even against a handler that never returns (measured
+ * directly).
  */
 interface TestServer {
   readonly port: number;

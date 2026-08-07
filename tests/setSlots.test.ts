@@ -262,13 +262,14 @@ test("an unreadable workflow file is reported without guessing why", async () =>
 });
 
 test("finding 3: a workflow path that is a directory is reported cleanly, whatever errno the platform used", async () => {
-  // Measured on this machine: Bun's copyFileSync throws ENOTSUP for a
+  // Measured on this machine: Node's copyFileSync throws ENOTSUP for a
   // directory source (`ENOTSUP: operation not supported on socket, copyfile
-  // '<dir>' -> '<temp path>'`), not the EISDIR this class already mapped —
-  // and the raw message quotes the destination, i.e. exactly the UUID temp
-  // path WorkflowFileError exists to hide. The fix checks the filesystem fact
-  // directly rather than the OS's own errno spelling for it, so this holds
-  // regardless of which errno this platform happens to report.
+  // '<dir>' -> '<temp path>'`), while Deno's throws EISDIR instead — the
+  // errno this project's own runtimes don't even agree on between
+  // themselves. The raw ENOTSUP message quotes the destination, i.e. exactly
+  // the UUID temp path WorkflowFileError exists to hide. The fix checks the
+  // filesystem fact directly rather than the OS's own errno spelling for it,
+  // so this holds regardless of which errno a given runtime reports.
   const dir = join(workdir, "adir.json");
   mkdirSync(dir);
 

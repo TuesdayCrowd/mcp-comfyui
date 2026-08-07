@@ -212,8 +212,10 @@ test("a non-executable binary is reported as ComfyUnavailableError", async () =>
 });
 
 test("a missing cwd names the directory, not just the binary", async () => {
-  // Bun reports a bad cwd as ENOENT quoting the BINARY, so a message that
-  // blames only the install sends the operator to reinstall a working tool.
+  // A bad cwd surfaces as ENOENT quoting the BINARY (e.g. "spawn /bin/echo
+  // ENOENT"), not the missing directory — measured directly under both Node
+  // and Deno — so a message that blames only the install sends the operator
+  // to reinstall a working tool.
   const missing = join(workdir, "no-such-dir");
   const err = await rejection(runComfy(["run"], { cwd: missing }));
   expect(err).toBeInstanceOf(ComfyUnavailableError);
@@ -278,8 +280,11 @@ test("runs the child in the requested cwd", async () => {
 });
 
 test("environment set after startup reaches the child", async () => {
-  // Bun hands a child the environment as it stood at startup unless it is
-  // passed explicitly, which would strip every COMFYUI_* var an operator sets.
+  // `runComfyRaw` passes `env: process.env` explicitly (src/comfy/exec.ts)
+  // rather than relying on a runtime's default forwarding behaviour, so a
+  // COMFYUI_* var an operator sets stays forwarded even if that default
+  // ever changes upstream. This asserts the explicit pass captures the
+  // current environment, not a snapshot taken earlier.
   process.env.FAKE_COMFY_MODE = "echo_env";
   process.env.FAKE_COMFY_PROBE = "set-at-runtime";
   expect(await runComfy(["run"])).toEqual({ probe: "set-at-runtime" });

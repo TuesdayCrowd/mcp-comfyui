@@ -85,9 +85,10 @@ function spawnDist(env: NodeJS.ProcessEnv = process.env): Deno.ChildProcess {
 
 /**
  * Write text to a child's stdin. The writer is released (not closed) after
- * each write rather than held across calls, the Deno `WritableStream`
- * equivalent of Bun's independent `child.stdin.write()` calls — several
- * tests below write more than once to the same child, interleaved with reads.
+ * each write rather than held across calls: `Deno.ChildProcess`'s stdin is a
+ * `WritableStream`, whose writer must be released before another
+ * `getWriter()` call can succeed, and several tests below write more than
+ * once to the same child, interleaved with reads.
  */
 async function writeStdin(child: Deno.ChildProcess, text: string): Promise<void> {
   const writer = child.stdin.getWriter();
@@ -114,11 +115,11 @@ const SYSTEM_STATS = {
 };
 
 /**
- * `Bun.serve`-shaped wrapper over `Deno.serve`: a `{port, stop}` pair rather
- * than the raw `Deno.HttpServer`. `stop(true)` (this file only ever forces)
- * aborts the creating `signal` instead of calling `.shutdown()`, which —
- * unlike `.shutdown()` — resolves immediately even against a handler that
- * never returns (measured directly).
+ * A `{port, stop}` pair wrapping the raw `Deno.HttpServer`. `stop(true)`
+ * (this file only ever forces) aborts the creating `signal` instead of
+ * calling `.shutdown()`, which — unlike `.shutdown()` — resolves
+ * immediately even against a handler that never returns (measured
+ * directly).
  */
 interface TestServer {
   readonly port: number;
@@ -1875,8 +1876,7 @@ test("a payload beyond the buffer limit is reported on stderr rather than dying 
   // server exits once `ReadBuffer.append()` throws on overflow (see
   // `src/index.ts`'s doc comment on Finding 1), and streaming 20MB takes
   // long enough that the child can already be gone before the write
-  // completes. Measured directly — unlike Bun's `FileSink.write()`, which
-  // did not surface this the same way — Deno's stdin writer rejects with
+  // completes. Measured directly: Deno's stdin writer rejects with
   // `Deno.errors.BrokenPipe` when that race is lost. That IS the failure
   // this test exists to prove (the transport died), not a different one, so
   // it is tolerated here rather than propagated.

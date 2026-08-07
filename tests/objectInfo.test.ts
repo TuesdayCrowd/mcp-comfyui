@@ -33,15 +33,15 @@ const PAYLOAD = readFileSync(FIXTURE, "utf8");
 type Handler = (request: Request) => Response | Promise<Response>;
 
 /**
- * `Bun.serve`-shaped wrapper over `Deno.serve`: a `{port, stop}` pair rather
- * than the raw `Deno.HttpServer`. `stop(true)` (this file only ever forces)
- * aborts the `signal` the server was created with rather than calling
- * `.shutdown()`, which matters for a handler that never resolves — the
- * "a server that never answers" tests below install exactly one. Measured
- * directly: `.shutdown()` awaits every in-flight request and hangs forever
- * against such a handler, while aborting via `signal` resolves `.finished`
- * immediately and frees the port for the next test's `serve()` — the actual
- * behaviour `Bun.serve(...).stop(true)` gave this suite.
+ * A `{port, stop}` pair wrapping the raw `Deno.HttpServer`, so callers get a
+ * bound port number without reaching into `Deno.serve`'s return shape.
+ * `stop(true)` (this file only ever forces) aborts the `signal` the server
+ * was created with rather than calling `.shutdown()`, which matters for a
+ * handler that never resolves — the "a server that never answers" tests
+ * below install exactly one. Measured directly: `.shutdown()` awaits every
+ * in-flight request and hangs forever against such a handler, while
+ * aborting via `signal` resolves `.finished` immediately and frees the port
+ * for the next test's `serve()`.
  */
 interface TestServer {
   readonly port: number;

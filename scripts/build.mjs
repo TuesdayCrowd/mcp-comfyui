@@ -16,12 +16,14 @@ import { spawnSync } from "node:child_process";
  * (see `src/comfy/exec.ts`) or web-standard APIs (`fetch`, `URL`,
  * `AbortSignal`) available in both.
  *
- * This script still has to fix the shebang, exactly as it did under Bun:
- * `deno bundle` carries the *source* file's shebang through verbatim
- * regardless of `--platform` (measured directly — a `--platform=deno` bundle
- * of a file shebang'd `#!/usr/bin/env bun` still starts with that same
- * line), so the shebang this project ships has to be rewritten same as
- * before.
+ * This script still has to fix the shebang: `deno bundle` carries the
+ * *source* file's own shebang through verbatim regardless of `--platform`
+ * (measured directly — a `--platform=deno` bundle of `src/index.ts`, whose
+ * own shebang is `#!/usr/bin/env -S deno run ...`, still starts with that
+ * same line), so the shebang this project ships has to be rewritten to
+ * `#!/usr/bin/env node` before publish. This project's former Bun bundler
+ * had the identical behaviour and needed the identical fix; the step
+ * survived the migration to `deno bundle` unchanged.
  */
 
 const OUTFILE = "dist/index.js";

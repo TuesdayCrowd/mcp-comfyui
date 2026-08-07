@@ -115,10 +115,10 @@ export class ComfyTimeoutError extends Error {
  * Drain a pipe to text, with a handle to abandon the read. Killing the child is
  * not enough to end a read: every descendant inherits the pipe's write end, so
  * EOF waits on the slowest grandchild — and `comfy launch` exists precisely to
- * leave one behind. `cancel()` destroys *our* end of the pipe instead: that
- * closes this process's read descriptor outright, which needs no cooperation
- * from whichever descendant is still holding the write end open, and is the
- * Node equivalent of the read-side cancellation Bun's `reader.cancel()` did.
+ * leave one behind. `cancel()` destroys *our* end of the pipe instead: Node's
+ * `stream.destroy()` closes this process's read descriptor outright, which
+ * needs no cooperation from whichever descendant is still holding the write
+ * end open.
  */
 function drain(stream: Readable): { text: Promise<string>; cancel: () => void } {
   const chunks: Buffer[] = [];
@@ -148,7 +148,7 @@ function drain(stream: Readable): { text: Promise<string>; cancel: () => void } 
   return { text, cancel: () => void stream.destroy() };
 }
 
-/** Resolve once the child has actually exited — the Node equivalent of Bun's `proc.exited`. */
+/** Resolve once the child has actually exited, reported by Node's `exit` event. */
 function exited(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => child.once("exit", () => resolve()));
@@ -173,19 +173,22 @@ export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promis
 
   const child = spawn(binary, [SKIP_PROMPT, ...args], {
     cwd: opts.cwd,
-    // Passed explicitly, exactly as the Bun implementation did (landmine #17):
-    // Node already forwards live `process.env` by default, unlike Bun, but
-    // every spawn in this project passes `env` on principle so the behaviour
-    // cannot regress if that default ever changes upstream.
+    // Passed explicitly, on principle: Node already forwards live
+    // `process.env` to a spawned child by default (verified directly), so
+    // this is defensive rather than required — every spawn in this project
+    // passes `env` anyway so the behaviour cannot regress if that default
+    // ever changes upstream. Historically load-bearing under this project's
+    // former Bun toolchain (landmine #17): Bun's spawn captured the
+    // environment only at process start and ignored runtime mutations
+    // unless `env` was passed explicitly.
     env: process.env,
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  // Unlike Bun, which throws synchronously when a spawn cannot start, Node
-  // only ever reports it asynchronously via an `error` event — there is no
-  // synchronous failure mode to catch here. `spawn` is the complementary
-  // success signal (fired once the OS call has actually gone through), so
-  // racing the two turns Node's async report back into the same
+  // Node reports a spawn failure only asynchronously via an `error` event —
+  // there is no synchronous throw to catch here. `spawn` is the
+  // complementary success signal (fired once the OS call has actually gone
+  // through), so racing the two turns Node's async report back into the same
   // fails-before-anything-else contract this module already promised its
   // callers.
   let startedSettled = false;
