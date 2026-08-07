@@ -2998,13 +2998,23 @@ test("the build makes dist/ describe its own module format", async () => {
   expect(JSON.parse(readFileSync(manifest, "utf8"))).toEqual({ type: "module" });
 
   // And the artifact really does run under a Node that will not guess.
-  const child = new Deno.Command("node", {
-    args: ["--no-experimental-detect-module", DIST_ENTRY],
-    stdin: "null",
-    stdout: "piped",
-    stderr: "piped",
-  }).spawn();
-  const { code, stderr } = await child.output();
-  expect(new TextDecoder().decode(stderr)).not.toContain("outside a module");
-  expect(code).toBe(0);
+  //
+  // `--no-experimental-detect-module` turns off the syntax detection Node 22.7
+  // and later do by default, which is what would otherwise mask a missing
+  // manifest. A Node old enough not to recognise the flag has no detection to
+  // disable, so a plain run is already the strict test there — that fallback is
+  // what keeps this meaningful across the whole supported range rather than
+  // failing on the CI runner's Node purely over a flag name.
+  const run = async (args: string[]) => {
+    const child = new Deno.Command("node", { args, stdin: "null", stdout: "piped", stderr: "piped" })
+      .spawn();
+    const { code, stderr } = await child.output();
+    return { code, stderr: new TextDecoder().decode(stderr) };
+  };
+
+  let result = await run(["--no-experimental-detect-module", DIST_ENTRY]);
+  if (result.stderr.includes("bad option")) result = await run([DIST_ENTRY]);
+
+  expect(result.stderr).not.toContain("outside a module");
+  expect(result.code).toBe(0);
 });
