@@ -117,11 +117,19 @@ Rule-shaped code (when to drop a constraint, which source wins) needs hand-built
 
 GitButler. Use the `gitbutler` skill and `but commit`, never `git commit`.
 
-**Project override:** this repo lands virtual branches directly onto `main` with `but land <branch>` instead of opening pull requests. Work is still committed to a named virtual branch first — land the branch, don't commit to `main` directly. Landing pushes to `origin/main` immediately and `but undo` cannot un-push it.
+**Pull requests are required.** Commit to a named virtual branch, `but push <branch>`, then open a PR (`but pr new`, or `gh pr create` — `gh` is authenticated with `repo` scope here even when GitButler's forge auth is not). Never commit to `main`, and **do not use `but land`**: it pushes straight to `origin/main`, skipping review and CI, and `but undo` cannot un-push it. This repo previously did land directly; that override was retired on 2026-08-07.
 
 ## Verified end to end
 
 Against a live ComfyUI 0.29.0 through the compiled binary over stdio: `describe_workflow` returned bounds for all five slots of `workflow.smoke` with zero unresolved, and `run_workflow {1.width:128, 1.height:96} wait:true` produced a 128×96 PNG. `get_job` reported an earlier submit `completed` with its output. `applySlots` was separately verified to keep a 2^64−1 seed byte-exact.
+
+**Multi-host, verified on 2026-08-07** through `dist/index.js` under `node` over real stdio, against a live ComfyUI **0.30.2** on a Windows RTX 4070 at `100.86.199.90:8189` while this machine's own ComfyUI was stopped:
+
+- `comfy_status {host: "rtx-video"}` and the same call with the raw address `100.86.199.90:8189` both returned that instance, reporting `local: false`, `output_directory: "F:\\Dev\\ComfyUI\\output"` and `--listen 100.86.199.90,127.0.0.1`.
+- `comfy_status` with no `host` reported the default as down, in the same session — two hosts, two answers, one process.
+- `describe_workflow {workflow: "default_image_gen", host: "rtx-video"}` returned all 13 slots with zero unresolved, and `4.ckpt_name`'s enum was `["ltx-2.3-22b-dev-fp8.safetensors"]` — **the checkpoints installed on the Windows box, not on this Mac**. That is the whole value of per-host node definitions, and the cache landed at `object_info-100.86.199.90-8189.json`.
+- `list_workflows {host: "rtx-video"}` returned this machine's 27 local workflows tagged `local` and no remote ones, the remote being a fresh install with an empty `workflows` directory — which its userdata API reports as a 404, read here as an empty library rather than a fault.
+- Two defects were found by this run and fixed: `UserdataError` reached the tool layer unclassified and was reported as `internal_error`; and a *mistyped workflow name* fell through to the default host's library, failed to reach it, and came back as `fetch failed` about `/api/userdata` instead of `workflow_not_found` with the 27 names that would have worked. A host consulted only as a fallback must not become the story; one the caller named still is.
 
 A real run also confirmed three things previously known only from source: `converted` and `prompt_preview` **are** emitted and are absent from comfy-cli's published event enum; `prompt_preview` carries the whole graph (landmine #12); and `queued`/`executed` carry undeclared fields (`validation_warnings`, `nodes`, structured `outputs`) that `looseObject` preserves.
 
