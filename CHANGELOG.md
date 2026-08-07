@@ -33,7 +33,15 @@ All notable changes to this project are recorded here. The format follows
 - **`fetch_outputs`** on `run_workflow` and `get_job`, which copies a run's
   artifacts to this machine and reports where each landed. Off by default: a run
   here already has its files here, and a video workflow's outputs can be
-  hundreds of megabytes to move.
+  hundreds of megabytes to move. Artifacts stream to disk with a cap, and a
+  filename that would escape the destination is refused rather than sanitised.
+- **A host-qualified workflow handle routes itself.** `list_workflows` publishes
+  a remote workflow as `rtx-video/portrait`, which reads as self-describing, so
+  passing it alone reaches that host without repeating `host`. Only a prefix
+  that is really a registered host counts — a local `templates/portrait`, which
+  is how `workflows/discover.ts` disambiguates a colliding name, stays local.
+  An explicit `host` still wins, which is what keeps `{workflow: "portrait",
+  host: "rtx-video"}` meaning "run my local workflow there".
 
 ### Fixed
 

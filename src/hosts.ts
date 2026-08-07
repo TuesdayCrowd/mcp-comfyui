@@ -574,7 +574,12 @@ function interpret(
     return {
       path,
       present: true,
-      repairable,
+      // **Not `repairable`**, even when the tolerant parse rescued the syntax.
+      // What came back is not a registry — an array, a string, a number — so
+      // `mutateHostRegistry` will refuse to rewrite it (there are no entries to
+      // preserve), and advertising a repair that the repair action then declines
+      // is worse than not offering one.
+      repairable: false,
       defaultName: fallback.name,
       hosts: [fallback],
       warnings,
@@ -939,12 +944,57 @@ function serialise(registry: HostRegistry, top: Record<string, unknown>): string
  * @throws {Error} `add` named one that already is, or the file could not be
  * written.
  */
-export async function mutateHostRegistry(
+export function mutateHostRegistry(
   mutation: HostMutation,
   opts: LoadRegistryOptions = {},
 ): Promise<HostMutationResult> {
+  const path = opts.path ?? hostsFilePath(opts.env ?? process.env);
+  // Serialised per file. Two `manage_hosts` calls can genuinely be in flight at
+  // once — the MCP transport dispatches a request without waiting for the last
+  // one to finish — and each of the several `await`s below is a point where the
+  // other can interleave. Both would then read the same registry, and the
+  // second would write a document computed from a snapshot taken before the
+  // first existed: a host the caller was *told* had been added, silently gone,
+  // with the evidence only in a `.bak-` file nobody was pointed at.
+  //
+  // A promise chain rather than a lock, because that is what the surrounding
+  // code already is: the same shape as `objectInfo.ts`'s in-flight map, keyed
+  // the same way, for the same reason. This bounds one process; two servers
+  // sharing a registry file would still race, which is why the write is
+  // temp-file-and-rename — that at least keeps the file whole.
+  const queued = writeQueue.get(path) ?? Promise.resolve();
+  const next = queued.then(
+    () => performMutation(mutation, opts, path),
+    () => performMutation(mutation, opts, path),
+  );
+  // The chain must not break on a failed mutation, so the stored link swallows
+  // the rejection; `next` keeps it, for the caller.
+  writeQueue.set(
+    path,
+    next.then(
+      () => {},
+      () => {},
+    ),
+  );
+  return next;
+}
+
+/**
+ * The mutations this process is performing, keyed by registry path.
+ *
+ * Never cleared by key, only replaced: an entry is one link in a chain, and the
+ * chain is what orders the writes. The map holds one settled promise per file
+ * an operator has ever edited in this process, which is a handful of bytes for
+ * a handful of paths.
+ */
+const writeQueue = new Map<string, Promise<void>>();
+
+async function performMutation(
+  mutation: HostMutation,
+  opts: LoadRegistryOptions,
+  path: string,
+): Promise<HostMutationResult> {
   const env = opts.env ?? process.env;
-  const path = opts.path ?? hostsFilePath(env);
   const before = await loadHostRegistry({ ...opts, env, path });
 
   // **Including `repair`.** A file neither parse could read yielded no entries

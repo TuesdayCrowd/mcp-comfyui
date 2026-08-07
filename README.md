@@ -126,7 +126,9 @@ Then `describe_workflow {workflow: "portrait", host: "rtx-video"}` describes tha
 
 A `host` may also be a raw address — `100.86.199.90:8189` — which needs no registry entry. It has to carry an explicit port unless it's an IP literal or `localhost`: a bare word with no port is reported as an unknown *host name*, with the names that would have worked, because otherwise a mistyped `rtx-video` becomes a DNS lookup and comes back as "unreachable".
 
-**Workflows come from two places.** Your local library (the directories `MCP_COMFYUI_WORKFLOW_DIRS` names) can be run on any host — that is the ordinary case. A host's *own* saved workflows are listed too when you pass `host` to `list_workflows`, tagged `remote:<name>` and named `rtx-video/portrait`; running one fetches its exact bytes over ComfyUI's userdata API and hands them to `comfy` unparsed, so a 2^64−1 seed survives the trip.
+**Workflows come from two places.** Your local library (the directories `MCP_COMFYUI_WORKFLOW_DIRS` names) can be run on any host — that is the ordinary case, and what `{workflow: "portrait", host: "rtx-video"}` means. A host's *own* saved workflows are listed too when you pass `host` to `list_workflows`, tagged `remote:<name>` and named `rtx-video/portrait`; running one fetches its exact bytes over ComfyUI's userdata API and hands them to `comfy` unparsed, so a 2^64−1 seed survives the trip.
+
+A host-qualified handle routes itself: `{workflow: "rtx-video/portrait"}` needs no `host`, because the name already says which machine it is on. Only a prefix that is really a registered host counts — a local workflow called `templates/portrait` (which is how a colliding name gets disambiguated) stays local.
 
 ### What multi-host does not do
 
@@ -134,7 +136,7 @@ These don't degrade gracefully; they don't exist.
 
 - **A remote ComfyUI cannot be launched.** `comfy launch` starts ComfyUI on whichever machine runs `comfy` — it has no `--host`. So a host that isn't answering is reported, never started, and `auto_launch: true` on a non-local address is refused when you write it. Before this was enforced, pointing the server at a sleeping remote started a ComfyUI *here*, polled the remote for five minutes, reported a timeout, and left the local process running.
 - **Artifacts stay on the machine that made them.** `local_paths` keeps one meaning: a file this machine can open. A run on another host has none, and `outputs.urls` is the way in — pass `fetch_outputs: true` to copy them here.
-- **A job belongs to the host that ran it.** The server remembers where it sent each run, so `get_job` normally needs no `host`. It does not guess: asking the wrong ComfyUI about a real job answers `prompt_not_found`, which is exactly what it answers for a job that never existed, so a guess would be a confident wrong answer rather than a detectable one. With two or more hosts and no record, you are asked which.
+- **A job belongs to the host that ran it.** The server remembers where it sent each run, so `get_job` normally needs no `host`. It does not guess: asking the wrong ComfyUI about a real job answers `prompt_not_found`, which is exactly what it answers for a job that never existed, so a guess would be a confident wrong answer rather than a detectable one. With two or more hosts and no record, you are asked which; with exactly one, it is used and the answer says so (`host_source: "only"`, plus a warning), because a run submitted to a raw address is not in the registry at all.
 - **Attribution does not survive a restart.** The ledger is in memory. Poll a job from before a restart, or one started in the ComfyUI web interface, and name its host.
 
 ## Where your images are

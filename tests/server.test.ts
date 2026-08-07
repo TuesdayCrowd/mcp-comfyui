@@ -2814,3 +2814,148 @@ test("a workflow a named host does not have is a missing workflow", async () => 
 
   expect(error["kind"]).toBe("workflow_not_found");
 });
+
+test("a host-qualified workflow handle routes itself, without repeating the host", async () => {
+  // list_workflows publishes a remote workflow as `box/portrait`, and a handle
+  // that carries a host's name reads as self-describing — a model will pass it
+  // on its own. If it did not route, the call would resolve against the
+  // DEFAULT host, look for `box/portrait` in that machine's library, and report
+  // a workflow that plainly exists as missing.
+  const graph = `{"nodes":[{"id":3,"type":"KSampler"}],"links":[]}`;
+  const port = serveLibraryInstance({ "workflows/portrait.json": graph });
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      box: { host: "127.0.0.1", port },
+    },
+  });
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "box/portrait" });
+
+  expect(body["target"]).toMatchObject({ name: "box" });
+  expect(body["workflow"]).toMatchObject({ name: "box/portrait", source: "remote" });
+});
+
+test("a local workflow whose name merely contains a slash is not read as a host", async () => {
+  // `workflows/discover.ts` qualifies a colliding name with its own directory,
+  // so `templates/portrait` is a perfectly ordinary LOCAL handle. Only a prefix
+  // the registry really has is treated as a host.
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({ default: "configured", hosts: { configured: { host: "127.0.0.1", port: configured } } });
+  const second = join(workdir, "templates");
+  mkdirSync(second);
+  writeFileSync(join(second, "portrait.json"), `{"nodes":[],"links":[]}`);
+  writeWorkflow("portrait");
+  process.env.MCP_COMFYUI_WORKFLOW_DIRS = `${roots}:${second}`;
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "templates/portrait" });
+
+  expect(body["workflow"]).toMatchObject({ name: "templates/portrait", source: "local" });
+  expect(body["target"]).toMatchObject({ name: "configured" });
+});
+
+test("launch_comfyui refuses a host on another machine, and spawns nothing", async () => {
+  // The locality gate, through the tool a model can actually reach. Its own
+  // error subclass exists so this is reported as host_not_local rather than
+  // invalid_input: the fix is on the other machine, not in the argument.
+  //
+  // Mutant: make `refuseRemoteTarget` throw a plain LaunchArgumentError. This
+  // test dies on the kind.
+  process.env.MCP_COMFYUI_ALLOW_LAUNCH = "1";
+  writeHosts({ default: "far", hosts: { far: { host: REMOTE_ADDRESS, port: 8189 } } });
+
+  const error = await failure(await connect(), "launch_comfyui", { host: "far" });
+
+  expect(error["kind"]).toBe("host_not_local");
+  expect(error["host"]).toBe(`${REMOTE_ADDRESS}:8189`);
+  expect(String(error["message"])).toContain("--host");
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("launch_comfyui refuses a --listen naming another machine, whatever the host is", async () => {
+  // `launchTarget` reads the address out of the ASSEMBLED argv, so a gate
+  // checking only the configured host would miss the very argument that decides
+  // where the server binds.
+  process.env.MCP_COMFYUI_ALLOW_LAUNCH = "1";
+
+  const error = await failure(await connect(), "launch_comfyui", { listen: REMOTE_ADDRESS });
+
+  expect(error["kind"]).toBe("host_not_local");
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("a host that agrees with the ledger is reported without a contradiction", async () => {
+  const other = serveOtherInstance();
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      other: { host: "127.0.0.1", port: other },
+    },
+  });
+  writeWorkflow("smoke");
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: PROMPT_ID, status: "running" }));
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+  const client = await connect();
+
+  const run = await ok(client, "run_workflow", { workflow: "smoke", host: "other" });
+  const job = await ok(client, "get_job", { prompt_id: run["prompt_id"] as string, host: "other" });
+
+  expect(job["host_source"]).toBe("explicit");
+  // The equality check is what keeps a caller who simply repeated the right
+  // host from being told they disagreed with this server.
+  expect(job["warnings"]).toBeUndefined();
+});
+
+test("the only registered host is used for an unknown job, and said to be an assumption", async () => {
+  // Not a guess between candidates — there is one host — but still an
+  // assumption, because a run can be submitted to a raw address that is in no
+  // registry, and the wrong ComfyUI answers `prompt_not_found` in exactly the
+  // words a job that never existed gets.
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: PROMPT_ID, status: "running" }));
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect(body["host_source"]).toBe("only");
+  expect((body["warnings"] as Record<string, unknown>[])[0]).toMatchObject({ code: "host_assumed" });
+});
+
+test("a decoy address in a REMOTE workflow is refused before anything is spawned", async () => {
+  // The decoy analysis reads the fetched bytes rather than a file, so it still
+  // happens before any temp directory exists. Without it, a remote workflow
+  // would lose the one refusal that stopped a request for "black metal, 60s"
+  // from silently producing 150 seconds of tropical house.
+  //
+  // Mutant: drop the `resolved.contents` arm of `refuseInertInputs`. This test
+  // dies, because `inertInputsOfFile` cannot read `workflows/decoy.json`.
+  const graph = JSON.stringify({
+    nodes: [
+      { id: 3, type: "CLIPTextEncode", inputs: [{ name: "text", widget: { name: "text" }, link: 7 }] },
+      { id: 9, type: "PrimitiveStringMultiline", inputs: [{ name: "value", widget: { name: "value" }, link: null }] },
+    ],
+    links: [[7, 9, 0, 3, 0, "STRING"]],
+  });
+  const port = serveLibraryInstance({ "workflows/decoy.json": graph });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+
+  const error = await failure(await connect(), "run_workflow", {
+    workflow: "box/decoy",
+    inputs: { "3.text": "black metal" },
+  });
+
+  expect(error["kind"]).toBe("inert_slot");
+  const addresses = error["inert_addresses"] as Record<string, unknown>[];
+  expect(addresses[0]).toMatchObject({ address: "3.text" });
+  expect(existsSync(argvOut)).toBe(false);
+  expect(leakedTempDirs()).toEqual([]);
+});

@@ -203,6 +203,50 @@ async function resolveTarget(config: ToolConfig, host: string | undefined): Prom
   return resolveHostRef(await hostRegistry(config), host);
 }
 
+/** The host and the workflow, resolved together — see {@link resolveCallTarget}. */
+interface CallTarget {
+  target: ResolvedHost;
+  /** Whether the host was named, by either argument. Decides how a dead host is reported. */
+  named: boolean;
+}
+
+/**
+ * The host a workflow call meant, taking the workflow handle into account.
+ *
+ * `list_workflows` publishes a remote workflow as `rtx-video/portrait`, and a
+ * handle that carries a host's name reads as self-describing — so a model will
+ * pass it on its own, without repeating `host`. It has to work: otherwise the
+ * call resolves against the *default* host, looks for `rtx-video/portrait` in
+ * that machine's library, and reports a workflow that plainly exists as
+ * missing.
+ *
+ * An explicit `host` still wins, and is what makes the two arguments
+ * composable: `{workflow: "portrait", host: "rtx-video"}` runs a **local**
+ * workflow on that host, which is the ordinary case and must not be confused
+ * with fetching one from it.
+ */
+async function resolveCallTarget(
+  config: ToolConfig,
+  host: string | undefined,
+  workflow: string,
+): Promise<CallTarget> {
+  const registry = await hostRegistry(config);
+  if (host !== undefined) return { target: resolveHostRef(registry, host), named: true };
+
+  const separator = workflow.indexOf("/");
+  if (separator > 0) {
+    const prefix = workflow.slice(0, separator);
+    // Only a name the registry really has. A local workflow can legitimately be
+    // called `templates/portrait` — `workflows/discover.ts` qualifies a
+    // colliding name with its own directory — and that must not be read as a
+    // host.
+    if (registry.hosts.some((entry) => entry.name === prefix)) {
+      return { target: resolveHostRef(registry, prefix), named: true };
+    }
+  }
+  return { target: resolveHostRef(registry, undefined), named: false };
+}
+
 /** The address arguments every CLI-backed call passes through. */
 function address(resolved: ResolvedHost): { host: string; port: number } {
   return { host: resolved.host, port: resolved.port };
@@ -243,13 +287,31 @@ async function decideJobTarget(
  * knew, and `only` means there was exactly one host it could have been.
  */
 function jobTargetBody(decided: JobTarget): Record<string, unknown> {
+  const warnings: Array<Record<string, unknown>> = [];
+  if (decided.source === "only") {
+    // Not a guess between candidates — there is only one host registered — but
+    // it IS an assumption, because a run can be submitted to a raw address that
+    // was never added to the registry. If that job is what is being polled and
+    // the ledger no longer holds it (a restart, or 512 submissions later), this
+    // asks the wrong ComfyUI, and the wrong ComfyUI answers `prompt_not_found`
+    // in exactly the words a job that never existed gets.
+    warnings.push({
+      source: "host",
+      code: "host_assumed",
+      message:
+        `no host was given and this server has no record of this job, so the only registered ` +
+        `host (${decided.target.label}) was used. If the job was submitted to an address that is ` +
+        `not in the registry, pass that address as \`host\`.`,
+    });
+  }
   return {
     target: targetBody(decided.target),
     host_source: decided.source,
     ...(decided.contradiction === null
-      ? {}
+      ? { ...(warnings.length === 0 ? {} : { warnings }) }
       : {
           warnings: [
+            ...warnings,
             {
               source: "host",
               code: "host_contradicts_ledger",
@@ -1141,8 +1203,8 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
     },
     async ({ workflow, host }) =>
       toolAnswer(async () => {
-        const target = await resolveTarget(config, host);
-        const resolved = await resolveWorkflow(workflow, config, target, host !== undefined);
+        const { target, named } = await resolveCallTarget(config, host, workflow);
+        const resolved = await resolveWorkflow(workflow, config, target, named);
         const location = { ...address(target), cacheDir: config.cacheDir };
         // Fetched and cached in one step, then the *path* is handed to the CLI:
         // the join below needs the parsed document, and `slots --input` needs
@@ -1244,8 +1306,8 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
     },
     async ({ workflow, inputs, wait, timeout_seconds, host, fetch_outputs }) =>
       toolAnswer(async () => {
-        const target = await resolveTarget(config, host);
-        const resolved = await resolveWorkflow(workflow, config, target, host !== undefined);
+        const { target, named } = await resolveCallTarget(config, host, workflow);
+        const resolved = await resolveWorkflow(workflow, config, target, named);
         // Before anything else, and independent of the CLI entirely: a decoy
         // address writes its value nowhere ComfyUI reads it, so nothing below
         // this line — no CLI spawn, no launch, no submit — may run for a call

@@ -8,6 +8,13 @@ import {
   resolveArtifactPaths,
   type ArtifactLocation,
 } from "../src/comfy/outputs.ts";
+import type { InterfaceAddresses } from "../src/comfy/target.ts";
+
+/**
+ * This machine, injected everywhere locality is decided, so a result never
+ * depends on which NICs the machine running the suite has.
+ */
+const INTERFACES: InterfaceAddresses = { lo0: [{ address: "127.0.0.1" }, { address: "::1" }] };
 
 /**
  * Turning a `/view` URL back into a file on this machine.
@@ -277,4 +284,39 @@ test("resolveArtifactPaths keys the paths it found by the URL it found them from
 test("nothing to resolve is an empty map, not a missing one", async () => {
   expect(resolveArtifactPaths([], instance)).toEqual({});
   expect(resolveArtifactPaths(classifyOutputs(["/out/a.png"]).urls, instance)).toEqual({});
+});
+
+test("an instance on another machine yields no local paths, whatever its directories say", () => {
+  // The guard that `tools.ts` reaches only sometimes, tested where it always
+  // applies. A remote instance's `outputDirectory` is a path in ITS filesystem;
+  // two Unix boxes sharing a layout would otherwise have this hand back a path
+  // naming a completely different image — and the file below really does exist
+  // here, so nothing but the address check can decline it.
+  //
+  // Mutant: delete the `isLocalAddress` guard at the top of
+  // `resolveArtifactPath`. This test dies. (An earlier version of this suite
+  // pinned the same rule only through `get_job`, which short-circuits on the
+  // resolved host before ever calling this — so the mutant survived.)
+  const outputDir = mkdtempSync(join(tmpdir(), "mcp-comfyui-outputs-local-"));
+  try {
+    writeFileSync(join(outputDir, "shared.png"), "png");
+    const remote = {
+      host: "192.0.2.10",
+      port: 8189,
+      outputDirectory: outputDir,
+      inputDirectory: null,
+    };
+    const url = `http://192.0.2.10:8189/view?filename=shared.png&subfolder=&type=output`;
+
+    expect(resolveArtifactPath(url, remote, INTERFACES)).toBeNull();
+    expect(resolveArtifactPaths([url], remote, INTERFACES)).toEqual({});
+
+    // The identical instance at a LOCAL address resolves, which is what proves
+    // the refusal above is the address and not the path.
+    const local = { ...remote, host: "127.0.0.1", port: 8189 };
+    const localUrl = `http://127.0.0.1:8189/view?filename=shared.png&subfolder=&type=output`;
+    expect(resolveArtifactPath(localUrl, local, INTERFACES)).toBe(join(outputDir, "shared.png"));
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
 });
