@@ -1,6 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { basename, isAbsolute } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 import { z } from "zod";
+import { fetchArtifacts, type FetchedArtifact } from "./comfy/fetchOutputs.ts";
+import { fetchRemoteWorkflow, listRemoteWorkflows } from "./comfy/userdata.ts";
 import {
   detectInstance,
   ensureInstance,
@@ -15,6 +17,7 @@ import {
   type ClassifiedOutputs,
 } from "./comfy/outputs.ts";
 import {
+  cacheRoot,
   getObjectInfo,
   objectInfoCachePath,
   ObjectInfoFetchError,
@@ -42,7 +45,12 @@ import {
 import { recordJobHost, resolveJobTarget, type JobTarget } from "./jobLedger.ts";
 import { InertSlotError, toolAnswer, WorkflowNotFoundError } from "./toolResult.ts";
 import { describeSlots } from "./workflows/describe.ts";
-import { discoverWorkflows, inertInputsOfFile, type InertInput } from "./workflows/discover.ts";
+import {
+  discoverWorkflows,
+  inertInputsOfFile,
+  inertInputsOfText,
+  type InertInput,
+} from "./workflows/discover.ts";
 import { listSlots } from "./workflows/slots.ts";
 import { runWorkflow, type EffectiveParameter, type WorkflowRun } from "./workflows/run.ts";
 import { applySlots, type SlotInputs } from "./workflows/setSlots.ts";
@@ -291,7 +299,15 @@ async function ensureRunning(config: ToolConfig, resolved: ResolvedHost) {
 interface ResolvedWorkflow {
   /** The handle `list_workflows` reports, or the file's stem for a raw path. */
   name: string;
+  /** A file on this machine, or — for a remote — its path in that instance's own library. */
   path: string;
+  source: "local" | "remote";
+  /**
+   * A remote workflow's exact bytes, fetched once and handed to `applySlots`
+   * verbatim. Absent for a local workflow, which is byte-copied from disk
+   * instead. Never parsed, in either case (landmine #1).
+   */
+  contents?: Uint8Array;
 }
 
 /**
@@ -314,21 +330,134 @@ interface ResolvedWorkflow {
  * the caller chose and nothing they can see, so it falls through and is reported
  * as an unknown name — with the names that would have worked.
  */
-async function resolveWorkflow(handle: string, config: ToolConfig): Promise<ResolvedWorkflow> {
+async function resolveWorkflow(
+  handle: string,
+  config: ToolConfig,
+  target: ResolvedHost,
+): Promise<ResolvedWorkflow> {
   const { workflows } = await discoverWorkflows({ env: config.env });
 
   const named = workflows.find((workflow) => workflow.name === handle);
-  if (named !== undefined) return { name: named.name, path: named.path };
+  if (named !== undefined) return { name: named.name, path: named.path, source: "local" };
 
   const located = workflows.find((workflow) => workflow.path === handle);
-  if (located !== undefined) return { name: located.name, path: located.path };
+  if (located !== undefined) return { name: located.name, path: located.path, source: "local" };
 
-  if (isAbsolute(handle)) return { name: basename(handle, ".json"), path: handle };
+  // Only now, and only for a handle no local file answers to. Running a file
+  // from the local library **on** another host is the ordinary case — that is
+  // what `host` is for — so the local library is searched first, and this
+  // costs a round trip only for a name it did not have.
+  if (!isAbsolute(handle)) {
+    const remote = await resolveRemoteWorkflow(handle, target);
+    if (remote !== null) return remote;
+  }
+
+  if (isAbsolute(handle)) return { name: basename(handle, ".json"), path: handle, source: "local" };
 
   throw new WorkflowNotFoundError(
     handle,
     workflows.map((workflow) => workflow.name),
   );
+}
+
+/**
+ * The same handle against the target host's own saved workflows.
+ *
+ * Three spellings are accepted, for the same reason `resolveWorkflow` accepts
+ * both a name and a path: the qualified handle `list_workflows` publishes
+ * (`rtx-video/portrait`), the bare stem, and the relative path the instance
+ * itself reports (`workflows/portrait.json`). The qualified form is the one to
+ * prefer and the only one that cannot collide.
+ *
+ * Returns `null` rather than throwing when the host has no such workflow, so
+ * the caller reports one `workflow_not_found` naming the local library rather
+ * than two different errors for the same mistake. A host that could not be
+ * *asked* is different and does throw — that is a fact about the host, not
+ * about the handle.
+ */
+async function resolveRemoteWorkflow(
+  handle: string,
+  target: ResolvedHost,
+): Promise<ResolvedWorkflow | null> {
+  const workflows = await listRemoteWorkflows(address(target));
+  if (workflows.length === 0) return null;
+
+  const prefix = `${target.label}/`;
+  const wanted = handle.startsWith(prefix) ? handle.slice(prefix.length) : handle;
+  const found =
+    workflows.find((workflow) => workflow.path === wanted) ??
+    workflows.find((workflow) => workflow.stem === wanted);
+  if (found === undefined) return null;
+
+  return {
+    name: `${target.label}/${found.stem}`,
+    path: found.path,
+    source: "remote",
+    contents: await fetchRemoteWorkflow(found.path, address(target)),
+  };
+}
+
+/**
+ * A workflow as a file `comfy` can be pointed at, whether it came from this
+ * machine or from the host's own library.
+ *
+ * `applySlots` with no inputs is exactly this primitive already: it makes the
+ * private copy and spawns nothing (`set-slot` requires at least one
+ * `ADDR=VALUE`, so calling it with none would be a Typer usage error). Reusing
+ * it here rather than writing a second temp-file dance is what keeps one
+ * answer to "where do prepared copies live and who deletes them".
+ *
+ * **The caller owns the result's `dispose`.**
+ */
+function stageWorkflow(resolved: ResolvedWorkflow) {
+  return applySlots(resolved.path, {}, { contents: resolved.contents });
+}
+
+/**
+ * One host's own saved workflows, in `list_workflows`'s shape.
+ *
+ * A host that cannot be reached degrades to a `problem` rather than failing the
+ * call, which is `workflows/discover.ts`'s promise applied one layer out: a
+ * listing is all-or-nothing to its caller, and denying somebody their 27 local
+ * workflows because a remote box is asleep is the wrong trade. An **unknown
+ * host name** is a different thing and does throw — that is the caller's own
+ * argument being wrong, and silently listing nothing for it would look like a
+ * host with no workflows.
+ */
+async function remoteWorkflows(
+  config: ToolConfig,
+  host: string,
+): Promise<{
+  target: ResolvedHost;
+  workflows: Record<string, unknown>[];
+  problem?: { host: string; reason: string };
+}> {
+  const target = await resolveTarget(config, host);
+  try {
+    const found = await listRemoteWorkflows(address(target));
+    return {
+      target,
+      workflows: found.map((workflow) => ({
+        name: `${target.label}/${workflow.stem}`,
+        path: workflow.path,
+        source: `remote:${target.label}`,
+        // Deciding this means downloading the file, and a listing of 27 would
+        // mean 27 downloads to answer a question describe_workflow answers for
+        // the one workflow anybody actually wants.
+        format: "unknown",
+        node_count: null,
+        has_subgraphs: null,
+        size_bytes: workflow.sizeBytes,
+        modified: workflow.modified,
+      })),
+    };
+  } catch (err) {
+    return {
+      target,
+      workflows: [],
+      problem: { host: target.label, reason: err instanceof Error ? err.message : String(err) },
+    };
+  }
 }
 
 /**
@@ -346,7 +475,13 @@ async function refuseInertInputs(resolved: ResolvedWorkflow, inputs: SlotInputs 
   const addresses = Object.keys(inputs ?? {});
   if (addresses.length === 0) return;
 
-  const inertInputs = await inertInputsOfFile(resolved.path);
+  // A remote workflow is analysed from the bytes already in hand rather than
+  // from a file, which keeps this refusal where it belongs: before anything is
+  // spawned and before any temp directory exists.
+  const inertInputs =
+    resolved.contents === undefined
+      ? await inertInputsOfFile(resolved.path)
+      : inertInputsOfText(new TextDecoder().decode(resolved.contents));
   if (inertInputs.size === 0) return;
 
   const offending: InertInput[] = [];
@@ -422,13 +557,59 @@ function instanceBody(instance: RunningInstance): Record<string, unknown> {
 function outputsBody(
   outputs: ClassifiedOutputs,
   instance: ArtifactLocation | null,
+  fetched: FetchedArtifact[] | null = null,
 ): Record<string, unknown> {
   return {
     files: outputs.files,
     urls: outputs.urls,
     local_paths: instance === null ? {} : resolveArtifactPaths(outputs.urls, instance),
+    // Absent unless it was asked for, so an empty `fetched` always means "asked
+    // for, and none came across" rather than "never attempted".
+    ...(fetched === null
+      ? {}
+      : {
+          fetched: Object.fromEntries(
+            fetched.filter((one) => one.path !== null).map((one) => [one.url, one.path]),
+          ),
+          fetch_problems: fetched
+            .filter((one) => one.problem !== null)
+            .map((one) => ({ url: one.url, problem: one.problem })),
+        }),
   };
 }
+
+/**
+ * Copy a run's artifacts here, when the caller asked and there is anything to
+ * copy.
+ *
+ * Per `prompt_id`, under this server's own cache directory, so two runs cannot
+ * overwrite each other's files even when ComfyUI reuses a filename — which it
+ * does, because its counter restarts per output-node prefix.
+ */
+async function fetchIfAsked(
+  urls: readonly string[],
+  promptId: string | null,
+  config: ToolConfig,
+  wanted: boolean,
+): Promise<FetchedArtifact[] | null> {
+  if (!wanted) return null;
+  if (urls.length === 0 || promptId === null) return [];
+  return await fetchArtifacts(urls, {
+    destination: join(cacheRoot(config.cacheDir), "fetched", promptId),
+  });
+}
+
+/** The parameter both artifact-returning tools take, worded once. */
+const fetchOutputsArgument = z
+  .boolean()
+  .default(false)
+  .describe(
+    "Download the run's artifacts to this machine and report where they landed, under " +
+      "`outputs.fetched`. Off by default, and deliberately: a run on this machine already has " +
+      "its files here (`outputs.local_paths`), and a video workflow's outputs can be hundreds of " +
+      "megabytes to copy across a network. Turn it on for a run on another host whose images you " +
+      "actually want to open.",
+  );
 
 /**
  * The instance whose directories can turn a job's `/view` URLs into paths, or
@@ -454,14 +635,18 @@ async function resolvingInstance(
   return detection.running ? detection : null;
 }
 
-function jobBody(job: JobStatus, instance: ArtifactLocation | null): Record<string, unknown> {
+function jobBody(
+  job: JobStatus,
+  instance: ArtifactLocation | null,
+  fetched: FetchedArtifact[] | null,
+): Record<string, unknown> {
   return {
     prompt_id: job.promptId,
     status: job.status,
     terminal: job.terminal,
     queue_position: job.queuePosition,
     workflow_size: job.workflowSize,
-    outputs: outputsBody(job.outputs, instance),
+    outputs: outputsBody(job.outputs, instance, fetched),
     error: job.error,
     host: job.host,
     port: job.port,
@@ -541,15 +726,16 @@ function runBody(
   setSlotWarnings: Array<Record<string, unknown>>,
   run: WorkflowRun,
   instance: ArtifactLocation,
+  fetched: FetchedArtifact[] | null,
 ): Record<string, unknown> {
   const body: Record<string, unknown> = {
-    workflow: { name: workflow.name, path: workflow.path },
+    workflow: { name: workflow.name, path: workflow.path, source: workflow.source },
     status: run.status,
     terminal: run.terminal,
     prompt_id: run.promptId,
     applied,
     effective_parameters: run.effectiveParameters,
-    outputs: outputsBody(run.outputs, instance),
+    outputs: outputsBody(run.outputs, instance, fetched),
     warnings: [
       ...setSlotWarnings.map((warning) => ({ source: "set_slot", ...warning })),
       ...run.warnings.map((warning) => ({ source: "run", ...warning })),
@@ -864,20 +1050,36 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "informational only — it does not block describing or running a workflow — and means its " +
         "settable addresses may run deeper than the usual `<id>.<name>`, e.g. `52/6.text`; " +
         "describe_workflow's `inert` list is what actually says which addresses on it are decoys. " +
-        "Set MCP_COMFYUI_WORKFLOW_DIRS (colon-separated, like PATH) to change the directories scanned.",
-      inputSchema: {},
+        "Set MCP_COMFYUI_WORKFLOW_DIRS (colon-separated, like PATH) to change the directories scanned. " +
+        "Pass `host` to ALSO list that ComfyUI's own saved workflows, over its HTTP API. Those " +
+        "entries are tagged `source: \"remote:<host>\"`, their `name` is qualified with the host " +
+        "(`rtx-video/portrait`), and their `format` is `\"unknown\"` because deciding it means " +
+        "downloading the file — describe_workflow will say if one is not a frontend graph. Every " +
+        "local entry is tagged `source: \"local\"` and can be run on any host; the local library " +
+        "and each host's own files are two separate places, and both are usable.",
+      inputSchema: { host: hostArgument },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
-    async () =>
+    async ({ host }) =>
       toolAnswer(async () => {
         const listing = await discoverWorkflows({ env: config.env });
+        const local = listing.workflows.map((workflow) => ({ ...workflow, source: "local" }));
+
+        // Only when a host was named. Without one this lists exactly what it
+        // always listed — and the default host is usually this machine, whose
+        // workflows directory is very likely already a configured root, so
+        // fetching it unasked would report most of the library twice.
+        const remote = host === undefined ? null : await remoteWorkflows(config, host);
+
         return {
-          count: listing.workflows.length,
+          count: local.length + (remote?.workflows.length ?? 0),
           // Named even on a successful listing: an empty result is otherwise
           // indistinguishable from a directory nobody configured.
           roots: workflowRoots(config.env),
-          workflows: listing.workflows,
+          ...(remote === null ? {} : { host: targetBody(remote.target) }),
+          workflows: [...local, ...(remote?.workflows ?? [])],
           unreadable: listing.unreadable,
+          ...(remote?.problem === undefined ? {} : { remote_unreadable: remote.problem }),
         };
       }),
   );
@@ -918,30 +1120,41 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
     async ({ workflow, host }) =>
       toolAnswer(async () => {
         const target = await resolveTarget(config, host);
-        const resolved = await resolveWorkflow(workflow, config);
+        const resolved = await resolveWorkflow(workflow, config, target);
         const location = { ...address(target), cacheDir: config.cacheDir };
         // Fetched and cached in one step, then the *path* is handed to the CLI:
         // the join below needs the parsed document, and `slots --input` needs
         // the file (landmine #7). Reading it twice would cost a second 1.7MB.
         const objectInfo = await withObjectInfo(location, config, target);
-        const listing = await listSlots(resolved.path, {
-          ...address(target),
-          objectInfoPath: objectInfoCachePath(location),
-        });
-        // A THIRD read of the same file, independent of the CLI entirely: the
-        // decoy analysis is pure JS over the raw graph, and `listSlots` never
-        // sees the link topology that decides it.
-        const inertInputs = await inertInputsOfFile(resolved.path);
-        const described = describeSlots(listing.slots, objectInfo, inertInputs);
 
-        return {
-          target: targetBody(target),
-          workflow: { name: resolved.name, path: resolved.path },
-          slot_count: listing.count,
-          schema: described.schema,
-          unresolved: described.unresolved,
-          inert: described.inert,
-        };
+        // A workflow that lives on the host has to become a file before the CLI
+        // can read it. A local one already is one, and is deliberately not
+        // copied: describing is the tool that works with ComfyUI stopped, and
+        // it should not start writing temp directories to do it.
+        const staged = resolved.source === "remote" ? await stageWorkflow(resolved) : null;
+        try {
+          const file = staged?.path ?? resolved.path;
+          const listing = await listSlots(file, {
+            ...address(target),
+            objectInfoPath: objectInfoCachePath(location),
+          });
+          // A THIRD read of the same file, independent of the CLI entirely: the
+          // decoy analysis is pure JS over the raw graph, and `listSlots` never
+          // sees the link topology that decides it.
+          const inertInputs = await inertInputsOfFile(file);
+          const described = describeSlots(listing.slots, objectInfo, inertInputs);
+
+          return {
+            target: targetBody(target),
+            workflow: { name: resolved.name, path: resolved.path, source: resolved.source },
+            slot_count: listing.count,
+            schema: described.schema,
+            unresolved: described.unresolved,
+            inert: described.inert,
+          };
+        } finally {
+          staged?.dispose();
+        }
       }),
   );
 
@@ -979,6 +1192,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
       inputSchema: {
         workflow: workflowArgument,
         host: hostArgument,
+        fetch_outputs: fetchOutputsArgument,
         inputs: inputsArgument.optional(),
         wait: z
           .boolean()
@@ -1006,10 +1220,10 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         openWorldHint: true,
       },
     },
-    async ({ workflow, inputs, wait, timeout_seconds, host }) =>
+    async ({ workflow, inputs, wait, timeout_seconds, host, fetch_outputs }) =>
       toolAnswer(async () => {
         const target = await resolveTarget(config, host);
-        const resolved = await resolveWorkflow(workflow, config);
+        const resolved = await resolveWorkflow(workflow, config, target);
         // Before anything else, and independent of the CLI entirely: a decoy
         // address writes its value nowhere ComfyUI reads it, so nothing below
         // this line — no CLI spawn, no launch, no submit — may run for a call
@@ -1040,11 +1254,15 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // workflow's own widget layout, which `workflow slots` reports no
         // matter which schema source resolved it. See `resolveSlotTypes` for
         // why this is skipped on the ordinary path.
-        const slotTypes = await resolveSlotTypes(
-          resolved.path,
-          inputs as SlotInputs | undefined,
-          address(target),
-        );
+        // Skipped for a remote workflow: `workflow slots` reads a *file*, and
+        // the only file this workflow will ever have is the prepared copy
+        // `applySlots` is about to make — which does not exist yet. The cost is
+        // one call's worth of finding 1's improvement, and `applySlots` already
+        // treats an unknown slot type exactly as it always did.
+        const slotTypes =
+          resolved.source === "remote"
+            ? {}
+            : await resolveSlotTypes(resolved.path, inputs as SlotInputs | undefined, address(target));
 
         // A run needs a live server whatever happens, so `set-slot` is pointed
         // at the same server rather than at the offline cache: making the edit
@@ -1053,6 +1271,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         const prepared = await applySlots(resolved.path, (inputs ?? {}) as SlotInputs, {
           ...address(target),
           slotTypes,
+          contents: resolved.contents,
         });
         // Nothing may go between here and the call below. `runWorkflow` takes
         // ownership of the prepared copy and removes it in a `finally` on every
@@ -1075,7 +1294,11 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // exists to prevent.
         if (run.promptId !== null) recordJobHost(run.promptId, target);
 
-        return { target: targetBody(target), ...runBody(resolved, prepared.applied, prepared.warnings, run, instance) };
+        const fetched = await fetchIfAsked(run.outputs.urls, run.promptId, config, fetch_outputs);
+        return {
+          target: targetBody(target),
+          ...runBody(resolved, prepared.applied, prepared.warnings, run, instance, fetched),
+        };
       }),
   );
 
@@ -1097,16 +1320,21 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "Asking the WRONG ComfyUI about a real job answers `prompt_not_found`, exactly as an id " +
         "that never existed does, so a job that seems to have vanished is worth re-checking " +
         "against the right host before believing it is gone.",
-      inputSchema: { prompt_id: promptIdArgument, host: hostArgument },
+      inputSchema: {
+        prompt_id: promptIdArgument,
+        host: hostArgument,
+        fetch_outputs: fetchOutputsArgument,
+      },
       annotations: { readOnlyHint: true, openWorldHint: true },
     },
-    async ({ prompt_id, host }) =>
+    async ({ prompt_id, host, fetch_outputs }) =>
       toolAnswer(async () => {
         const decided = await decideJobTarget(config, prompt_id, host);
         const job = await getJobStatus(prompt_id, address(decided.target));
+        const fetched = await fetchIfAsked(job.outputs.urls, job.promptId, config, fetch_outputs);
         return {
           ...jobTargetBody(decided),
-          ...jobBody(job, await resolvingInstance(job.outputs.urls, decided.target)),
+          ...jobBody(job, await resolvingInstance(job.outputs.urls, decided.target), fetched),
         };
       }),
   );

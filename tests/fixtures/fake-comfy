@@ -22,6 +22,9 @@
 #   $FAKE_COMFY_STDERR         run_stream: one line of human chatter for stderr
 #   $FAKE_COMFY_EXIT           run_stream: exit code to end with (default 0)
 #   $FAKE_COMFY_HANG          run_stream: block after the stream instead of exiting
+#   $FAKE_COMFY_WORKFLOW_COPY  run_capture: file the workflow named by --workflow is
+#                              copied to, so a test can assert on the exact bytes that
+#                              reached `comfy run`
 #   $FAKE_COMFY_ARGV_LOG       jobs: file each invocation's argv is APPENDED to,
 #                              because one cancel makes two calls and
 #                              $FAKE_COMFY_ARGV_OUT only ever holds the last
@@ -170,6 +173,26 @@ case "$FAKE_COMFY_MODE" in
     # runs out, and the only way to test what is recoverable from a partial
     # stream. exec so the sleeper keeps this pid.
     [ -n "$FAKE_COMFY_HANG" ] && exec sleep 30
+    exit "${FAKE_COMFY_EXIT:-0}" ;;
+  run_capture)
+    # `comfy run --json`, plus a copy of the graph it was handed.
+    #
+    # A NEW mode rather than a switch inside run_stream, because modes here are
+    # append-only: every test written against run_stream must keep behaving
+    # exactly as it did. What this adds is the only way to assert on the bytes
+    # that actually reached the CLI — which is what pins landmine #1 for a
+    # workflow fetched over HTTP, where there is no local file to compare
+    # against afterwards (the prepared copy is deleted when the run returns).
+    take=0
+    for arg in "$@"; do
+      if [ "$take" = 1 ]; then
+        [ -n "$FAKE_COMFY_WORKFLOW_COPY" ] && cp "$arg" "$FAKE_COMFY_WORKFLOW_COPY"
+        break
+      fi
+      [ "$arg" = "--workflow" ] && take=1
+    done
+    [ -n "$FAKE_COMFY_STREAM_FILE" ] && cat "$FAKE_COMFY_STREAM_FILE"
+    [ -n "$FAKE_COMFY_STDERR" ] && printf '%s\n' "$FAKE_COMFY_STDERR" >&2
     exit "${FAKE_COMFY_EXIT:-0}" ;;
   jobs)
     # `comfy jobs`, dispatching on the subcommand: one cancel makes two calls
