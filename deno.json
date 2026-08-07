@@ -1,17 +1,20 @@
 {
   "name": "@tuesdaycrowd/mcp-comfyui",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "license": "Unlicense",
   "exports": "./src/index.ts",
   "imports": {
-    "@modelcontextprotocol/sdk/": "npm:@modelcontextprotocol/sdk@1.30.0/",
+    "@modelcontextprotocol/sdk": "npm:@modelcontextprotocol/sdk@1.30.0",
     "zod": "npm:zod@4.4.3",
     "@std/testing/bdd": "jsr:@std/testing@1.0.20/bdd",
     "@std/expect": "jsr:@std/expect@1.0.20",
-    "@std/async/delay": "jsr:@std/async@1.5.0/delay"
+    "@std/async/delay": "jsr:@std/async@1.5.0/delay",
+    "typescript": "npm:typescript@^7.0.2",
+    "@types/node": "npm:@types/node@^26.1.2"
   },
   "tasks": {
     "test": "deno test --no-check --allow-read --allow-write --allow-env --allow-run --allow-sys=networkInterfaces,homedir --allow-net=127.0.0.1,[::1],192.0.2.1 tests/",
+    "test:one": "deno test --no-check --allow-read --allow-write --allow-env --allow-run --allow-sys=networkInterfaces,homedir --allow-net=127.0.0.1,[::1],192.0.2.1",
     "build": "node scripts/build.mjs",
     "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
     "compile": "deno compile --no-check --node-modules-dir=none --exclude-unused-npm --allow-read --allow-write --allow-env --allow-run --allow-sys=networkInterfaces,homedir --allow-net --output dist/mcp-comfyui src/index.ts"

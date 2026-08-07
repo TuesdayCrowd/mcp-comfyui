@@ -47,7 +47,13 @@ Nothing to clone, nothing to build. Verify Claude can see it:
 claude mcp list
 ```
 
-Deno needs all five permissions — it spawns `comfy`, reads workflow files, writes temp copies, talks to `127.0.0.1:8188`, and reads its configuration — so `-A` is the practical form. The long spelling is `--allow-run --allow-read --allow-write --allow-net --allow-env`.
+Deno needs every permission — it spawns `comfy`, reads workflow files, writes temp copies, talks to ComfyUI over HTTP, reads its configuration, and asks the OS for your home directory and this machine's own interface addresses — so `-A` is the practical form. The long spelling is:
+
+```
+--allow-run --allow-read --allow-write --allow-net --allow-env --allow-sys=homedir,networkInterfaces
+```
+
+`--allow-sys` is easy to leave off and fails late: `homedir` is how the config and cache directories are found, and `networkInterfaces` is how the server decides whether an address is this machine's before it will start ComfyUI for it. Without it the first call that needs either one fails with `NotCapable`.
 
 ### Node and Bun
 
@@ -156,6 +162,8 @@ These don't degrade gracefully; they don't exist.
 
 Every artifact appears exactly once in `files` or `urls`. For a URL, look it up in `local_paths`: the value is an absolute path to a file that existed when the answer was built, and **no key means there is no local path** — fetch the URL instead. The path is never guessed; the file must exist and must lie inside its output root.
 
+A run on another machine never has a local path, whatever its output directory is called — that directory is on *that* machine. Pass `fetch_outputs: true` to `run_workflow` or `get_job` to copy the artifacts here; they land under `MCP_COMFYUI_CACHE_DIR` per `prompt_id`, and come back under `outputs.fetched`.
+
 ## Tools
 
 | Tool | Read-only | What it does |
@@ -170,7 +178,7 @@ Every artifact appears exactly once in `files` or `urls`. For a URL, look it up 
 | `manage_hosts` | | Add, change, remove or repair entries in the host registry |
 | `launch_comfyui` | | Start ComfyUI with explicit flags — only when `MCP_COMFYUI_ALLOW_LAUNCH=1` |
 
-Every tool above except `list_hosts` and `manage_hosts` takes an optional `host`; omitting it uses the default.
+Every tool above except `list_hosts` and `manage_hosts` takes an optional `host` saying which ComfyUI to use; omitting it uses the default. (`manage_hosts` has a `host` field too, but it means the *address to record* for the entry being written, not which instance to talk to — it talks to none.)
 
 The intended order is `list_workflows` → `describe_workflow` → `run_workflow`. Inputs are keyed by slot address (`3.seed`, `6.text`), which `describe_workflow` gives you.
 
@@ -184,22 +192,31 @@ Three decisions that are not obvious and are load-bearing.
 
 The same problem recurs on the way back: `comfy run --json` echoes the whole graph as a `prompt_preview` event on every run. The server drops it during decode.
 
-**It starts ComfyUI when one is needed, and never starts a second.** A tool that needs a live server detects first; if nothing answers it launches one, and if anything is already answering — on the detection target *or* on the address the startup arguments name — it uses that instead. Concurrent calls arriving while ComfyUI is down share a single launch, because what a second launch collides with is the machine's accelerator and its shared model directory, and those are singular however many addresses are involved.
+**It starts ComfyUI when one is needed, never starts a second at the same address, and never starts one for another machine.** A tool that needs a live server detects first; if nothing answers it launches one, and if anything is already answering at the address the startup arguments name, it uses that instead. Concurrent calls for the *same* address share one launch — they are one piece of work — while two calls for two different addresses are both legitimate and both proceed. A launch that goes ahead alongside an instance elsewhere says so in `warnings`, because the two do compete for the machine's accelerator and its shared model directory.
+
+An address that is not on this machine is refused outright. `comfy launch` has no `--host`: it starts ComfyUI wherever `comfy` runs, so a remote address could never have been satisfied by launching here.
 
 **Every registry from the CLI is an open string.** Error codes, slot types, job statuses, run event types. Upstream documents its error codes as append-only, and its *published* schemas are already behind its own source — `comfy jobs`' status enum omits `cancelled`, which the CLI demonstrably emits, and the run-event enum omits `converted` and `prompt_preview`. A server that closes those enums breaks on the next release.
 
 ## Development
 
 ```bash
-deno task test                        # full suite
-deno test tests/describe.test.ts      # one file
-deno task typecheck
-deno task build
+deno task test                              # full suite
+deno task test:one tests/describe.test.ts   # one file
+deno task typecheck                         # tsc --noEmit, under node
+deno task build                             # -> dist/index.js
 ```
+
+`test:one` exists because a bare `deno test <file>` type-checks by default, and
+Deno bundles a TypeScript a full major behind this project's own — enough to
+reject `import.meta.dirname` and the MCP SDK's handler signatures with errors
+that `deno task typecheck` (the authoritative gate, `tsc` under `node`) does not
+produce. Both tasks pass the same permissions, so a single file behaves exactly
+as it does in the suite.
 
 Tests never contact a real ComfyUI and never invoke the real `comfy`. The CLI is faked by `tests/fixtures/fake-comfy`, a dependency-free POSIX `sh` script driven by `$FAKE_COMFY_MODE`; HTTP is faked with `Deno.serve({port: 0})`.
 
-Fixtures under `tests/fixtures/` are real captures from a live ComfyUI 0.29.0, not hand-written approximations — including `slots.6key.json`, a 210-slot listing from a 122KB video workflow, and comfy-cli's own published JSON Schemas.
+Fixtures under `tests/fixtures/` are real captures from a live ComfyUI (0.29.0, and 0.30.2 for the userdata API), not hand-written approximations — including `slots.6key.json`, a 210-slot listing from a 122KB video workflow, and comfy-cli's own published JSON Schemas.
 
 `tests/fixtures/workflow.smoke.json` is an `EmptyImage` → `SaveImage` graph that needs no checkpoint, for end-to-end verification on any install.
 

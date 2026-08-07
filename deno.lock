@@ -708,15 +708,9 @@
       "jsr:@std/expect@1.0.20",
       "jsr:@std/testing@1.0.20",
       "npm:@modelcontextprotocol/sdk@1.30.0",
+      "npm:@types/node@^26.1.2",
+      "npm:typescript@^7.0.2",
       "npm:zod@4.4.3"
-    ],
-    "packageJson": {
-      "dependencies": [
-        "npm:@modelcontextprotocol/sdk@1.30.0",
-        "npm:@types/node@^26.1.2",
-        "npm:typescript@^7.0.2",
-        "npm:zod@4.4.3"
-      ]
-    }
+    ]
   }
 }
