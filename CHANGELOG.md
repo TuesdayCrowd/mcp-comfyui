@@ -4,6 +4,22 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The publish workflow type-checked with the wrong TypeScript.** `npx jsr
+  publish` downloads its own Deno rather than the version `setup-deno` pins, so
+  the publish step's type-check ran on whichever TypeScript that download
+  carried — and Deno's bundled TypeScript has a known false-positive gap
+  against this project's `@modelcontextprotocol/sdk` + zod 4 combination,
+  reporting the SDK's own handler parameters as implicit `any`. 0.5.0 published
+  cleanly and 0.6.0 failed with 21 of them, on the same class of code. The step
+  now passes `--no-check`, which is the decision `deno task test` already makes
+  for the same measured reason; `deno task typecheck` — `tsc` on this project's
+  own TypeScript, zero errors — runs first in the same job and remains the
+  authoritative gate.
+
 ## [0.6.0] — 2026-08-07
 
 ### Added

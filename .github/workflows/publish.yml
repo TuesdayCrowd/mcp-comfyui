@@ -43,7 +43,23 @@ jobs:
       - name: Typecheck
         run: deno task typecheck
 
+      # `--no-check` is the same decision the Test step above already makes, for
+      # the same measured reason: `deno check` has a known false-positive gap
+      # against this project's @modelcontextprotocol/sdk + zod 4 combination —
+      # it reports the SDK's own `registerTool` handler parameters as implicit
+      # `any` (TS7006/TS7031) — while `tsc`, running on this project's own
+      # TypeScript one step above, passes with zero errors. That step is the
+      # authoritative gate and it runs first, in this same job, so nothing is
+      # published without a real type-check having passed.
+      #
+      # Not merely tidiness: `npx jsr publish` downloads its OWN Deno rather
+      # than using the version pinned above, so leaving the check on made an
+      # irreversible step depend on whichever TypeScript that download happened
+      # to carry. 0.5.0 published cleanly and 0.6.0 did not, on the same class
+      # of code. `jsr publish` does not list this flag in `--help`; it passes
+      # through to `deno publish`, verified locally against this repo.
+      #
       # `jsr publish` is a no-op when deno.json's version is already published,
       # so pushing to main without bumping the version is safe and silent.
       - name: Publish to JSR
-        run: npx jsr publish
+        run: npx jsr publish --no-check
