@@ -6,9 +6,18 @@ import {
   LaunchArgumentError,
   LaunchFailedError,
   LaunchTimeoutError,
+  RemoteLaunchRefusedError,
 } from "./comfy/instance.ts";
 import { JobPayloadError } from "./comfy/jobs.ts";
 import { ObjectInfoCacheWriteError, ObjectInfoFetchError } from "./comfy/objectInfo.ts";
+import { UserdataError } from "./comfy/userdata.ts";
+import {
+  HostNotLocalError,
+  RegistryInvalidError,
+  RemoteHostUnavailableError,
+  UnknownHostError,
+} from "./hosts.ts";
+import { JobHostUnknownError } from "./jobLedger.ts";
 import type { InertUpstream } from "./workflows/discover.ts";
 import { RunContractError, RunFailedError, type RunEvent } from "./workflows/run.ts";
 import { SetSlotContractError, SlotValueError, WorkflowFileError } from "./workflows/setSlots.ts";
@@ -100,6 +109,24 @@ export type ToolErrorKind =
    * fix is a configuration choice or a hand-started ComfyUI, not a retry.
    */
   | "comfyui_not_running"
+  /** No host by that name. Carries the names that would have worked. */
+  | "unknown_host"
+  /**
+   * A host on another machine is not answering. Distinct from
+   * `comfyui_not_running`, whose message offers the two fixes an operator of a
+   * *local* instance has; neither applies to a box that is asleep elsewhere.
+   */
+  | "host_unreachable"
+  /**
+   * Something only a local address can do was asked of a remote one — a launch,
+   * or `auto_launch` in the registry. Not `invalid_input`: the argument is a
+   * perfectly good address, and the fix is on the other machine.
+   */
+  | "host_not_local"
+  /** The host registry could not be read, and a named host needed it. */
+  | "registry_invalid"
+  /** Which ComfyUI a job is on could not be established, and guessing is worse. */
+  | "job_host_unknown"
   /** A fault in this server. Reported as such rather than blamed on the caller. */
   | "internal_error";
 
@@ -142,6 +169,17 @@ export interface ToolErrorBody {
   cache_path?: string;
   /** `object_info_unavailable`: the HTTP status, where the request got one. */
   status?: number | null;
+  /** `unknown_host`, `job_host_unknown`: every host name that would have worked. */
+  known_hosts?: string[];
+  /** `unknown_host`, `registry_invalid`: the registry file, so it can be opened. */
+  registry_path?: string;
+  /** `registry_invalid`: where the parse gave up, when the runtime said. */
+  line?: number | null;
+  column?: number | null;
+  /** `host_not_local`, `host_unreachable`: the address or host name at fault. */
+  host?: string;
+  /** `job_host_unknown`: the job nobody could place. */
+  prompt_id?: string;
   /** `internal_error`: the constructor name, since the kind cannot say. */
   error_name?: string;
 }
@@ -177,6 +215,20 @@ export class WorkflowNotFoundError extends Error {
     );
     this.known = known;
   }
+}
+
+/**
+ * An argument this layer could not use, where the schema could not have said
+ * so.
+ *
+ * `manage_hosts` is the case: `name` is required for four of its five actions
+ * and `host` for one, and expressing that in the schema would mean a
+ * discriminated union of five shapes — harder for a model to fill in than one
+ * flat object, in exchange for a check whose message can simply name the
+ * missing field.
+ */
+export class ToolArgumentError extends Error {
+  override readonly name = "ToolArgumentError";
 }
 
 /** One address `run_workflow` refused, and what actually supplies its value. */
@@ -333,8 +385,46 @@ export function describeError(err: unknown): ToolErrorBody {
   if (err instanceof SlotValueError) {
     return { kind: "invalid_input", message: err.message, address: err.address };
   }
-  if (err instanceof LaunchArgumentError) {
+  // Before LaunchArgumentError, which it subclasses. The distinction is the
+  // whole point: one says "correct this argument", the other says "that machine
+  // is not this one, and no argument here can change that".
+  if (err instanceof RemoteLaunchRefusedError) {
+    return { kind: "host_not_local", message: err.message, host: err.address };
+  }
+  if (err instanceof LaunchArgumentError || err instanceof ToolArgumentError) {
     return { kind: "invalid_input", message: err.message };
+  }
+
+  if (err instanceof UnknownHostError) {
+    return {
+      kind: "unknown_host",
+      message: err.message,
+      known_hosts: err.known,
+      registry_path: err.registryPath,
+    };
+  }
+  if (err instanceof RegistryInvalidError) {
+    return {
+      kind: "registry_invalid",
+      message: err.message,
+      registry_path: err.registryPath,
+      line: err.problem.line,
+      column: err.problem.column,
+    };
+  }
+  if (err instanceof HostNotLocalError) {
+    return { kind: "host_not_local", message: err.message, host: err.address };
+  }
+  if (err instanceof RemoteHostUnavailableError) {
+    return { kind: "host_unreachable", message: err.message, url: err.url, host: err.host };
+  }
+  if (err instanceof JobHostUnknownError) {
+    return {
+      kind: "job_host_unknown",
+      message: err.message,
+      prompt_id: err.promptId,
+      known_hosts: err.candidates,
+    };
   }
   if (err instanceof WorkflowNotFoundError) {
     return { kind: "workflow_not_found", message: err.message, known_workflows: err.known };
@@ -351,6 +441,20 @@ export function describeError(err: unknown): ToolErrorBody {
       code: present(err.code),
       workflow_path: err.workflowPath,
     };
+  }
+
+  // A remote instance's own workflow library. Three different failures wear one
+  // type here because the operator's question is the same — which instance, and
+  // what did it say — and `status` is what tells them apart: nothing answered,
+  // the file is not there, or it answered with something unusable.
+  if (err instanceof UserdataError) {
+    if (err.status === null) {
+      return { kind: "host_unreachable", message: err.message, url: err.url };
+    }
+    if (err.status === 404) {
+      return { kind: "workflow_not_found", message: err.message };
+    }
+    return { kind: "workflow_file", message: err.message, workflow_path: err.url };
   }
 
   if (err instanceof ObjectInfoFetchError) {

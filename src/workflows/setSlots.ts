@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { copyFileSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { z } from "zod";
@@ -143,6 +143,21 @@ export interface ApplySlotsOptions {
    * actually reach.
    */
   slotTypes?: Record<string, string>;
+  /**
+   * The workflow's bytes, when they did not come from a file on this machine.
+   *
+   * Supplied for a workflow fetched from a remote ComfyUI's own library
+   * (`comfy/userdata.ts`), where there is no local file to copy. `workflowPath`
+   * is then a *name* rather than a path — it decides the temp copy's filename
+   * and appears in every diagnostic — and nothing here opens it.
+   *
+   * These are written verbatim, exactly as {@link applySlots} otherwise
+   * byte-copies. That is the whole point: the bytes arrive from
+   * `web.FileResponse` and are written straight through, so landmine #1's
+   * 2^64−1 seed survives a remote workflow for the same reason it survives a
+   * local one — no JavaScript ever parses the graph.
+   */
+  contents?: Uint8Array;
 }
 
 /**
@@ -546,7 +561,11 @@ export async function applySlots(
     // list and preserves anything downstream that reads the file's stem.
     const path = join(temp.dir, basename(workflowPath));
     try {
-      copyFileSync(workflowPath, path);
+      // Two sources, one destination, and neither goes through a parse: a local
+      // file is copied byte for byte, and bytes already in hand are written
+      // byte for byte. See `ApplySlotsOptions.contents`.
+      if (opts.contents === undefined) copyFileSync(workflowPath, path);
+      else writeFileSync(path, opts.contents);
     } catch (cause) {
       // Wrapped rather than propagated: the raw error is named `Error`, is in
       // none of this function's documented failures, and quotes the temp

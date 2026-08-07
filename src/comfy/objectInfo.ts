@@ -163,6 +163,18 @@ function defaultCacheDir(): string {
 }
 
 /**
+ * The directory this server keeps its own files in — the `/object_info` cache,
+ * and whatever else later needs somewhere to put something.
+ *
+ * Exported so the answer to "where does `MCP_COMFYUI_CACHE_DIR` default to"
+ * lives in one place. A second copy of `~/.cache/mcp-comfyui` is exactly the
+ * kind of duplication `comfy/target.ts` exists because of.
+ */
+export function cacheRoot(cacheDir: string | undefined): string {
+  return cacheDir ?? defaultCacheDir();
+}
+
+/**
  * Hostnames may legally contain nothing exotic, but an operator's config can,
  * and this string becomes a filename: an IPv6 host is full of colons, and a
  * mistyped one could otherwise carry path separators.

@@ -112,9 +112,23 @@ function baseConfig(overrides: Partial<ToolConfig> = {}): ToolConfig {
     workspace: undefined,
     autoLaunch: false,
     allowLaunch: false,
-    env: {},
+    // `MCP_COMFYUI_HOSTS_FILE` is pointed inside this test's own directory
+    // even though no test here writes one: without it every handler would
+    // read whichever real `~/.config/mcp-comfyui/hosts.json` the machine
+    // running the suite happens to have, and a developer with two hosts
+    // registered would see failures nobody else could reproduce.
+    env: { MCP_COMFYUI_HOSTS_FILE: join(workdir, "hosts.json") },
     ...overrides,
   };
+}
+
+/**
+ * The address `resolveSlotTypes` is pointed at — a port nothing answers on, so
+ * a test that expects no CLI call cannot accidentally reach the real ComfyUI
+ * this machine may well be running. See {@link closedPort}.
+ */
+function testAddress(): { host: string; port: number } {
+  return { host: "127.0.0.1", port: deadPort };
 }
 
 /** Serve the captured 13-slot listing of `default_image_gen` as `workflow slots`'s data. */
@@ -132,13 +146,13 @@ function serveFailure(code: string, message: string): void {
 // --- resolveSlotTypes: the gate --------------------------------------------
 
 test("resolveSlotTypes never spawns the CLI when inputs is empty", async () => {
-  const types = await resolveSlotTypes("flow.json", {}, baseConfig());
+  const types = await resolveSlotTypes("flow.json", {}, testAddress());
   expect(types).toEqual({});
   expect(existsSync(argvOut)).toBe(false);
 });
 
 test("resolveSlotTypes never spawns the CLI when inputs is undefined", async () => {
-  const types = await resolveSlotTypes("flow.json", undefined, baseConfig());
+  const types = await resolveSlotTypes("flow.json", undefined, testAddress());
   expect(types).toEqual({});
   expect(existsSync(argvOut)).toBe(false);
 });
@@ -151,7 +165,7 @@ test("resolveSlotTypes never spawns the CLI for ordinary, unambiguous values", a
   const types = await resolveSlotTypes(
     "flow.json",
     { "3.seed": 42, "6.text": "a photo of a cat", "3.add_noise": true },
-    baseConfig(),
+    testAddress(),
   );
   expect(types).toEqual({});
   expect(existsSync(argvOut)).toBe(false);
@@ -159,7 +173,7 @@ test("resolveSlotTypes never spawns the CLI for ordinary, unambiguous values", a
 
 test("resolveSlotTypes fetches the listing when a value looks like a JSON boolean", async () => {
   serveSlots();
-  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "true" }, baseConfig());
+  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "true" }, testAddress());
   expect(existsSync(argvOut)).toBe(true); // the round trip was made
   expect(types["9.filename_prefix"]).toBe("STRING");
   expect(types["4.ckpt_name"]).toBe("COMBO");
@@ -168,19 +182,19 @@ test("resolveSlotTypes fetches the listing when a value looks like a JSON boolea
 
 test("resolveSlotTypes fetches the listing when a value looks like a JSON integer", async () => {
   serveSlots();
-  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "42" }, baseConfig());
+  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "42" }, testAddress());
   expect(types["9.filename_prefix"]).toBe("STRING");
 });
 
 test("resolveSlotTypes fetches the listing when a value looks like JSON null", async () => {
   serveSlots();
-  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "null" }, baseConfig());
+  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "null" }, testAddress());
   expect(types["9.filename_prefix"]).toBe("STRING");
 });
 
 test("resolveSlotTypes fetches the listing when a value looks like a JSON array", async () => {
   serveSlots();
-  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": '["a","b"]' }, baseConfig());
+  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": '["a","b"]' }, testAddress());
   expect(types["9.filename_prefix"]).toBe("STRING");
 });
 
@@ -189,7 +203,7 @@ test("resolveSlotTypes fetches the listing when just one of several values is am
   const types = await resolveSlotTypes(
     "flow.json",
     { "6.text": "a photo of a cat", "9.filename_prefix": "true" },
-    baseConfig(),
+    testAddress(),
   );
   expect(existsSync(argvOut)).toBe(true);
   expect(types["9.filename_prefix"]).toBe("STRING");
@@ -201,7 +215,7 @@ test("resolveSlotTypes does not treat the digit-string seed hatch itself as need
   // `setSlots.ts`, not this gate, that keeps a *known-numeric* type raw. This
   // asserts the gate's half of that: the round trip is made at all.
   serveSlots();
-  const types = await resolveSlotTypes("flow.json", { "3.seed": "18446744073709551615" }, baseConfig());
+  const types = await resolveSlotTypes("flow.json", { "3.seed": "18446744073709551615" }, testAddress());
   expect(existsSync(argvOut)).toBe(true);
   expect(types["3.seed"]).toBe("INT");
 });
@@ -212,7 +226,7 @@ test("resolveSlotTypes falls back to {} rather than failing the run when the lis
   // treated every address before finding 1 was fixed — not a new failure
   // mode, only a missed improvement for this one call.
   serveFailure("server_not_running", "no server");
-  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "true" }, baseConfig());
+  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "true" }, testAddress());
   expect(types).toEqual({});
 });
 
@@ -222,7 +236,7 @@ test("resolveSlotTypes falls back to {} when the CLI's payload is not a slot lis
   writeFileSync(badPayload, JSON.stringify({ not: "a slot listing" }));
   process.env.FAKE_COMFY_DATA_FILE = badPayload;
 
-  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "true" }, baseConfig());
+  const types = await resolveSlotTypes("flow.json", { "9.filename_prefix": "true" }, testAddress());
   expect(types).toEqual({});
 });
 

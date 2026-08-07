@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "../src/server.ts";
 import { toolConfig } from "../src/tools.ts";
+import { clearJobLedger } from "../src/jobLedger.ts";
 
 /**
  * The MCP surface, exercised through a real client over a real transport.
@@ -170,6 +171,7 @@ const MANAGED_ENV = [
   "FAKE_COMFY_JOBS_CANCEL_FILE",
   "FAKE_COMFY_JOBS_CANCEL_ERROR",
   "FAKE_COMFY_DISPATCH_LOG",
+  "FAKE_COMFY_WORKFLOW_COPY",
   "MCP_COMFYUI_WORKFLOW_DIRS",
   "MCP_COMFYUI_CACHE_DIR",
   "MCP_COMFYUI_HOST",
@@ -177,6 +179,7 @@ const MANAGED_ENV = [
   "MCP_COMFYUI_ALLOW_LAUNCH",
   "MCP_COMFYUI_AUTO_LAUNCH",
   "MCP_COMFYUI_WORKSPACE",
+  "MCP_COMFYUI_HOSTS_FILE",
 ];
 
 beforeEach(async () => {
@@ -195,6 +198,17 @@ beforeEach(async () => {
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
   process.env.MCP_COMFYUI_WORKFLOW_DIRS = roots;
   process.env.MCP_COMFYUI_CACHE_DIR = cacheDir;
+  // Pointed inside this test's own directory even though nothing writes one:
+  // otherwise every test here would read whoever's real
+  // `~/.config/mcp-comfyui/hosts.json` happens to be on the machine running
+  // the suite, and a developer with two hosts registered would see failures
+  // nobody else could reproduce.
+  process.env.MCP_COMFYUI_HOSTS_FILE = join(workdir, "hosts.json");
+  // The job ledger is module state and outlives a test. Every test in this
+  // file polls the same `PROMPT_ID`, so without this a later test inherits an
+  // earlier run's host and port — which is exactly right in production, where
+  // a prompt_id is a UUID belonging to one run, and exactly wrong here.
+  clearJobLedger();
   // A ComfyUI is answering by default, because that is the state every tool
   // that needs one is written for. Tests about the other state call
   // `nothingRunning()`; tests about starting one turn auto-launch back on.
@@ -488,13 +502,15 @@ async function failure(
 
 // --- registration --------------------------------------------------------
 
-test("registers exactly the six default tools", async () => {
+test("registers exactly the eight default tools", async () => {
   expect(await toolNames(await connect())).toEqual([
     "cancel_job",
     "comfy_status",
     "describe_workflow",
     "get_job",
+    "list_hosts",
     "list_workflows",
+    "manage_hosts",
     "run_workflow",
   ]);
 });
@@ -2152,4 +2168,794 @@ test("run_workflow's description warns that the first call may start ComfyUI", a
   const description = toolNamed(await tools(await connect()), "run_workflow").description ?? "";
   expect(description).toContain("start ComfyUI");
   expect(description).toContain("minute");
+});
+
+// --- multi-host ------------------------------------------------------------
+
+/**
+ * Which ComfyUI a call reaches, chosen per call rather than at process start.
+ *
+ * Two constraints shape every test here. `deno task test` grants
+ * `--allow-net=127.0.0.1,[::1],192.0.2.1`, so two *different* hosts have to be
+ * two ports on loopback — and the one genuinely non-local address available is
+ * `192.0.2.1`, an RFC 5737 documentation address that is on no interface
+ * anywhere and answers nothing. That is exactly what a sleeping remote is, so
+ * it is the right fixture for the case this whole feature was built around.
+ */
+
+/** RFC 5737 TEST-NET-1: routable-looking, on no interface, answering nothing. */
+const REMOTE_ADDRESS = "192.0.2.1";
+
+/** The registry file every test in this file is pointed at. */
+function hostsFile(): string {
+  return process.env.MCP_COMFYUI_HOSTS_FILE as string;
+}
+
+function writeHosts(document: unknown): void {
+  writeFileSync(hostsFile(), JSON.stringify(document, null, 2));
+}
+
+/**
+ * A second loopback ComfyUI, deliberately NOT pointed at by
+ * `MCP_COMFYUI_PORT`: the whole question these tests ask is whether a call
+ * reaches a host the environment never named.
+ */
+function serveOtherInstance(): number {
+  const bound = denoServe((request) =>
+    new URL(request.url).pathname === "/system_stats"
+      ? new Response(JSON.stringify(SYSTEM_STATS), { headers: { "content-type": "application/json" } })
+      : new Response("not found", { status: 404 }),
+  );
+  servers.push(bound);
+  return portOf(bound);
+}
+
+test("list_hosts reports the environment's single host when there is no registry", async () => {
+  const body = await ok(await connect(), "list_hosts");
+
+  expect(body["count"]).toBe(1);
+  expect(body["default"]).toBe("default");
+  expect(body["problem"]).toBeNull();
+  expect((body["registry"] as Record<string, unknown>)["present"]).toBe(false);
+  expect((body["hosts"] as Record<string, unknown>[])[0]).toMatchObject({
+    name: "default",
+    host: "127.0.0.1",
+    local: true,
+    is_default: true,
+  });
+});
+
+test("list_hosts reports a registry, and leads with what is wrong with it", async () => {
+  writeHosts({
+    default: "mac",
+    hosts: {
+      mac: { host: "127.0.0.1", port: 8188 },
+      far: { host: REMOTE_ADDRESS, port: 8189, auto_launch: true, note: "RTX" },
+    },
+  });
+  const body = await ok(await connect(), "list_hosts");
+
+  expect(body["count"]).toBe(2);
+  expect(Object.keys(body)[0]).toBe("problem"); // the breakage comes first, or nobody reads it
+  const warnings = body["warnings"] as Record<string, unknown>[];
+  expect(warnings.map((warning) => warning["code"])).toContain("auto_launch_not_local");
+  const far = (body["hosts"] as Record<string, unknown>[]).find((entry) => entry["name"] === "far");
+  // Neutralised, not dropped: the address is still perfectly usable.
+  expect(far).toMatchObject({ local: false, auto_launch: false, port: 8189, note: "RTX" });
+});
+
+test("a tool naming a host that is not registered is refused, with the names that would have worked", async () => {
+  writeHosts({ hosts: { mac: { host: "127.0.0.1", port: 8188 } } });
+  const error = await failure(await connect(), "comfy_status", { host: "rtx-vidoe" });
+
+  expect(error["kind"]).toBe("unknown_host");
+  expect(error["known_hosts"]).toEqual(["mac"]);
+  // Nothing was spawned to find that out.
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("comfy_status talks to the host it is named, not to the configured default", async () => {
+  const other = serveOtherInstance();
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      other: { host: "127.0.0.1", port: other },
+    },
+  });
+  const client = await connect();
+
+  expect(await ok(client, "comfy_status")).toMatchObject({
+    running: true,
+    port: configured,
+    target: { name: "configured" },
+  });
+  expect(await ok(client, "comfy_status", { host: "other" })).toMatchObject({
+    running: true,
+    port: other,
+    target: { name: "other", local: true },
+  });
+});
+
+test("a raw address reaches an instance the registry has never heard of", async () => {
+  const other = serveOtherInstance();
+  const body = await ok(await connect(), "comfy_status", { host: `127.0.0.1:${other}` });
+
+  expect(body).toMatchObject({
+    running: true,
+    port: other,
+    target: { name: null, address: `127.0.0.1:${other}` },
+  });
+});
+
+test("a sleeping host on another machine is reported, and nothing is launched for it", async () => {
+  // The defect this feature was designed around. Before the locality gate, a
+  // remote that did not answer made this machine start a ComfyUI on its own
+  // default port, poll the remote for the full readiness budget, report a
+  // timeout, and leave the local process running — `--background` had already
+  // detached it. `comfy launch` has no --host, so no launch here could ever
+  // have produced a server at that address.
+  //
+  // Mutant: drop the `!resolved.local` branch in `ensureRunning` and let
+  // `ensureInstance` handle it. This test dies on the argv assertion, because
+  // the CLI is spawned.
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  writeHosts({ default: "far", hosts: { far: { host: REMOTE_ADDRESS, port: 8189 } } });
+  writeWorkflow("smoke");
+
+  const error = await failure(await connect(), "run_workflow", { workflow: "smoke" });
+
+  expect(error["kind"]).toBe("host_unreachable");
+  expect(error["host"]).toBe("far");
+  expect(String(error["message"])).toContain("comfy launch");
+  // The load-bearing assertion: no `comfy` process was started at all.
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("a remote host's artifacts are never reported as files on this machine", async () => {
+  // A remote instance's `outputDirectory` is a path in ITS filesystem. Two Unix
+  // boxes sharing a layout would otherwise have this hand back a local path
+  // naming a different image entirely — so the check is on the address, not on
+  // whether the path happens to resolve here.
+  //
+  // Mutant: drop the `isLocalAddress` guard at the top of
+  // `resolveArtifactPath`. This test dies, because the directory below really
+  // does exist on this machine and really does hold that file.
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "remote_00001_.png"), "png bytes");
+  const url = `http://${REMOTE_ADDRESS}:8189/view?filename=remote_00001_.png&subfolder=&type=output`;
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: [url] }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+  writeHosts({ default: "far", hosts: { far: { host: REMOTE_ADDRESS, port: 8189 } } });
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect(body["outputs"]).toEqual({ files: [], urls: [url], local_paths: {} });
+  expect(body["host_source"]).toBe("only");
+});
+
+test("get_job finds a run's host without being told, and says how it knew", async () => {
+  const other = serveOtherInstance();
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      other: { host: "127.0.0.1", port: other },
+    },
+  });
+  writeWorkflow("smoke");
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: PROMPT_ID, status: "running" }));
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+  process.env.FAKE_COMFY_ARGV_LOG = join(workdir, "argv.log");
+  const client = await connect();
+
+  const run = await ok(client, "run_workflow", { workflow: "smoke", host: "other" });
+  expect(run["target"]).toMatchObject({ name: "other" });
+
+  const job = await ok(client, "get_job", { prompt_id: run["prompt_id"] as string });
+  expect(job["host_source"]).toBe("ledger");
+  expect(job["target"]).toMatchObject({ name: "other", address: `127.0.0.1:${other}` });
+  // And the CLI really was pointed there: `--host`/`--port` follow the
+  // subcommand, where `--json` precedes it.
+  const invocation = readFileSync(join(workdir, "argv.log"), "utf8").trim().split("\n").pop() as string;
+  const argv = invocation.split(" ");
+  expect(argv.indexOf("--json")).toBeLessThan(argv.indexOf("jobs"));
+  expect(argv.indexOf("jobs")).toBeLessThan(argv.indexOf("--port"));
+  expect(argv[argv.indexOf("--port") + 1]).toBe(String(other));
+});
+
+test("get_job refuses to guess a host it was never told and never recorded", async () => {
+  // Mutant: make this fall back to the default host. The test dies — and the
+  // reason it must is that the fallback would not fail loudly, it would answer
+  // `prompt_not_found`, which is byte-identical to the answer for a job that
+  // never existed.
+  writeHosts({
+    default: "mac",
+    hosts: { mac: { host: "127.0.0.1", port: 8188 }, far: { host: REMOTE_ADDRESS, port: 8189 } },
+  });
+  const error = await failure(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect(error["kind"]).toBe("job_host_unknown");
+  expect(error["known_hosts"]).toEqual(["mac", "far"]);
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("an explicit host overrides the ledger, and the disagreement is reported", async () => {
+  const other = serveOtherInstance();
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      other: { host: "127.0.0.1", port: other },
+    },
+  });
+  writeWorkflow("smoke");
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: PROMPT_ID, status: "running" }));
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+  const client = await connect();
+
+  const run = await ok(client, "run_workflow", { workflow: "smoke", host: "other" });
+  const job = await ok(client, "get_job", {
+    prompt_id: run["prompt_id"] as string,
+    host: "configured",
+  });
+
+  expect(job["host_source"]).toBe("explicit");
+  expect(job["target"]).toMatchObject({ name: "configured" });
+  const warnings = job["warnings"] as Record<string, unknown>[];
+  expect(warnings[0]).toMatchObject({ code: "host_contradicts_ledger" });
+});
+
+test("a registry that will not parse leaves the default working and refuses names", async () => {
+  writeFileSync(hostsFile(), `{"hosts": {"mac": {"host": "127.0.0.1" "port": 8188}}}`);
+  const client = await connect();
+
+  // The default host's address comes from the environment, not from the file,
+  // so it survives the file being unreadable. Routing a video job to the laptop
+  // because a comma was missing is the failure this arrangement prevents.
+  expect(await ok(client, "comfy_status")).toMatchObject({ running: true });
+
+  const error = await failure(client, "comfy_status", { host: "mac" });
+  expect(error["kind"]).toBe("registry_invalid");
+  expect(error["registry_path"]).toBe(hostsFile());
+  expect(error["line"]).toBe(1);
+});
+
+/**
+ * A ComfyUI that also serves its own saved workflows, the way a remote does.
+ *
+ * `/api/userdata` and `/api/userdata/{file}` are answered exactly as ComfyUI
+ * answers them — see `tests/userdata.test.ts` for where that shape comes from —
+ * so a test can exercise the whole path from `list_workflows` through a run
+ * without a real instance anywhere.
+ */
+function serveLibraryInstance(files: Record<string, string>): number {
+  const bound = denoServe((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/system_stats") {
+      return new Response(JSON.stringify(SYSTEM_STATS), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname === "/api/userdata") {
+      return Response.json(
+        Object.entries(files).map(([path, body]) => ({
+          path,
+          size: new TextEncoder().encode(body).byteLength,
+          modified: 1786069244638,
+        })),
+      );
+    }
+    if (url.pathname.startsWith("/api/userdata/")) {
+      const name = decodeURIComponent(url.pathname.slice("/api/userdata/".length));
+      const body = files[name];
+      return body === undefined
+        ? new Response("", { status: 404 })
+        : new Response(body, { headers: { "content-type": "application/json" } });
+    }
+    return new Response("nf", { status: 404 });
+  });
+  servers.push(bound);
+  return portOf(bound);
+}
+
+test("list_workflows shows a host's own library beside the local one, tagged", async () => {
+  writeWorkflow("local_only");
+  const port = serveLibraryInstance({ "workflows/portrait.json": `{"nodes":[],"links":[]}` });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+
+  const bare = await ok(await connect(), "list_workflows");
+  expect((bare["workflows"] as Record<string, unknown>[]).map((w) => w["name"])).toEqual(["local_only"]);
+  // No host named, no remote call: the default host is usually this machine,
+  // whose workflows directory is very likely already a configured root.
+  expect(bare["host"]).toBeUndefined();
+
+  const both = await ok(await connect(), "list_workflows", { host: "box" });
+  const entries = both["workflows"] as Record<string, unknown>[];
+  expect(entries.map((entry) => entry["name"])).toEqual(["local_only", "box/portrait"]);
+  expect(entries[0]).toMatchObject({ source: "local", format: "frontend" });
+  expect(entries[1]).toMatchObject({
+    source: "remote:box",
+    path: "workflows/portrait.json",
+    format: "unknown",
+    size_bytes: 23,
+  });
+  expect(both["count"]).toBe(2);
+});
+
+test("list_workflows still lists the local library when the host cannot be asked", async () => {
+  // `workflows/discover.ts`'s promise, one layer out: denying somebody their
+  // local workflows because a remote box is asleep is the wrong trade.
+  writeWorkflow("local_only");
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port: deadPort } } });
+
+  const body = await ok(await connect(), "list_workflows", { host: "box" });
+
+  expect((body["workflows"] as unknown[]).length).toBe(1);
+  expect(body["remote_unreadable"]).toMatchObject({ host: "box" });
+});
+
+test("a workflow that exists only on a host runs there, byte-exact", async () => {
+  // Landmine #1 over HTTP. The local path is a byte copy and has been pinned
+  // since the beginning; this is the first route where a graph arrives from a
+  // network. `run_capture` keeps the file `comfy run` was handed, because the
+  // prepared copy is deleted the moment the run returns — so there would
+  // otherwise be nothing left to compare against.
+  //
+  // Mutant: make `resolveRemoteWorkflow` hand back
+  // `JSON.parse`-then-`JSON.stringify` of the fetched bytes instead of the
+  // bytes. This test dies on the exact digits.
+  const graph = `{"nodes":[{"id":3,"type":"KSampler","widgets_values":[${HUGE_SEED}]}],"links":[]}`;
+  const port = serveLibraryInstance({ "workflows/seeded.json": graph });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  const copy = join(workdir, "submitted.json");
+  const log = join(workdir, "dispatch.log");
+  process.env.FAKE_COMFY_RUN_MODE = "run_capture";
+  process.env.FAKE_COMFY_WORKFLOW_COPY = copy;
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
+
+  const body = await ok(await connect(), "run_workflow", {
+    workflow: "box/seeded",
+    inputs: { "3.cfg": 7 },
+  });
+
+  expect(body["workflow"]).toMatchObject({ name: "box/seeded", source: "remote" });
+  // The graph that reached the CLI still opens with the exact bytes the host
+  // served. (The fake `set-slot` appends its markers after them.)
+  expect(readFileSync(copy, "utf8").startsWith(graph)).toBe(true);
+  expect(readFileSync(copy, "utf8")).toContain(HUGE_SEED);
+  expect(readFileSync(copy, "utf8")).not.toContain("18446744073709552000");
+
+  // Flag POSITION, not merely presence: `--json` is a Typer root flag and
+  // precedes the subcommand, while `--host` is the subcommand's own and
+  // follows it. Both orderings now appear in one argv.
+  const lines = readFileSync(log, "utf8").trim().split("\n");
+  const setSlot = (lines.find((line) => line.includes("set-slot")) as string).split(" ");
+  expect(setSlot.indexOf("--json")).toBe(-1); // set-slot is not a --json command
+  expect(setSlot.indexOf("set-slot")).toBeLessThan(setSlot.indexOf("--host"));
+  const run = (lines.find((line) => line.includes(" run ")) as string).split(" ");
+  expect(run.indexOf("--json")).toBeGreaterThan(run.indexOf("run"));
+  expect(run.indexOf("run")).toBeLessThan(run.indexOf("--host"));
+  expect(run[run.indexOf("--port") + 1]).toBe(String(port));
+});
+
+test("a local workflow is still run without a copy of anything being fetched", async () => {
+  // The ordinary case, and the one `host` is mostly for: the workflow comes
+  // from the local library and is RUN on another instance.
+  const path = writeWorkflow("flow");
+  const port = serveLibraryInstance({ "workflows/other.json": "{}" });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "flow", host: "box" });
+
+  expect(body["workflow"]).toMatchObject({ name: "flow", path, source: "local" });
+  expect(body["target"]).toMatchObject({ name: "box" });
+});
+
+test("describe_workflow reads a host's own workflow without leaving a temp copy behind", async () => {
+  const graph = `{"nodes":[{"id":3,"type":"KSampler"}],"links":[]}`;
+  const port = serveLibraryInstance({ "workflows/remote_flow.json": graph });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  serveSlots();
+  // Per host and port, which is the whole point of the cache being keyed that
+  // way: two ComfyUIs with different models installed must never answer for
+  // each other. The library instance is on its own port, so its cache is its
+  // own file.
+  copyFileSync(OBJECT_INFO_SAMPLE, join(cacheDir, `object_info-127.0.0.1-${port}.json`));
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "box/remote_flow" });
+
+  expect(body["workflow"]).toMatchObject({ name: "box/remote_flow", source: "remote" });
+  expect(body["slot_count"]).toBeGreaterThan(0);
+  // The staged copy is the caller's to delete, and describe_workflow is the
+  // caller. `leakedTempDirs` is checked in afterEach for every test here.
+  expect(leakedTempDirs()).toEqual([]);
+});
+
+/**
+ * An instance that both reports an output directory and serves the files in it
+ * over `/view` — which `serveInstanceWritingTo` deliberately does not, because
+ * every test before this one only ever asked whether a URL resolved to a path,
+ * never fetched one.
+ */
+function serveArtifactInstance(outputDir: string, files: Record<string, string>): number {
+  const bound = denoServe((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/system_stats") {
+      const argv = ["ComfyUI/main.py", "--output-directory", outputDir];
+      return new Response(JSON.stringify({ ...SYSTEM_STATS, system: { ...SYSTEM_STATS.system, argv } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname === "/view") {
+      const body = files[url.searchParams.get("filename") ?? ""];
+      return body === undefined
+        ? new Response("", { status: 404 })
+        : new Response(body, { headers: { "content-type": "image/png" } });
+    }
+    return new Response("nf", { status: 404 });
+  });
+  servers.push(bound);
+  const port = portOf(bound);
+  process.env.MCP_COMFYUI_PORT = String(port);
+  return port;
+}
+
+test("fetch_outputs brings a run's artifacts here, and says where each one landed", async () => {
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "made_00001_.png"), "png bytes");
+  const port = serveArtifactInstance(outputDir, { "made_00001_.png": "png bytes" });
+  const url = viewUrl(port, { filename: "made_00001_.png", subfolder: "", type: "output" });
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: [url] }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const off = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+  // Absent unless asked for, so an empty `fetched` can only ever mean "asked
+  // for, and none came across".
+  expect((off["outputs"] as Record<string, unknown>)["fetched"]).toBeUndefined();
+
+  const on = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, fetch_outputs: true });
+  const outputs = on["outputs"] as Record<string, Record<string, string>>;
+  expect(outputs["fetch_problems"]).toEqual([]);
+  const landed = outputs["fetched"]?.[url] as string;
+  expect(landed).toContain(PROMPT_ID);
+  expect(readFileSync(landed, "utf8")).toBe("png bytes");
+});
+
+test("an artifact that will not come across is reported without denying the others", async () => {
+  const outputDir = makeDir("comfy-output");
+  writeFileSync(join(outputDir, "good.png"), "good bytes");
+  const port = serveArtifactInstance(outputDir, { "good.png": "good bytes" });
+  const good = viewUrl(port, { filename: "good.png", subfolder: "", type: "output" });
+  const gone = viewUrl(port, { filename: "gone.png", subfolder: "", type: "output" });
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(
+    statusFile,
+    JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: [good, gone] }),
+  );
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, fetch_outputs: true });
+
+  const outputs = body["outputs"] as Record<string, unknown>;
+  expect(Object.keys(outputs["fetched"] as Record<string, string>)).toEqual([good]);
+  expect((outputs["fetch_problems"] as Record<string, unknown>[])[0]).toMatchObject({ url: gone });
+});
+
+test("manage_hosts adds a host, backs the file up, and reports what the next call will see", async () => {
+  writeHosts({ default: "mac", hosts: { mac: { host: "127.0.0.1", port: 8188 } } });
+  const client = await connect();
+
+  const body = await ok(client, "manage_hosts", {
+    action: "add",
+    name: "rtx-video",
+    host: REMOTE_ADDRESS,
+    port: 8189,
+    note: "Windows, RTX 4070",
+  });
+
+  expect(body["backup_path"]).toContain(".bak-");
+  expect(readFileSync(body["backup_path"] as string, "utf8")).toContain("8188");
+  expect(body["changes"]).toContainEqual({
+    host: "rtx-video",
+    field: "port",
+    from: null,
+    to: 8189,
+  });
+  // Re-read from disk, so the answer is what the next call will see rather than
+  // what this call believed it wrote.
+  const registry = body["registry"] as Record<string, unknown>;
+  expect((registry["hosts"] as Record<string, unknown>[]).map((entry) => entry["name"])).toEqual([
+    "mac",
+    "rtx-video",
+  ]);
+  expect(await ok(client, "list_hosts")).toMatchObject({ count: 2, default: "mac" });
+});
+
+test("manage_hosts refuses auto_launch for another machine, and writes nothing", async () => {
+  const before = { default: "mac", hosts: { mac: { host: "127.0.0.1", port: 8188 } } };
+  writeHosts(before);
+
+  const error = await failure(await connect(), "manage_hosts", {
+    action: "add",
+    name: "far",
+    host: REMOTE_ADDRESS,
+    auto_launch: true,
+  });
+
+  expect(error["kind"]).toBe("host_not_local");
+  expect(JSON.parse(readFileSync(hostsFile(), "utf8"))).toEqual(before);
+});
+
+test("manage_hosts repairs a file's syntax without touching a single address", async () => {
+  writeFileSync(
+    hostsFile(),
+    `{
+  // the laptop
+  "default": "mac",
+  "hosts": {
+    "mac": { "host": "127.0.0.1", "port": 8188, "vram_gb": 48 },
+  },
+}
+`,
+  );
+  const body = await ok(await connect(), "manage_hosts", { action: "repair" });
+
+  // Empty `changes` IS the guarantee: a repair fixes syntax, and one that
+  // quietly re-pointed a host would be indistinguishable from one that did not.
+  expect(body["changes"]).toEqual([]);
+  expect(body["reformatted"]).toBe(true);
+  const written = JSON.parse(readFileSync(hostsFile(), "utf8"));
+  expect(written.hosts.mac).toMatchObject({ host: "127.0.0.1", port: 8188, vram_gb: 48 });
+});
+
+test("manage_hosts will not 'repair' a file it could not read", async () => {
+  // The dangerous case. Neither parse read this, so the registry held only the
+  // environment's default — rewriting it would replace the operator's hosts
+  // with that one entry and leave the real ones in a .bak- file nobody was told
+  // to look for.
+  const broken = `{"hosts": {"mac": {"host": "127.0.0.1" "port": 8188}}}`;
+  writeFileSync(hostsFile(), broken);
+
+  const error = await failure(await connect(), "manage_hosts", { action: "repair" });
+
+  expect(error["kind"]).toBe("registry_invalid");
+  expect(readFileSync(hostsFile(), "utf8")).toBe(broken);
+});
+
+test("manage_hosts names the argument it needs rather than failing obscurely", async () => {
+  const error = await failure(await connect(), "manage_hosts", { action: "add", name: "x" });
+
+  expect(error["kind"]).toBe("invalid_input");
+  expect(String(error["message"])).toContain("host");
+});
+
+test("manage_hosts set_default changes which host an unqualified call reaches", async () => {
+  const other = serveOtherInstance();
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      other: { host: "127.0.0.1", port: other },
+    },
+  });
+  const client = await connect();
+
+  await ok(client, "manage_hosts", { action: "set_default", name: "other" });
+
+  // The registry is read per call, so this takes effect immediately — no
+  // restart, and no shared state to invalidate.
+  expect(await ok(client, "comfy_status")).toMatchObject({
+    port: other,
+    target: { name: "other" },
+  });
+});
+
+test("a workflow name nothing answers to is a missing workflow, not a network error", async () => {
+  // Found live, against a stopped local ComfyUI: a mistyped workflow name fell
+  // through to the default host's own library, could not reach it, and came
+  // back as `fetch failed` about /api/userdata — a true statement about
+  // something the caller never asked about, in place of the names that would
+  // have worked. A host consulted only as a fallback must not become the story.
+  writeWorkflow("real_one");
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port: deadPort } } });
+
+  const error = await failure(await connect(), "run_workflow", { workflow: "reel_one" });
+
+  expect(error["kind"]).toBe("workflow_not_found");
+  expect(error["known_workflows"]).toEqual(["real_one"]);
+});
+
+test("a host the caller named, that cannot be asked, is reported as the host", async () => {
+  // The other half of the same rule. Here the caller DID name a host, so its
+  // being unreachable is the answer to their question rather than an aside.
+  writeWorkflow("real_one");
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port: deadPort } } });
+
+  const error = await failure(await connect(), "run_workflow", {
+    workflow: "box/whatever",
+    host: "box",
+  });
+
+  expect(error["kind"]).toBe("host_unreachable");
+  expect(String(error["url"])).toContain("/api/userdata");
+});
+
+test("a workflow a named host does not have is a missing workflow", async () => {
+  const port = serveLibraryInstance({ "workflows/here.json": "{}" });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  writeWorkflow("local_one");
+
+  const error = await failure(await connect(), "describe_workflow", {
+    workflow: "box/absent",
+    host: "box",
+  });
+
+  expect(error["kind"]).toBe("workflow_not_found");
+});
+
+test("a host-qualified workflow handle routes itself, without repeating the host", async () => {
+  // list_workflows publishes a remote workflow as `box/portrait`, and a handle
+  // that carries a host's name reads as self-describing — a model will pass it
+  // on its own. If it did not route, the call would resolve against the
+  // DEFAULT host, look for `box/portrait` in that machine's library, and report
+  // a workflow that plainly exists as missing.
+  const graph = `{"nodes":[{"id":3,"type":"KSampler"}],"links":[]}`;
+  const port = serveLibraryInstance({ "workflows/portrait.json": graph });
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      box: { host: "127.0.0.1", port },
+    },
+  });
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "box/portrait" });
+
+  expect(body["target"]).toMatchObject({ name: "box" });
+  expect(body["workflow"]).toMatchObject({ name: "box/portrait", source: "remote" });
+});
+
+test("a local workflow whose name merely contains a slash is not read as a host", async () => {
+  // `workflows/discover.ts` qualifies a colliding name with its own directory,
+  // so `templates/portrait` is a perfectly ordinary LOCAL handle. Only a prefix
+  // the registry really has is treated as a host.
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({ default: "configured", hosts: { configured: { host: "127.0.0.1", port: configured } } });
+  const second = join(workdir, "templates");
+  mkdirSync(second);
+  writeFileSync(join(second, "portrait.json"), `{"nodes":[],"links":[]}`);
+  writeWorkflow("portrait");
+  process.env.MCP_COMFYUI_WORKFLOW_DIRS = `${roots}:${second}`;
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+
+  const body = await ok(await connect(), "run_workflow", { workflow: "templates/portrait" });
+
+  expect(body["workflow"]).toMatchObject({ name: "templates/portrait", source: "local" });
+  expect(body["target"]).toMatchObject({ name: "configured" });
+});
+
+test("launch_comfyui refuses a host on another machine, and spawns nothing", async () => {
+  // The locality gate, through the tool a model can actually reach. Its own
+  // error subclass exists so this is reported as host_not_local rather than
+  // invalid_input: the fix is on the other machine, not in the argument.
+  //
+  // Mutant: make `refuseRemoteTarget` throw a plain LaunchArgumentError. This
+  // test dies on the kind.
+  process.env.MCP_COMFYUI_ALLOW_LAUNCH = "1";
+  writeHosts({ default: "far", hosts: { far: { host: REMOTE_ADDRESS, port: 8189 } } });
+
+  const error = await failure(await connect(), "launch_comfyui", { host: "far" });
+
+  expect(error["kind"]).toBe("host_not_local");
+  expect(error["host"]).toBe(`${REMOTE_ADDRESS}:8189`);
+  expect(String(error["message"])).toContain("--host");
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("launch_comfyui refuses a --listen naming another machine, whatever the host is", async () => {
+  // `launchTarget` reads the address out of the ASSEMBLED argv, so a gate
+  // checking only the configured host would miss the very argument that decides
+  // where the server binds.
+  process.env.MCP_COMFYUI_ALLOW_LAUNCH = "1";
+
+  const error = await failure(await connect(), "launch_comfyui", { listen: REMOTE_ADDRESS });
+
+  expect(error["kind"]).toBe("host_not_local");
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("a host that agrees with the ledger is reported without a contradiction", async () => {
+  const other = serveOtherInstance();
+  const configured = Number(process.env.MCP_COMFYUI_PORT);
+  writeHosts({
+    default: "configured",
+    hosts: {
+      configured: { host: "127.0.0.1", port: configured },
+      other: { host: "127.0.0.1", port: other },
+    },
+  });
+  writeWorkflow("smoke");
+  serveStream(`${envelopeLine(queuedPayload())}\n`);
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: PROMPT_ID, status: "running" }));
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+  const client = await connect();
+
+  const run = await ok(client, "run_workflow", { workflow: "smoke", host: "other" });
+  const job = await ok(client, "get_job", { prompt_id: run["prompt_id"] as string, host: "other" });
+
+  expect(job["host_source"]).toBe("explicit");
+  // The equality check is what keeps a caller who simply repeated the right
+  // host from being told they disagreed with this server.
+  expect(job["warnings"]).toBeUndefined();
+});
+
+test("the only registered host is used for an unknown job, and said to be an assumption", async () => {
+  // Not a guess between candidates — there is one host — but still an
+  // assumption, because a run can be submitted to a raw address that is in no
+  // registry, and the wrong ComfyUI answers `prompt_not_found` in exactly the
+  // words a job that never existed gets.
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: PROMPT_ID, status: "running" }));
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  expect(body["host_source"]).toBe("only");
+  expect((body["warnings"] as Record<string, unknown>[])[0]).toMatchObject({ code: "host_assumed" });
+});
+
+test("a decoy address in a REMOTE workflow is refused before anything is spawned", async () => {
+  // The decoy analysis reads the fetched bytes rather than a file, so it still
+  // happens before any temp directory exists. Without it, a remote workflow
+  // would lose the one refusal that stopped a request for "black metal, 60s"
+  // from silently producing 150 seconds of tropical house.
+  //
+  // Mutant: drop the `resolved.contents` arm of `refuseInertInputs`. This test
+  // dies, because `inertInputsOfFile` cannot read `workflows/decoy.json`.
+  const graph = JSON.stringify({
+    nodes: [
+      { id: 3, type: "CLIPTextEncode", inputs: [{ name: "text", widget: { name: "text" }, link: 7 }] },
+      { id: 9, type: "PrimitiveStringMultiline", inputs: [{ name: "value", widget: { name: "value" }, link: null }] },
+    ],
+    links: [[7, 9, 0, 3, 0, "STRING"]],
+  });
+  const port = serveLibraryInstance({ "workflows/decoy.json": graph });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+
+  const error = await failure(await connect(), "run_workflow", {
+    workflow: "box/decoy",
+    inputs: { "3.text": "black metal" },
+  });
+
+  expect(error["kind"]).toBe("inert_slot");
+  const addresses = error["inert_addresses"] as Record<string, unknown>[];
+  expect(addresses[0]).toMatchObject({ address: "3.text" });
+  expect(existsSync(argvOut)).toBe(false);
+  expect(leakedTempDirs()).toEqual([]);
 });
