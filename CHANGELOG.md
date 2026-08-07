@@ -74,6 +74,11 @@ All notable changes to this project are recorded here. The format follows
   `prepublishOnly`, `scripts`, and the npm-registry metadata — served a channel
   this project does not publish to, and its duplicate `version` field had
   already caused two silent desyncs.
+  `package-lock.json` went with it — a lockfile for a manifest that no longer
+  exists, still recording version `0.1.0` — and the publish workflow's `npm ci`
+  step became `deno install`, which reads the same dependencies from
+  `deno.json`. Left as it was, CI would have failed on the first push to `main`
+  after this release.
 - **The MCP SDK is mapped bare rather than by prefix.** The old
   `"@modelcontextprotocol/sdk/": "npm:…@1.30.0/"` only ever resolved because
   `package.json` listed the SDK and Deno went through `node_modules`; without

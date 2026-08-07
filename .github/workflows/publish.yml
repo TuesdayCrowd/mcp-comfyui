@@ -27,10 +27,12 @@ jobs:
           node-version: "20"
 
       # Populates node_modules for the Node-facing tooling (`tsc`, and
-      # `scripts/build.mjs` itself, which runs under `node`). `deno test` /
-      # `deno bundle` extend the same directory as needed for npm: specifiers
-      # (`nodeModulesDir: "auto"` in deno.json) once this step has run.
-      - run: npm ci
+      # `scripts/build.mjs` itself, which runs under `node`). This was `npm ci`
+      # until 0.6.0 deleted package.json; `deno install` reads the same
+      # dependencies from deno.json's own `imports` and materialises them the
+      # same way, because of `nodeModulesDir: "auto"`. Verified from a clean
+      # room with node_modules and deno.lock both deleted.
+      - run: deno install
 
       # Publishing a broken version is not undoable — JSR refuses to republish a
       # version number, so a bad one is spent. The gates run first for that
