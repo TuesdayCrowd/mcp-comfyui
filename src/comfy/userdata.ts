@@ -73,6 +73,19 @@ const JSON_EXTENSION = ".json";
  */
 const MAX_WORKFLOW_BYTES = 8 * 1024 * 1024;
 
+/**
+ * The largest *listing* this will read.
+ *
+ * Separate from the workflow cap and much smaller, because a listing is one
+ * JSON object per file: 27 workflows measured at about 100 bytes each, so 2 MiB
+ * is room for something like twenty thousand of them. It exists for the same
+ * reason as the other cap — the length is another machine's to choose — and
+ * a listing had none at all until a review pointed out that the module's own
+ * promise not to "stream an unbounded body into memory on its say-so" was made
+ * only about the fetch.
+ */
+const MAX_LISTING_BYTES = 2 * 1024 * 1024;
+
 /** Budget for a listing or a fetch. Generous for a workflow over a tailnet. */
 const DEFAULT_TIMEOUT_MS = 20_000;
 
@@ -149,6 +162,59 @@ function base(opts: UserdataOptions): string {
   return `http://${authority(opts.host, opts.port)}`;
 }
 
+/**
+ * A response body, read a chunk at a time and abandoned the moment it passes
+ * `limit`.
+ *
+ * **Not `arrayBuffer()` or `text()`.** Both of those read the whole body before
+ * anything can look at its size, so a `content-length` check ahead of them
+ * bounds only a server that tells the truth — and a chunked response makes no
+ * claim at all. The length is the *remote's* to choose, which is the whole
+ * reason there is a cap; enforcing it after the allocation would be enforcing
+ * it after the damage.
+ *
+ * `getReader()` rather than `for await`: async iteration over a
+ * `ReadableStream` is a comparatively recent addition and this bundle targets
+ * Node 18 upward as well as Deno and Bun, where the reader API is the one
+ * spelling that exists everywhere `fetch` does.
+ */
+async function readCapped(response: Response, limit: number): Promise<Uint8Array | null> {
+  if (response.body === null) return new Uint8Array(0);
+
+  const declared = Number(response.headers.get("content-length") ?? Number.NaN);
+  if (Number.isFinite(declared) && declared > limit) {
+    await response.body.cancel().catch(() => {});
+    return null;
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => {});
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch {
+    await reader.cancel().catch(() => {});
+    throw new Error("the connection ended before the whole response arrived");
+  }
+
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
 async function get(url: string, opts: UserdataOptions, accept: string): Promise<Response> {
   try {
     return await fetch(url, {
@@ -194,7 +260,17 @@ export async function listRemoteWorkflows(opts: UserdataOptions): Promise<Remote
   // remote this was measured against is in exactly that state.
   if (response.status === 404) return [];
 
-  const body = await response.text();
+  const bytes = await readCapped(response, MAX_LISTING_BYTES);
+  if (bytes === null) {
+    throw new UserdataError(
+      url,
+      response.status,
+      `the listing is larger than this server's ${MAX_LISTING_BYTES}-byte limit`,
+      "This server bounds a response whose length another machine decides. A workflow " +
+        "directory that large is not something it can enumerate.",
+    );
+  }
+  const body = new TextDecoder().decode(bytes);
   if (!response.ok) {
     throw new UserdataError(
       url,
@@ -322,17 +398,12 @@ export async function fetchRemoteWorkflow(
     );
   }
 
-  // Checked before reading, where the server declared a length, and again after
-  // — a `content-length` is the remote's claim, and a chunked response makes no
-  // claim at all.
-  const declared = Number(response.headers.get("content-length") ?? Number.NaN);
-  if (Number.isFinite(declared) && declared > MAX_WORKFLOW_BYTES) {
-    throw new UserdataError(url, response.status, tooLarge(declared), CAP_GUIDANCE);
-  }
-
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_WORKFLOW_BYTES) {
-    throw new UserdataError(url, response.status, tooLarge(bytes.byteLength), CAP_GUIDANCE);
+  // Read a chunk at a time and stopped at the cap, never buffered whole and
+  // measured afterwards — see {@link readCapped}. A `content-length` is the
+  // remote's claim, and a chunked response makes no claim at all.
+  const bytes = await readCapped(response, MAX_WORKFLOW_BYTES);
+  if (bytes === null) {
+    throw new UserdataError(url, response.status, tooLarge(), CAP_GUIDANCE);
   }
   return bytes;
 }
@@ -341,6 +412,6 @@ const CAP_GUIDANCE =
   "This server caps a fetched workflow rather than reading a body whose length another " +
   "machine decides. Copy the file across by hand if it is genuinely that large.";
 
-function tooLarge(bytes: number): string {
-  return `the workflow is ${bytes} bytes, over this server's ${MAX_WORKFLOW_BYTES}-byte limit`;
+function tooLarge(): string {
+  return `the workflow is over this server's ${MAX_WORKFLOW_BYTES}-byte limit`;
 }

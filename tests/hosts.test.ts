@@ -562,3 +562,45 @@ test("nothing is left behind in the registry's directory", async () => {
   expect(existsSync(hostsPath)).toBe(true);
   expect(backups()).toHaveLength(1);
 });
+
+test("two mutations in flight at once do not lose one of each other's hosts", async () => {
+  // The MCP transport dispatches a request without waiting for the last one to
+  // finish, so two `manage_hosts` calls really can interleave — and every
+  // `await` inside a mutation is a place where they would. Unserialised, both
+  // read the same registry, and the second writes a document computed from a
+  // snapshot taken before the first host existed: a host the caller was TOLD
+  // had been added, silently gone, with the evidence only in a `.bak-` file
+  // nobody was pointed at.
+  //
+  // Mutant: drop the promise chain in `mutateHostRegistry` and call
+  // `performMutation` directly. This test dies.
+  write(TWO_HOSTS);
+
+  const [first, second] = await Promise.all([
+    mutate({ action: "add", name: "alpha", host: "127.0.0.1", port: 8190 }),
+    mutate({ action: "add", name: "beta", host: "127.0.0.1", port: 8191 }),
+  ]);
+
+  for (const result of [first, second]) {
+    expect(result.registry.problem).toBeNull();
+  }
+  const reloaded = await load();
+  expect(reloaded.hosts.map((entry) => entry.name).sort()).toEqual([
+    "alpha",
+    "beta",
+    "mac-local",
+    "rtx-video",
+  ]);
+});
+
+test("a file that repairs into something that is not a registry is not offered a repair", async () => {
+  // The tolerant parse can succeed and still not yield a registry. Advertising
+  // `repairable` here would offer an action that `mutateHostRegistry` then
+  // declines, because there are no entries for it to preserve.
+  write(`// a registry, allegedly\n["mac-local"]\n`);
+  const registry = await load();
+
+  expect(registry.problem).not.toBeNull();
+  expect(registry.repairable).toBe(false);
+  await expect(mutate({ action: "repair" })).rejects.toThrow(RegistryInvalidError);
+});
