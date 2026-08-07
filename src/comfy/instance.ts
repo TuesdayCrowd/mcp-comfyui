@@ -299,7 +299,30 @@ export type LaunchResult =
  * spawned, so a rejected launch has no side effects at all.
  */
 export class LaunchArgumentError extends Error {
-  override readonly name = "LaunchArgumentError";
+  // Typed as `string` rather than inferred as the literal, so that
+  // {@link RemoteLaunchRefusedError} can name itself. Every other error class
+  // here keeps the literal, because none of them is subclassed.
+  override readonly name: string = "LaunchArgumentError";
+}
+
+/**
+ * The one refused argument that is not a mistake in the *arguments* — the
+ * target is a perfectly good address, on a machine this is not.
+ *
+ * A subclass so that everything treating a refused launch as a refused launch
+ * keeps working, while the tool layer can report it under its own kind: the fix
+ * is "start ComfyUI on that machine, or name a different host", which is not
+ * the same instruction as "correct this argument".
+ */
+export class RemoteLaunchRefusedError extends LaunchArgumentError {
+  override readonly name = "RemoteLaunchRefusedError";
+  /** The `host:port` that is not this machine's. */
+  readonly address: string;
+
+  constructor(address: string, message: string) {
+    super(message);
+    this.address = address;
+  }
 }
 
 /**
@@ -642,8 +665,10 @@ function launchTarget(opts: LaunchOptions, argv: readonly string[]): Target {
  */
 function refuseRemoteTarget(target: Target): void {
   if (isLocalAddress(target.host)) return;
-  throw new LaunchArgumentError(
-    `refusing to launch: ${authority(target.host, target.port)} is not an address on this ` +
+  const address = authority(target.host, target.port);
+  throw new RemoteLaunchRefusedError(
+    address,
+    `refusing to launch: ${address} is not an address on this ` +
       `machine, and \`comfy launch\` can only start ComfyUI locally — it has no --host. ` +
       `Start ComfyUI on that machine, or aim this server at a local address.`,
   );

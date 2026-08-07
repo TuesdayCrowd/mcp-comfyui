@@ -1,6 +1,7 @@
 import { statSync } from "node:fs";
+import { networkInterfaces } from "node:os";
 import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
-import { authority } from "./target.ts";
+import { authority, isLocalAddress, type InterfaceAddresses } from "./target.ts";
 
 /**
  * What a path that came out of `comfy` means.
@@ -114,6 +115,16 @@ export interface ArtifactLocation {
  *
  * ## What it refuses, and why each refusal is not caution but correctness
  *
+ * - **An instance on another machine** — the load-bearing one. `outputDirectory`
+ *   is a path in *that* machine's filesystem, and this function's last step is
+ *   to ask whether the file is really there, on *this* one. Two Unix boxes
+ *   sharing a layout — `/home/me/ComfyUI/output` on both — would therefore hand
+ *   back a local path naming a completely different image, or one that does not
+ *   exist as far as the caller is concerned. Measured against the live remote,
+ *   the accident that hides this is Windows: `F:\Dev\ComfyUI\output` is not
+ *   `isAbsolute` under POSIX, so the containment check below declines it for
+ *   the wrong reason. `isLocalAddress` is the right one, and it is checked
+ *   first. See `comfy/target.ts` for why it fails closed.
  * - **Not this instance's address** — only the instance that ran the job knows
  *   where it writes. A `/view` URL on another host names a directory this
  *   server has never seen.
@@ -131,7 +142,13 @@ export interface ArtifactLocation {
  * **This never throws.** A malformed URL, a missing directory, a permission
  * error — every one of them is an unresolved artifact, and the URL stands.
  */
-export function resolveArtifactPath(artifact: string, location: ArtifactLocation): string | null {
+export function resolveArtifactPath(
+  artifact: string,
+  location: ArtifactLocation,
+  interfaces: InterfaceAddresses = networkInterfaces(),
+): string | null {
+  if (!isLocalAddress(location.host, interfaces)) return null;
+
   const url = parseArtifactUrl(artifact);
   if (url === null) return null;
   if (url.pathname !== VIEW_PATH) return null;
@@ -162,10 +179,14 @@ export function resolveArtifactPath(artifact: string, location: ArtifactLocation
 export function resolveArtifactPaths(
   artifacts: readonly string[],
   location: ArtifactLocation,
+  // Read once here rather than once per artifact: `networkInterfaces()` is a
+  // syscall, and a run with twenty outputs would otherwise make twenty of them
+  // to answer the same question twenty times.
+  interfaces: InterfaceAddresses = networkInterfaces(),
 ): Record<string, string> {
   const resolved: Record<string, string> = {};
   for (const artifact of artifacts) {
-    const path = resolveArtifactPath(artifact, location);
+    const path = resolveArtifactPath(artifact, location, interfaces);
     if (path !== null) resolved[artifact] = path;
   }
   return resolved;
