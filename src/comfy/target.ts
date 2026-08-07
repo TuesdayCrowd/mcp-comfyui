@@ -14,6 +14,10 @@ import { networkInterfaces } from "node:os";
 const DEFAULT_HOST = "127.0.0.1";
 export const DEFAULT_PORT = 8188;
 
+/** The TCP port range, inclusive. */
+export const MIN_PORT = 1;
+export const MAX_PORT = 65535;
+
 /**
  * A wildcard bind address is not a connect address (landmine #10). An operator
  * who launched ComfyUI with `--listen 0.0.0.0` will hand us back that same
@@ -52,6 +56,85 @@ export function resolveHost(host: string | undefined): string {
 export function authority(host: string, port: number): string {
   const bare = unbracket(host);
   return `${bare.includes(":") ? `[${bare}]` : bare}:${port}`;
+}
+
+/** Whether a number is usable as a TCP port. */
+export function isPort(value: number): boolean {
+  return Number.isInteger(value) && value >= MIN_PORT && value <= MAX_PORT;
+}
+
+/** A dotted quad. Not a validity check on each octet — `resolveHost` does not claim one either. */
+const IPV4 = /^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+/** One address a caller typed, split into the two parts everything here takes. */
+export interface Address {
+  host: string;
+  port: number;
+}
+
+/**
+ * An address a caller wrote by hand — `100.86.199.90:8189`, `[::1]:8189`,
+ * `localhost` — or `null` when the text is not one.
+ *
+ * ## Why a bare hostname is *not* an address
+ *
+ * Anything is a syntactically valid hostname, including `rtx-vidoe`. If this
+ * accepted one, a mistyped registry name would stop being a mistyped name and
+ * become a DNS lookup, and the caller would be told the host was unreachable
+ * rather than that they had misspelled `rtx-video` — with the correct spelling
+ * sitting right there in the registry, unmentioned. So an address must prove
+ * itself: an IP literal, or `localhost`, or anything at all that carries an
+ * explicit `:port`. Every raw address a person actually types to reach another
+ * machine satisfies one of those, and a name that satisfies none of them is
+ * reported as an unknown name, with the names that would have worked.
+ *
+ * The bracket rule follows RFC 3986 and `fetch`: a bare IPv6 literal is
+ * recognised (`::1`), but pairing one with a port requires brackets
+ * (`[::1]:8189`), because `::1:8189` is itself a valid IPv6 address and nothing
+ * can tell the two readings apart.
+ *
+ * A missing port means {@link DEFAULT_PORT}, so `100.86.199.90` reaches 8188 —
+ * the same default every other entry point here applies.
+ */
+export function parseAddress(text: string): Address | null {
+  const trimmed = text.trim();
+  if (trimmed === "") return null;
+
+  if (trimmed.startsWith("[")) {
+    const close = trimmed.indexOf("]");
+    if (close === -1) return null;
+    const host = trimmed.slice(1, close);
+    const rest = trimmed.slice(close + 1);
+    if (host === "") return null;
+    if (rest === "") return { host, port: DEFAULT_PORT };
+    if (!rest.startsWith(":")) return null;
+    return withPort(host, rest.slice(1));
+  }
+
+  const colons = trimmed.split(":").length - 1;
+  // More than one colon and no brackets: an IPv6 literal, which cannot also be
+  // carrying a port — see the doc comment.
+  if (colons > 1) return { host: trimmed, port: DEFAULT_PORT };
+  if (colons === 1) {
+    const separator = trimmed.indexOf(":");
+    const host = trimmed.slice(0, separator);
+    if (host === "") return null;
+    return withPort(host, trimmed.slice(separator + 1));
+  }
+
+  // No port, so the host has to be self-evidently an address.
+  const bare = trimmed.toLowerCase();
+  if (bare === "localhost" || IPV4.test(trimmed)) return { host: trimmed, port: DEFAULT_PORT };
+  return null;
+}
+
+/** The `host:port` arm, refusing anything that is not a port rather than defaulting it. */
+function withPort(host: string, portText: string): Address | null {
+  // `Number("")` is 0 and `Number(" 8 ")` is 8; neither is a port anyone typed,
+  // so the digits are checked as text before they are read as a number.
+  if (!/^\d+$/.test(portText)) return null;
+  const port = Number(portText);
+  return isPort(port) ? { host, port } : null;
 }
 
 /** Only what this module needs of `os.networkInterfaces()`, so tests can fake it. */
