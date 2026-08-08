@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerTools, resolveSlotTypes, type ToolConfig } from "../src/tools.ts";
@@ -123,6 +123,11 @@ function baseConfig(overrides: Partial<ToolConfig> = {}): ToolConfig {
     env: { MCP_COMFYUI_HOSTS_FILE: join(workdir, "hosts.json") },
     ...overrides,
   };
+}
+
+/** `baseConfig` with extra env, keeping the hosts-file redirect it sets. */
+function configWithEnv(extra: Record<string, string>): ToolConfig {
+  return baseConfig({ env: { MCP_COMFYUI_HOSTS_FILE: join(workdir, "hosts.json"), ...extra } });
 }
 
 /**
@@ -482,4 +487,80 @@ test("search_templates is annotated read-only and takes no host", async () => {
   const tool = tools.find((t) => t.name === "search_templates");
   expect(tool?.annotations?.readOnlyHint).toBe(true);
   expect(Object.keys(tool?.inputSchema.properties ?? {})).not.toContain("host");
+});
+
+// --- origin: "template" on list_workflows -----------------------------------
+
+test("list_workflows tags an entry under the created root, and only that entry", async () => {
+  const roots = join(workdir, "origin-roots");
+  const created = join(workdir, "origin-created");
+  mkdirSync(roots, { recursive: true });
+  mkdirSync(created, { recursive: true });
+  const graph = JSON.stringify({ nodes: [], links: [] });
+  writeFileSync(join(roots, "mine.json"), graph);
+  writeFileSync(join(created, "fetched.json"), graph);
+
+  const client = await connect(configWithEnv({
+    MCP_COMFYUI_WORKFLOW_DIRS: roots,
+    MCP_COMFYUI_CREATED_DIR: created,
+  }));
+  const result = (await client.callTool({
+    name: "list_workflows",
+    arguments: {},
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+
+  const mine = body.workflows.find((w: { name: string }) => w.name === "mine");
+  const fetched = body.workflows.find((w: { name: string }) => w.name === "fetched");
+  expect(fetched.origin).toBe("template");
+  expect(mine.origin).toBeUndefined();
+});
+
+test("a created workflow colliding with an operator's does not take the bare name", async () => {
+  const roots = join(workdir, "collide-roots");
+  const created = join(workdir, "collide-created");
+  mkdirSync(roots, { recursive: true });
+  mkdirSync(created, { recursive: true });
+  const graph = JSON.stringify({ nodes: [], links: [] });
+  writeFileSync(join(roots, "portrait.json"), graph);
+  writeFileSync(join(created, "portrait.json"), graph);
+
+  const client = await connect(configWithEnv({
+    MCP_COMFYUI_WORKFLOW_DIRS: roots,
+    MCP_COMFYUI_CREATED_DIR: created,
+  }));
+  const result = (await client.callTool({
+    name: "list_workflows",
+    arguments: {},
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+
+  // The bare name belongs to the operator's copy. The fetched one is still
+  // listed and still reachable, but under a disambiguated name — this is the
+  // whole point of appending the created root last.
+  const bare = body.workflows.find((w: { name: string }) => w.name === "portrait");
+  expect(bare.path.startsWith(roots)).toBe(true);
+  expect(bare.origin).toBeUndefined();
+  expect(body.workflows.filter((w: { origin?: string }) => w.origin === "template")).toHaveLength(1);
+});
+
+test("a sibling directory sharing the created prefix is not tagged", async () => {
+  const created = mkdtempSync(join(tmpdir(), "mcp-comfyui-prefix-"));
+  const sibling = `${created}-other`;
+  mkdirSync(sibling);
+  writeFileSync(join(sibling, "decoy.json"), JSON.stringify({ nodes: [], links: [] }));
+
+  const client = await connect(configWithEnv({
+    MCP_COMFYUI_WORKFLOW_DIRS: sibling,
+    MCP_COMFYUI_CREATED_DIR: created,
+  }));
+  const result = (await client.callTool({
+    name: "list_workflows",
+    arguments: {},
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.workflows.find((w: { name: string }) => w.name === "decoy").origin).toBeUndefined();
+
+  rmSync(created, { recursive: true, force: true });
+  rmSync(sibling, { recursive: true, force: true });
 });

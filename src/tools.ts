@@ -1,5 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { basename, isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join, sep } from "node:path";
 import { z } from "zod";
 import { fetchArtifacts, type FetchedArtifact } from "./comfy/fetchOutputs.ts";
 import { fetchRemoteWorkflow, listRemoteWorkflows } from "./comfy/userdata.ts";
@@ -32,6 +32,7 @@ import {
   ALLOW_LAUNCH_ENV,
   AUTO_LAUNCH_ENV,
   CACHE_DIR_ENV,
+  createdWorkflowDir,
   HOST_ENV,
   PORT_ENV,
   WORKSPACE_ENV,
@@ -1191,16 +1192,30 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "Pass `host` to ALSO list that ComfyUI's own saved workflows, over its HTTP API. Those " +
         "entries are tagged `source: \"remote:<host>\"`, their `name` is qualified with the host " +
         "(`rtx-video/portrait`), and their `format` is `\"unknown\"` because deciding it means " +
-        "downloading the file — describe_workflow will say if one is not a frontend graph. Every " +
-        "local entry is tagged `source: \"local\"` and can be run on any host; the local library " +
-        "and each host's own files are two separate places, and both are usable.",
+        "downloading the file — describe_workflow will say if one is not a frontend graph. " +
+        "An entry tagged `origin: \"template\"` was fetched from the gallery by " +
+        "create_workflow_from_template rather than written by hand; it behaves like any other " +
+        "local workflow. Every local entry is tagged `source: \"local\"` and can be run on any " +
+        "host; the local library and each host's own files are two separate places, and both are " +
+        "usable.",
       inputSchema: { host: hostArgument },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ host }) =>
       toolAnswer(async () => {
         const listing = await discoverWorkflows({ env: config.env });
-        const local = listing.workflows.map((workflow) => ({ ...workflow, source: "local" }));
+        // Provenance is decided here, not in discover.ts: that module is a pure
+        // content classifier and has no business knowing which root belongs to
+        // this server. Every entry already carries an absolute `path`, so a
+        // prefix comparison is the whole implementation.
+        const created = createdWorkflowDir(config.env);
+        const local = listing.workflows.map((workflow) => ({
+          ...workflow,
+          source: "local",
+          // Absent rather than `origin: null` on an operator's own file: a key
+          // that is only ever one value carries its meaning by being there.
+          ...(workflow.path.startsWith(`${created}${sep}`) ? { origin: "template" } : {}),
+        }));
 
         // Only when a host was named. Without one this lists exactly what it
         // always listed — and the default host is usually this machine, whose
