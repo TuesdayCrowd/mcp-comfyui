@@ -10,6 +10,7 @@ import {
 } from "./comfy/instance.ts";
 import { JobPayloadError } from "./comfy/jobs.ts";
 import { ObjectInfoCacheWriteError, ObjectInfoFetchError } from "./comfy/objectInfo.ts";
+import { TemplatesPayloadError } from "./comfy/templates.ts";
 import { UserdataError } from "./comfy/userdata.ts";
 import {
   HostNotLocalError,
@@ -383,7 +384,8 @@ export function describeError(err: unknown): ToolErrorBody {
     err instanceof RunContractError ||
     err instanceof SetSlotContractError ||
     err instanceof SlotListingParseError ||
-    err instanceof JobPayloadError
+    err instanceof JobPayloadError ||
+    err instanceof TemplatesPayloadError
   ) {
     return { kind: "contract_violation", message: err.message };
   }
