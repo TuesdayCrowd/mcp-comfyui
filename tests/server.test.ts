@@ -142,6 +142,8 @@ function denoServe(handler: (request: Request) => Response | Promise<Response>):
 
 let workdir: string;
 let roots: string;
+/** Where `MCP_COMFYUI_CREATED_DIR` points this run, unwritten — `workflowRoots()` still reports it. */
+let createdDir: string;
 let cacheDir: string;
 let argvOut: string;
 let servers: TestServer[] = [];
@@ -173,6 +175,7 @@ const MANAGED_ENV = [
   "FAKE_COMFY_DISPATCH_LOG",
   "FAKE_COMFY_WORKFLOW_COPY",
   "MCP_COMFYUI_WORKFLOW_DIRS",
+  "MCP_COMFYUI_CREATED_DIR",
   "MCP_COMFYUI_CACHE_DIR",
   "MCP_COMFYUI_HOST",
   "MCP_COMFYUI_PORT",
@@ -197,6 +200,12 @@ beforeEach(async () => {
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
   process.env.MCP_COMFYUI_WORKFLOW_DIRS = roots;
+  // Pointed inside this test's own directory, unwritten, so an exact `roots`
+  // or listing assertion here is deterministic rather than depending on this
+  // developer's real home directory, which `workflowRoots()` would otherwise
+  // append.
+  createdDir = join(workdir, "created");
+  process.env.MCP_COMFYUI_CREATED_DIR = createdDir;
   process.env.MCP_COMFYUI_CACHE_DIR = cacheDir;
   // Pointed inside this test's own directory even though nothing writes one:
   // otherwise every test here would read whoever's real
@@ -689,7 +698,9 @@ test("list_workflows enumerates the configured root and names the handles", asyn
   expect(workflows.map((entry) => entry["name"])).toEqual(["flow", "other"]);
   expect(workflows[0]?.["format"]).toBe("frontend");
   expect(workflows[0]?.["path"]).toBe(join(roots, "flow.json"));
-  expect(body["roots"]).toEqual([roots]);
+  // `workflowRoots()` always appends the created-workflows directory, last —
+  // see config.test.ts for that guarantee in isolation.
+  expect(body["roots"]).toEqual([roots, createdDir]);
 });
 
 test("a corrupt workflow is listed with its problem rather than failing the listing", async () => {
