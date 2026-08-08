@@ -13,8 +13,20 @@ import {
 
 /**
  * No test in this file may read the operator's real workflow directory or
- * contact a server: every root is a fresh temp directory written by the test
- * itself, and every `workflowRoots` call is passed an explicit environment.
+ * contact a server: every scanned root is a fresh temp directory written by
+ * the test itself.
+ *
+ * Most tests hand `discoverWorkflows` an explicit `roots` array, which
+ * bypasses `workflowRoots`/the environment entirely — nothing to guard there.
+ * The "config" section below calls `workflowRoots` directly to inspect its
+ * *return value*, never to scan anything, so an env that omits
+ * `MCP_COMFYUI_CREATED_DIR` there cannot read a real directory either. The one
+ * call that must set it is `discoverWorkflows({ env })`: `workflowRoots`
+ * always appends {@link createdWorkflowDir}'s result as a live scan root, and
+ * an env that leaves `MCP_COMFYUI_CREATED_DIR` unset resolves that to the
+ * operator's real `~/.local/share/mcp-comfyui/workflows` — silently correct
+ * only while nothing has ever written there. Every such call must pin it to a
+ * temp directory too, on the same reasoning as `MCP_COMFYUI_WORKFLOW_DIRS`.
  */
 
 let roots: string[] = [];
@@ -604,11 +616,19 @@ test("an empty or blank override falls back to the default", () => {
 
 test("discoverWorkflows falls back to the configured roots", async () => {
   // Called with no roots at all it must consult the environment rather than
-  // scanning nothing. Pointed at a temp dir so the real one is never read.
+  // scanning nothing. Pointed at a temp dir so the real one is never read —
+  // and MCP_COMFYUI_CREATED_DIR is pinned to a second temp dir for the same
+  // reason: workflowRoots() appends createdWorkflowDir(env) unconditionally,
+  // and leaving it unset here would make this call scan this developer's
+  // real ~/.local/share/mcp-comfyui/workflows once anything (e.g. Task 6)
+  // ever writes a fetched template there.
   const root = makeRoot();
   write(root, "graph.json", frontend());
+  const created = makeRoot();
 
-  const listing = await discoverWorkflows({ env: { MCP_COMFYUI_WORKFLOW_DIRS: root } });
+  const listing = await discoverWorkflows({
+    env: { MCP_COMFYUI_WORKFLOW_DIRS: root, MCP_COMFYUI_CREATED_DIR: created },
+  });
 
   expect(names(listing)).toEqual(["graph"]);
 });

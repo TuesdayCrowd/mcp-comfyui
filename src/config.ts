@@ -106,11 +106,16 @@ export function flag(env: Environment, name: string, fallback: boolean): boolean
 }
 
 /**
- * The directories to scan for workflow files, in the operator's own order.
+ * The directories to scan for workflow files: the operator's own configured
+ * roots, in their given order, followed unconditionally by this server's own
+ * {@link createdWorkflowDir} — appended regardless of what the operator
+ * configured, not merely when they configured nothing.
  *
  * Order is preserved and load-bearing: `workflows/discover.ts` gives the first
  * root's copy of a colliding filename the bare, unqualified name, so this list
- * is a precedence order rather than a set.
+ * is a precedence order rather than a set. The created directory is placed
+ * last within that order for the same reason — see the comment on its
+ * `uniqueRoots` call below.
  *
  * Paths are resolved to absolute so that a relative entry cannot make a
  * reported workflow path depend on the working directory an MCP client happened
