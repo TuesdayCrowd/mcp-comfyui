@@ -12,6 +12,7 @@ const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 const LIMIT5 = join(import.meta.dirname, "fixtures", "templates.video-limit5.json");
 const EXACT = join(import.meta.dirname, "fixtures", "templates.exact-limit.json");
 const EXOTIC_TYPE = join(import.meta.dirname, "fixtures", "templates.exotic-output-type.json");
+const LONG_DESCRIPTION = join(import.meta.dirname, "fixtures", "templates.long-description.json");
 
 /**
  * `RunOptions` is `{timeoutMs?, cwd?}` — there is no `env` option, because
@@ -106,8 +107,24 @@ test("an absent limit sends the default rather than no flag", async () => {
 });
 
 test("descriptions are truncated so 574 rows cannot fill a context window", async () => {
+  // The real gallery's descriptions are short (120 chars in every captured
+  // fixture), so no real capture reaches the 200-char cap — this fixture is
+  // hand-built, on the same reasoning as exact-limit.json and
+  // exotic-output-type.json: rule-shaped code needs an adversarial input a
+  // healthy install cannot produce.
+  process.env.FAKE_COMFY_TEMPLATES_FILE = LONG_DESCRIPTION;
   const listing = await searchTemplates({ type: "video", limit: 5 });
-  for (const row of listing.rows) {
-    if (row.description !== null) expect(row.description.length).toBeLessThanOrEqual(201);
-  }
+
+  // Over the cap: cut to exactly 200 chars plus one ellipsis character.
+  const over = listing.rows[0]?.description;
+  expect(over).not.toBeNull();
+  expect(over?.length).toBe(201);
+  expect(over?.endsWith("…")).toBe(true);
+
+  // At the cap, exactly: untouched, and no ellipsis appended. This is the
+  // boundary an off-by-one in `text.length <= MAX_DESCRIPTION` would miss.
+  const atCap = listing.rows[1]?.description;
+  expect(atCap).toBe("y".repeat(200));
+  expect(atCap?.length).toBe(200);
+  expect(atCap?.endsWith("…")).toBe(false);
 });
