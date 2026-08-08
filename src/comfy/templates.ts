@@ -177,3 +177,70 @@ export async function searchTemplates(
     rows,
   };
 }
+
+/** What `templates fetch` reports about what it wrote. */
+export interface FetchedTemplate {
+  name: string;
+  title: string | null;
+  output_type: string | null;
+  bytes: number | null;
+  path: string;
+}
+
+const FetchPayloadSchema = z.looseObject({
+  name: z.string().optional(),
+  title: z.string().nullable().optional(),
+  output_type: z.string().nullable().optional(),
+  bytes: z.number().int().nullable().optional(),
+});
+
+/**
+ * Refuse a value that would be read as a flag.
+ *
+ * The template name travels as a **positional** argument, ahead of `-o`. A
+ * value starting with `-` is taken by the CLI's own parser as an option
+ * instead — measured in this project before, where a slot address of
+ * `--input` smuggled in a caller-chosen file. `promptIdArgument` and
+ * `encodePair` guard the same hazard in their own modules; this is the third.
+ *
+ * @throws {Error} the value would be parsed as a flag.
+ */
+export function assertNotFlag(what: string, value: string): void {
+  if (value.startsWith("-")) {
+    throw new Error(
+      `a ${what} cannot start with \`-\` (${JSON.stringify(value)}): it is passed to comfy as a ` +
+        "positional argument and would be read as a flag.",
+    );
+  }
+}
+
+/**
+ * Fetch one gallery template to `destination`, which must be absolute.
+ *
+ * The bytes are never read here. `comfy` writes the file and the existing
+ * pipeline reads it; this function only reports what was written.
+ *
+ * @throws {Error} the template name would be read as a flag.
+ * @throws {TemplatesPayloadError} the CLI's payload was not a fetch report.
+ * @throws {ComfyCliError} the CLI reported a failure envelope, e.g. `template_not_found`.
+ */
+export async function fetchTemplate(
+  template: string,
+  destination: string,
+  opts: RunOptions = {},
+): Promise<FetchedTemplate> {
+  assertNotFlag("template name", template);
+  const data = await runComfy(
+    [JSON_MODE, "templates", "fetch", template, "-o", destination],
+    opts,
+  );
+  const result = FetchPayloadSchema.safeParse(data);
+  if (!result.success) throw new TemplatesPayloadError("templates fetch", data, result.error);
+  return {
+    name: result.data.name ?? template,
+    title: result.data.title ?? null,
+    output_type: result.data.output_type ?? null,
+    bytes: result.data.bytes ?? null,
+    path: destination,
+  };
+}

@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   DEFAULT_TEMPLATE_LIMIT,
   MAX_TEMPLATE_LIMIT,
+  fetchTemplate,
   searchTemplates,
 } from "../src/comfy/templates.ts";
 
@@ -13,6 +15,7 @@ const LIMIT5 = join(import.meta.dirname, "fixtures", "templates.video-limit5.jso
 const EXACT = join(import.meta.dirname, "fixtures", "templates.exact-limit.json");
 const EXOTIC_TYPE = join(import.meta.dirname, "fixtures", "templates.exotic-output-type.json");
 const LONG_DESCRIPTION = join(import.meta.dirname, "fixtures", "templates.long-description.json");
+const BIGSEED = join(import.meta.dirname, "fixtures", "template.bigseed.json");
 
 /**
  * `RunOptions` is `{timeoutMs?, cwd?}` — there is no `env` option, because
@@ -24,6 +27,10 @@ const FIXTURE_ENV = [
   "COMFY_BIN",
   "FAKE_COMFY_MODE",
   "FAKE_COMFY_TEMPLATES_FILE",
+  "FAKE_COMFY_TEMPLATE_FILE",
+  "FAKE_COMFY_TEMPLATE_NAME",
+  "FAKE_COMFY_ERROR_CODE",
+  "FAKE_COMFY_ERROR_MESSAGE",
   "FAKE_COMFY_ARGV_OUT",
 ];
 
@@ -127,4 +134,55 @@ test("descriptions are truncated so 574 rows cannot fill a context window", asyn
   expect(atCap).toBe("y".repeat(200));
   expect(atCap?.length).toBe(200);
   expect(atCap?.endsWith("…")).toBe(false);
+});
+
+function digest(path: string): string {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
+/** Switch the shared fixture over to fetch mode for one test. */
+function useFetchMode(): void {
+  process.env.FAKE_COMFY_MODE = "templates_fetch";
+  process.env.FAKE_COMFY_TEMPLATE_FILE = BIGSEED;
+  process.env.FAKE_COMFY_TEMPLATE_NAME = "fixture_template";
+}
+
+test("the fetched file is byte-identical, so a 2^64-1 widget value survives", async () => {
+  useFetchMode();
+  const dest = join(workdir, "out.json");
+  await fetchTemplate("fixture_template", dest);
+  // Digest, never JSON.parse — non-negotiable #1. A round trip through JS
+  // would render this seed 18446744073709552000, and a test that compared
+  // parsed objects would go on passing.
+  expect(digest(dest)).toBe(digest(BIGSEED));
+  expect(readFileSync(dest, "utf8")).toContain("18446744073709551615");
+});
+
+test("the template name and destination reach the CLI in the right order", async () => {
+  useFetchMode();
+  const dest = join(workdir, "out.json");
+  await fetchTemplate("fixture_template", dest);
+  const argv = readFileSync(argvOut, "utf8").trim().split(/\s+/);
+  expect(argv.indexOf("--json")).toBeLessThan(argv.indexOf("templates"));
+  expect(argv.slice(argv.indexOf("templates"))).toEqual([
+    "templates", "fetch", "fixture_template", "-o", dest,
+  ]);
+});
+
+test("a template name starting with a dash is refused before spawning", async () => {
+  // The name is a POSITIONAL. `--gallery` in this position is read by the CLI's
+  // own parser as a flag, which is how a caller-chosen file once got smuggled
+  // into an unrelated command in this project (see encodePair, promptIdArgument).
+  useFetchMode();
+  await expect(fetchTemplate("--gallery", join(workdir, "out.json")))
+    .rejects.toThrow(/cannot start with/);
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("the CLI's own template_not_found survives as a ComfyCliError", async () => {
+  process.env.FAKE_COMFY_MODE = "fail_code";
+  process.env.FAKE_COMFY_ERROR_CODE = "template_not_found";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "no template named 'nope' in the gallery";
+  await expect(fetchTemplate("nope", join(workdir, "out.json")))
+    .rejects.toMatchObject({ code: "template_not_found" });
 });
