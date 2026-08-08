@@ -91,3 +91,27 @@ On failure `ok:false` and `error:{code,message,hint,details}`.
 23. **A remote instance's `outputDirectory` is a path in *its* filesystem.** Measured: the live remote reports `F:\Dev\ComfyUI\output` and `--listen 100.86.199.90,127.0.0.1` (a comma-separated list — a shape `--listen` really does carry). Resolving a `/view` URL against that directory and then asking whether the file exists **here** is a category error that a Windows path only hides by accident, since it is not `isAbsolute` under POSIX. Two Unix machines sharing a layout would produce a local path naming a different image entirely. Locality must be decided on the address, not on whether the path happens to resolve.
 
 ---
+
+*Measured 2026-08-08, against comfy-cli `v1.13.0-59-g95d7897` and a live ComfyUI **0.30.2** at `100.86.199.90:8189`.*
+
+24. **The CLI refuses to fetch `/object_info` from a non-loopback address in local mode.** Measured, running a workflow with inputs against a remote host:
+
+    ```
+    cql_no_graph: Refusing to fetch object_info from non-loopback host
+    '100.86.199.90' in local mode (potential SSRF). Use --where cloud for remote targets.
+    ```
+
+    So any command that needs node definitions for a remote — `workflow slots`, `set-slot` — must be given `--input <cached object_info>`; there is no address it will fetch from. `describe_workflow` was unaffected only because it already passed `--input`. The run path did not, and `run_workflow` with `inputs` was broken against every remote host until this was found. **The cache is the only schema source that works off-box.**
+
+25. **A subgraph's interior nodes are renamed `outer:inner` — with a COLON — during API conversion, while `workflow slots` addresses them `outer/inner` with a SLASH.** `workflow_to_api.py:369` does `expanded["id"] = f"{outer_id}:{inner.get('id')}"`, and `run/__init__.py:213,259` echoes exactly that object as `prompt_preview`. So a caller's address `129/93.text` and the submitted graph's key `129:93` never match, and any code comparing one against the other reports **every** subgraph-interior address as absent, unconditionally — a false negative that looks exactly like a value that failed to apply. This server's `run.ts` had that bug: it reported `status: "missing"` for an address whose value had in fact been applied correctly. Chained nesting keeps chaining colons, so translation is `replaceAll("/", ":")`, not a single split.
+
+26. **`set-slot` cannot address a subgraph instance's own widget, and says so identically for a real widget name and for garbage.** On a ComfyUI 0.30.2 workflow, `set-slot '129.text=…'` fails:
+
+    ```
+    workflow_slot_invalid: no proxyWidget mapping for 129.text; address an
+    interior input directly, e.g. 129/<innerId>.<input>
+    ```
+
+    `129.unet_name`, `129.value` and the invented `129.not_a_thing` all return the byte-identical shape, so "rejected" carries no information about whether the name was real. Cause: `cql/engine.py:1710,1874` read only `instance.properties.proxyWidgets`, the **older** subgraph scheme; 0.30.2 puts the curated parameter list on the subgraph *definition* as `sg["inputs"][].linkIds`, which comfy-cli never reads. The in-source comment anticipates a *stale* `proxyWidgets`, not an *absent* one — this reads as an unhandled schema version rather than a decision.
+
+    **The interior address is the effective one**, and the instance's own widget value is dead. Proven by a three-way `convert_ui_to_api` comparison: pristine → default text; `set-slot 129/93.text=MARKER` → `MARKER` survives conversion; mutating node 129's own `widgets_values[0]` → converted output **unchanged**. `_rewrite_internal_input` severs an interior link whose origin is the boundary sentinel `-10` and never re-attaches the outer node's widget in its place. So a boundary-fed interior input is **not** a decoy — treating it as one would refuse the only address that works.
