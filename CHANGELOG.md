@@ -11,10 +11,10 @@ All notable changes to this project are recorded here. The format follows
 - `search_templates` and `create_workflow_from_template`: find a workflow in
   comfy-cli's template gallery and materialise it locally. A fetched template is
   frontend format, so `describe_workflow` and `run_workflow` read it with no
-  change to the pipeline — on `video_wan2_2_14B_i2v`, whose 58 slots include 14
-  decoys the existing inert detection correctly refuses, per the 2026-08-07
-  design-phase measurement; no ComfyUI was reachable to re-verify against a
-  live `describe_workflow` run.
+  change to the pipeline — verified on 2026-08-08 against a live remote ComfyUI
+  0.30.2, where `video_wan2_2_14B_i2v` described as 44 settable inputs, 14
+  decoys correctly refused, and **zero unresolved**, with every enum drawn from
+  that box's own models.
 - `MCP_COMFYUI_CREATED_DIR`, appended **last** to the workflow roots so a fetched
   workflow can never shadow one you made. Entries under it list as
   `origin: "template"`.

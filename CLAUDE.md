@@ -169,7 +169,14 @@ A real run also confirmed three things previously known only from source: `conve
 
 - `search_templates {type: "video", tag: "Image to Video", limit: 5}` matched 53 templates in the live gallery and returned the 5 requested.
 - `create_workflow_from_template {template: "video_wan2_2_14B_i2v"}` fetched the real workflow and wrote 84289 bytes — a genuine frontend graph (`nodes`, `last_node_id: 164`, `last_link_id: 292`), matching the design doc's own capture of this same template.
-- `describe_workflow` on the result was **not** exercised against a live ComfyUI: no instance was reachable on this machine, and `MCP_COMFYUI_AUTO_LAUNCH=0` meant the call never tried to start one. It failed with `object_info_unavailable`, and the script reported that plainly and exited 1 — the graceful-degradation path this script exists to prove, working as designed. The 58-slots/14-decoys figures in the changelog rest on the design-phase measurement in `docs/plans/2026-08-07-workflow-creation-design.md` (2026-08-07), not on a fresh run of this server's own `describe_workflow`; that specific re-verification is outstanding, pending a reachable ComfyUI.
+- `describe_workflow` on the result was not exercised in that run: no instance was reachable on this machine, and `MCP_COMFYUI_AUTO_LAUNCH=0` meant the call never tried to start one. It failed with `object_info_unavailable` and the script exited 1 — the graceful-degradation path this script exists to prove, working as designed.
+
+**The remaining step, closed on 2026-08-08** against the live Windows box at `100.86.199.90:8189` (ComfyUI **0.30.2**, registered as `xinde-win-64`), through `dist/index.js` under `node` over real stdio, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout and the **real** created-workflows directory rather than a temp one:
+
+- `search_templates {type: "video", tag: "Image to Video", limit: 5}` matched 53 of 574 and returned 5, `truncated: true`.
+- `create_workflow_from_template {template: "video_wan2_2_14B_i2v"}` wrote 84289 bytes to `~/.local/share/mcp-comfyui/workflows/`, and `list_workflows` then reported it `origin: "template"`, `format: "frontend"` — the created root is discovered, classified and tagged with no further argument.
+- `describe_workflow {workflow: "video_wan2_2_14B_i2v", host: "xinde-win-64"}` returned **44 settable, 14 inert, 0 unresolved** — matching the design-phase measurement exactly, at a nesting depth where 55 of 58 addresses are inside a subgraph. The inert set is the same fourteen: `129/98.length` (fed by `ComfyMathExpression`), `129/94.fps` (`PrimitiveFloat`), and the twelve sampler/switch addresses.
+- **The enums came from the Windows box, not this Mac.** `129/90.vae_name` offered `wan2.2_vae.safetensors`, `129/102.lora_name` offered `wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors`, and `97.image` listed that machine's own input directory. Zero unresolved means every node in a gallery template resolved against a host this server had never described before — which is the whole point of joining slots to per-host `/object_info`.
 
 ## Known gaps
 
