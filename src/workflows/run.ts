@@ -575,6 +575,38 @@ function splitAddress(address: string): { nodeId: string; field: string } | unde
 }
 
 /**
+ * The submitted graph's own key for a node, translated from this server's
+ * addressing for a subgraph-interior node (`129/93`, slash-joined — exactly
+ * what `comfy workflow slots` reports and `set-slot` accepts; built by
+ * `discover.ts`'s `analyseScope`) into the key `comfy_cli.workflow_to_api`'s
+ * subgraph expansion actually assigns before submitting.
+ *
+ * Measured directly against the installed comfy-cli:
+ * `_expand_one_subgraph` renames every interior node's id to
+ * `f"{outer_id}:{inner.get('id')}"` (COLON, never slash) — one rename per
+ * level of nesting, each applied to an `outer_id` that is already
+ * colon-joined from the level above, so a chain of any depth translates by
+ * replacing every `/` with `:`. Confirmed end to end on a real template
+ * (`video_wan2_2_14B_i2v.json`): a value written to `129/93.text` via
+ * `set-slot` survived subgraph expansion and landed in the submitted graph's
+ * `"129:93"` node, untouched.
+ *
+ * Without this translation, `submittedValueOf` below indexed the submitted
+ * graph with the address's own unmodified nodeId — `prompt["129/93"]` —
+ * which can never match the graph's real key. Every subgraph-interior
+ * address was reported `missing` unconditionally, whether or not the value
+ * actually took effect: a false negative in this server's own verification,
+ * not evidence the value was discarded.
+ *
+ * A no-op for the overwhelming majority of addresses: a top-level node id
+ * never contains `/`, so `replaceAll` leaves it untouched — the existing
+ * flat-address test suite below is the regression guard for that.
+ */
+function submittedNodeKey(addressNodeId: string): string {
+  return addressNodeId.replaceAll("/", ":");
+}
+
+/**
  * The submitted API-format prompt's value for one address, from an object
  * already produced by {@link guardLargeIntegers} + `JSON.parse` — never from
  * the ordinary, precision-lossy parse {@link decodeStream} performs for its
@@ -586,7 +618,7 @@ function submittedValueOf(
   field: string,
 ): { found: true; value: string | number | boolean | null } | { found: false } {
   if (!isRecord(prompt)) return { found: false };
-  const node = prompt[nodeId];
+  const node = prompt[submittedNodeKey(nodeId)];
   if (!isRecord(node)) return { found: false };
   const inputs = node["inputs"];
   if (!isRecord(inputs) || !Object.hasOwn(inputs, field)) return { found: false };
