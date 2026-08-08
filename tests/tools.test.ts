@@ -450,12 +450,14 @@ test("search_templates refuses a call with no filter, without spawning", async (
     arguments: {},
   })) as CallToolResult;
 
+  // Checked BEFORE the body: this is the property the guard exists for, and
+  // asserting it first is what lets the test tell "no guard" apart from "guard
+  // ran too late". Both produce the same error kind.
+  expect(existsSync(argvOut)).toBe(false);
+
   const body = JSON.parse(textOf(result));
   expect(body.error.kind).toBe("invalid_input");
   expect(body.error.message).toContain("at least one");
-  // The refusal must beat the subprocess: the fixture never ran, so it never
-  // wrote its argv file. This is the assertion the whole guard exists for.
-  expect(existsSync(argvOut)).toBe(false);
 });
 
 test("search_templates passes one filter through and reports the true match count", async () => {
