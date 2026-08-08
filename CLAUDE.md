@@ -63,6 +63,7 @@ src/comfy/          the CLI and instance layer
   fetchOutputs.ts   copy a remote run's artifacts here, on request only
   jobs.ts           jobs status | ls | cancel
   instance.ts       detection and guarded launch
+  templates.ts      the gallery: search and fetch. No host — it is not a ComfyUI.
 src/workflows/
   discover.ts       find workflow files, classify by CONTENT not filename
   slots.ts          comfy workflow slots -> typed Slot[]
@@ -89,6 +90,10 @@ These are not style preferences. Each was measured, and each has a test pinning 
 **1. Never let JS parse or re-serialise a workflow graph.** ComfyUI seeds reach 2^64−1; JavaScript rounds above 2^53. Measured: `set-slot --stdout` on a graph holding `18446744073709551615` returned the exact digits, and our `JSON.parse` corrupted that *untouched* seed to `18446744073709552000`. Hence the byte-copy in `setSlots.ts` and the graph-dropping in `run.ts` (`comfy run --json` echoes the whole graph as a `prompt_preview` event on every run). **Assume this recurs anywhere a comfy payload can contain a graph.**
 
 **2. Every registry from the CLI is an open string** — `error.code`, slot `type`, job `status`, run `event.type`. Upstream documents error codes as append-only, and its published schemas are already behind its own source. Closing an enum breaks the server on the next CLI release. Tests assert the published enums are incomplete, so the argument stays checkable.
+
+`comfy validate`'s 13 diagnostic codes (`unknown_enum_value`, `required_input_missing`,
+`dangling_edge`, …) appear in NONE of comfy-cli's published `error_codes.py` registry — a
+second, wholly undocumented open-string vocabulary. Measured 2026-08-07.
 
 **3. Branch on the envelope, never on the exit code.** Exit 1 covers missing file, downed server, HTTP error, conversion failure, validation failure, and execution error alike.
 
@@ -159,6 +164,12 @@ Against a live ComfyUI 0.29.0 through the compiled binary over stdio: `describe_
 - Two defects were found by this run and fixed: `UserdataError` reached the tool layer unclassified and was reported as `internal_error`; and a *mistyped workflow name* fell through to the default host's library, failed to reach it, and came back as `fetch failed` about `/api/userdata` instead of `workflow_not_found` with the 27 names that would have worked. A host consulted only as a fallback must not become the story; one the caller named still is.
 
 A real run also confirmed three things previously known only from source: `converted` and `prompt_preview` **are** emitted and are absent from comfy-cli's published event enum; `prompt_preview` carries the whole graph (landmine #12); and `queued`/`executed` carry undeclared fields (`validation_warnings`, `nodes`, structured `outputs`) that `looseObject` preserves.
+
+**Template creation against the real gallery, verified on 2026-08-08** through `dist/index.js` under `node` over real stdio (`scripts/smoke-templates.mjs`), with `MCP_COMFYUI_AUTO_LAUNCH=0` and `MCP_COMFYUI_CREATED_DIR` pointed at an isolated temp directory rather than the real default:
+
+- `search_templates {type: "video", tag: "Image to Video", limit: 5}` matched 53 templates in the live gallery and returned the 5 requested.
+- `create_workflow_from_template {template: "video_wan2_2_14B_i2v"}` fetched the real workflow and wrote 84289 bytes — a genuine frontend graph (`nodes`, `last_node_id: 164`, `last_link_id: 292`), matching the design doc's own capture of this same template.
+- `describe_workflow` on the result was **not** exercised against a live ComfyUI: no instance was reachable on this machine, and `MCP_COMFYUI_AUTO_LAUNCH=0` meant the call never tried to start one. It failed with `object_info_unavailable`, and the script reported that plainly and exited 1 — the graceful-degradation path this script exists to prove, working as designed. The 58-slots/14-decoys figures in the changelog rest on the design-phase measurement in `docs/plans/2026-08-07-workflow-creation-design.md` (2026-08-07), not on a fresh run of this server's own `describe_workflow`; that specific re-verification is outstanding, pending a reachable ComfyUI.
 
 ## Known gaps
 

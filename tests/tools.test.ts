@@ -605,7 +605,9 @@ test("an existing target is refused and the existing file is untouched", async (
   })) as CallToolResult;
   const body = JSON.parse(textOf(result));
   expect(body.error.kind).toBe("invalid_input");
-  expect(body.error.message).toContain("as");
+  // A substring as loose as "as" also matches "Pass" — assert the existing
+  // path instead, which only this message names.
+  expect(body.error.message).toContain(target);
   expect(readFileSync(target, "utf8")).toBe("ORIGINAL");
 });
 

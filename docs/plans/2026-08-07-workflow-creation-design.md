@@ -396,12 +396,11 @@ exactly the recovery a caller needs.
 Three failures need thought:
 
 - **Network failure on `fetch`.** The gallery index is cached; the workflow JSON
-  is not. Whether a genuine network failure arrives as a clean `ok:false`
-  envelope or as unparseable output was **not** measured — the investigation had
-  connectivity throughout. Measure it before **Stage 3** ships (Stage 3 owns
-  `fetch`; Stage 2 makes no CLI call at all); if it is not an envelope, it lands
-  in the existing `EnvelopeParseError` arm, which is survivable but produces a
-  worse message than it should.
+  is not. Measured 2026-08-08, behind an RFC 5737 blackhole proxy: `templates
+  fetch` still returns a clean `envelope/1`, `ok:false`,
+  `error.code: "template_fetch_failed"`, exit 1, after roughly 16s — comfy's own
+  `urlopen` timeout. It lands on the existing `ComfyCliError` path above, same as
+  `template_not_found`, so no new arm was needed.
 - **Target exists.** A refusal from this server, not the CLI, so it is a
   `ToolArgumentError` with the existing path in the message. There is
   deliberately no `overwrite` flag, which means a caller wanting a freshly

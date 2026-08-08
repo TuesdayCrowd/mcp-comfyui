@@ -63,7 +63,9 @@ export function createServer(env: Environment = process.env): McpServer {
       "Drives a local ComfyUI. The order is list_workflows -> describe_workflow -> run_workflow: " +
       "describe_workflow is the only source of the slot addresses (`3.seed`, `6.text`) that " +
       "run_workflow's inputs are keyed by. A run submitted without `wait: true` returns a " +
-      "prompt_id to poll with get_job.",
+      "prompt_id to poll with get_job. " +
+      "When list_workflows has nothing that fits the task, search_templates finds a ready-made " +
+      "workflow in the Comfy gallery and create_workflow_from_template turns it into a local one. ",
   });
 
   registerTools(server, toolConfig(env));

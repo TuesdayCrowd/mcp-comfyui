@@ -35,6 +35,8 @@ const FIXTURES = join(import.meta.dirname, "fixtures");
 const FAKE_COMFY = join(FIXTURES, "fake-comfy-dispatch");
 const OBJECT_INFO_SAMPLE = join(FIXTURES, "object_info.sample.json");
 const SLOTS_SAMPLE = join(FIXTURES, "slots.default_image_gen.json");
+/** A frontend-format workflow with one settable slot, from Task 5's fetch tests. */
+const SLOTS_CAPABLE_TEMPLATE = join(FIXTURES, "template.bigseed.json");
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 /**
@@ -533,12 +535,14 @@ test("the read-only tools are annotated read-only", async () => {
   }
 });
 
-test("the two tools that change something are annotated not read-only", async () => {
+test("the three tools that change something are annotated not read-only", async () => {
   // A client that hides or auto-approves read-only tools must not auto-approve
-  // a GPU render or the interruption of one.
+  // a GPU render, the interruption of one, or a fetch that writes a new
+  // workflow file to disk.
   const list = await tools(await connect());
   expect(toolNamed(list, "run_workflow").annotations?.readOnlyHint).toBe(false);
   expect(toolNamed(list, "cancel_job").annotations?.readOnlyHint).toBe(false);
+  expect(toolNamed(list, "create_workflow_from_template").annotations?.readOnlyHint).toBe(false);
 });
 
 test("cancel_job is annotated destructive and idempotent", async () => {
@@ -3030,4 +3034,71 @@ test("the build makes dist/ describe its own module format", async () => {
 
   expect(result.stderr).not.toContain("outside a module");
   expect(result.code).toBe(0);
+});
+
+// --- template creation needs no new pipeline ------------------------------
+
+test("a fetched template is describable by the existing pipeline, unchanged", async () => {
+  // The whole design rests on this: `templates fetch` writes frontend format,
+  // so describe_workflow reads it with no conversion step. If this fails, the
+  // feature does not work, however green the unit tests are. Driven over real
+  // stdio against the real dist/index.js, on this file's own pattern for that
+  // (see the stdio-landmine tests above), because that is the path a real MCP
+  // client actually takes — connect()'s in-memory transport never touches it.
+  const child = spawnDist({
+    ...process.env,
+    FAKE_COMFY_MODE: "templates_fetch",
+    FAKE_COMFY_TEMPLATE_FILE: SLOTS_CAPABLE_TEMPLATE,
+    FAKE_COMFY_TEMPLATE_NAME: "fixture_template",
+  });
+
+  // Two round trips, not one pipelined write: the SDK dispatches incoming
+  // requests as they arrive rather than queueing them, so a list_workflows
+  // sent before create_workflow_from_template's response has come back could
+  // race its async file write and see a directory that does not have the new
+  // file in it yet — a flake that would have nothing to do with the wiring
+  // this test exists to prove.
+  await writeStdin(child, INITIALIZE_LINE);
+  await writeStdin(
+    child,
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "create_workflow_from_template", arguments: { template: "fixture_template" } },
+    })}\n`,
+  );
+  const afterCreate = await readUntil(child.stdout, 2, 10_000); // the initialize response, then this one
+
+  await writeStdin(
+    child,
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "list_workflows", arguments: {} },
+    })}\n`,
+  );
+  const afterList = await readUntil(child.stdout, 1, 10_000); // one more line, on the same stream
+
+  child.kill("SIGKILL");
+  child.stdout.cancel();
+  child.stderr.cancel();
+  await child.status;
+
+  const lines = `${afterCreate}${afterList}`.split("\n").filter((line) => line.trim() !== "");
+  const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  const byId = new Map(messages.filter((m) => m["id"] !== undefined).map((m) => [m["id"], m]));
+
+  const created = byId.get(2)?.["result"] as { content: Array<{ text: string }> };
+  const createdBody = JSON.parse(created.content[0]!.text) as Record<string, unknown>;
+  expect(createdBody["path"]).toBe(join(createdDir, "fixture_template.json"));
+
+  const listed = byId.get(3)?.["result"] as { content: Array<{ text: string }> };
+  const listedBody = JSON.parse(listed.content[0]!.text) as Record<string, unknown>;
+  const entry = (listedBody["workflows"] as Array<Record<string, unknown>>).find(
+    (workflow) => workflow["name"] === "fixture_template",
+  );
+  expect(entry?.["origin"]).toBe("template");
+  expect(entry?.["format"]).toBe("frontend");
 });
