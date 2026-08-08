@@ -993,7 +993,14 @@ export async function resolveSlotTypes(
   // The resolved address rather than the whole `ToolConfig`: this is the only
   // thing it ever wanted from one, and taking it directly is what keeps the
   // function callable from a test without standing up a host registry.
-  location: { host: string; port: number },
+  //
+  // `objectInfoPath` is passed for a host that is not on this machine. comfy-cli
+  // refuses to fetch `/object_info` from a non-loopback address in local mode
+  // — "potential SSRF", measured against a live remote on 2026-08-08 — so for a
+  // remote the cached copy is not an optimisation, it is the only source that
+  // works. Omitted for a local host, where the live server is still preferred
+  // for the reason the call site documents.
+  location: { host: string; port: number; objectInfoPath?: string },
 ): Promise<Record<string, string>> {
   const values = Object.values(inputs ?? {});
   const ambiguous = values.some((value) => typeof value === "string" && looksLikeJsonLiteral(value));
@@ -1581,17 +1588,34 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // `applySlots` is about to make — which does not exist yet. The cost is
         // one call's worth of finding 1's improvement, and `applySlots` already
         // treats an unknown slot type exactly as it always did.
+        // For a host that is not on this machine the CLI cannot reach
+        // `/object_info` at all: it refuses a non-loopback fetch in local mode
+        // as potential SSRF (measured 2026-08-08 against a live remote —
+        // `cql_no_graph`, "Refusing to fetch object_info from non-loopback
+        // host"). So a remote target is pointed at the cache this server keeps
+        // per host, which `describe_workflow` has already populated by the time
+        // a caller knows which addresses to set.
+        const schemaSource = target.local
+          ? {}
+          : { objectInfoPath: objectInfoCachePath({ ...address(target), cacheDir: config.cacheDir }) };
+
         const slotTypes =
           resolved.source === "remote"
             ? {}
-            : await resolveSlotTypes(resolved.path, inputs as SlotInputs | undefined, address(target));
+            : await resolveSlotTypes(resolved.path, inputs as SlotInputs | undefined, {
+              ...address(target),
+              ...schemaSource,
+            });
 
         // A run needs a live server whatever happens, so `set-slot` is pointed
         // at the same server rather than at the offline cache: making the edit
         // work with ComfyUI down would buy a graph nothing could then submit.
-        // describe_workflow is the opposite case, and does the opposite.
+        // describe_workflow is the opposite case, and does the opposite. The
+        // exception is a remote host, per `schemaSource` above — there the live
+        // server is not a source the CLI is allowed to read.
         const prepared = await applySlots(resolved.path, (inputs ?? {}) as SlotInputs, {
           ...address(target),
+          ...schemaSource,
           slotTypes,
           contents: resolved.contents,
         });
