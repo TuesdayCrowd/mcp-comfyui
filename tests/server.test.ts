@@ -511,10 +511,11 @@ async function failure(
 
 // --- registration --------------------------------------------------------
 
-test("registers exactly the nine default tools", async () => {
+test("registers exactly the ten default tools", async () => {
   expect(await toolNames(await connect())).toEqual([
     "cancel_job",
     "comfy_status",
+    "create_workflow_from_template",
     "describe_workflow",
     "get_job",
     "list_hosts",

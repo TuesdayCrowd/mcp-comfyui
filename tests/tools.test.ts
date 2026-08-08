@@ -33,6 +33,8 @@ import { describeError } from "../src/toolResult.ts";
 const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 const SLOTS_SAMPLE = join(import.meta.dirname, "fixtures", "slots.default_image_gen.json");
 const LIMIT5 = join(import.meta.dirname, "fixtures", "templates.video-limit5.json");
+/** A frontend-format workflow carrying a 2^64-1 value, for the fetch tests below. */
+const BIGSEED = join(import.meta.dirname, "fixtures", "template.bigseed.json");
 
 let workdir: string;
 let argvOut: string;
@@ -104,6 +106,8 @@ afterEach(async () => {
   delete process.env.FAKE_COMFY_ERROR_CODE;
   delete process.env.FAKE_COMFY_ERROR_MESSAGE;
   delete process.env.FAKE_COMFY_TEMPLATES_FILE;
+  delete process.env.FAKE_COMFY_TEMPLATE_FILE;
+  delete process.env.FAKE_COMFY_TEMPLATE_NAME;
   rmSync(workdir, { recursive: true, force: true });
 });
 
@@ -563,4 +567,80 @@ test("a sibling directory sharing the created prefix is not tagged", async () =>
 
   rmSync(created, { recursive: true, force: true });
   rmSync(sibling, { recursive: true, force: true });
+});
+
+// --- create_workflow_from_template ------------------------------------------
+
+/** Point the fixture at a frontend-format workflow carrying a 2^64-1 value. */
+function useFetchMode(): void {
+  process.env.FAKE_COMFY_MODE = "templates_fetch";
+  process.env.FAKE_COMFY_TEMPLATE_FILE = BIGSEED;
+  process.env.FAKE_COMFY_TEMPLATE_NAME = "fixture_template";
+}
+
+test("create_workflow_from_template writes into the created directory and returns the path", async () => {
+  useFetchMode();
+  const created = join(workdir, "created");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template" },
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.path).toBe(join(created, "fixture_template.json"));
+  expect(existsSync(body.path)).toBe(true);
+});
+
+test("an existing target is refused and the existing file is untouched", async () => {
+  useFetchMode();
+  const created = join(workdir, "created2");
+  mkdirSync(created, { recursive: true });
+  const target = join(created, "fixture_template.json");
+  writeFileSync(target, "ORIGINAL");
+
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template" },
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.error.kind).toBe("invalid_input");
+  expect(body.error.message).toContain("as");
+  expect(readFileSync(target, "utf8")).toBe("ORIGINAL");
+});
+
+test("`as` cannot climb out of the created directory", async () => {
+  useFetchMode();
+  const created = join(workdir, "created3");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  for (const bad of ["../escape", "sub/dir", "..", ".", "/absolute", "a b"]) {
+    const result = (await client.callTool({
+      name: "create_workflow_from_template",
+      arguments: { template: "fixture_template", as: bad },
+    })) as CallToolResult;
+    const body = JSON.parse(textOf(result));
+    expect(body.error.kind).toBe("invalid_input");
+  }
+  expect(existsSync(join(workdir, "escape.json"))).toBe(false);
+});
+
+test("`as` names the file when it is a plain stem", async () => {
+  useFetchMode();
+  const created = join(workdir, "created4");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template", as: "my-video" },
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.path).toBe(join(created, "my-video.json"));
+});
+
+test("create_workflow_from_template is not read-only and takes no host", async () => {
+  const client = await connect(baseConfig());
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "create_workflow_from_template");
+  expect(tool?.annotations?.readOnlyHint).toBe(false);
+  expect(tool?.annotations?.destructiveHint).toBe(false);
+  expect(Object.keys(tool?.inputSchema.properties ?? {})).not.toContain("host");
 });

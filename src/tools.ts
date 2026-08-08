@@ -1,4 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { existsSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { basename, isAbsolute, join, sep } from "node:path";
 import { z } from "zod";
 import { fetchArtifacts, type FetchedArtifact } from "./comfy/fetchOutputs.ts";
@@ -13,6 +15,7 @@ import {
 import { cancelJob, getJobStatus, type CancelResult, type JobStatus } from "./comfy/jobs.ts";
 import {
   DEFAULT_TEMPLATE_LIMIT,
+  fetchTemplate,
   MAX_TEMPLATE_LIMIT,
   searchTemplates,
   type TemplateFilters,
@@ -609,6 +612,35 @@ function requireOneFilter(filters: TemplateFilters): void {
       "`name`. The gallery holds hundreds of templates and returning all of them would not fit " +
       "in a useful answer. Try {type: \"video\"} or {name: \"flux\"}.",
   );
+}
+
+/**
+ * A filename stem, and nothing else.
+ *
+ * `as` decides a path this server writes to, so it is refused unless it is a
+ * bare name: no separator, no `..`, no absolute path, no NUL. `outputs.ts`
+ * already refuses a `subfolder` that climbs out of its root for the same
+ * reason — a fabricated path is worse than none — and this is the write-side
+ * twin of that check. Refusing outright rather than sanitising is deliberate:
+ * a silently rewritten name is a file the caller cannot find again.
+ *
+ * @throws {ToolArgumentError} the stem would name something other than a file
+ *   directly inside the created directory.
+ */
+function assertPlainStem(stem: string): void {
+  const bad = stem.length === 0 ||
+    stem === "." ||
+    stem === ".." ||
+    stem.includes("/") ||
+    stem.includes("\\") ||
+    stem.includes("\0") ||
+    isAbsolute(stem);
+  if (bad) {
+    throw new ToolArgumentError(
+      `\`as\` must be a plain filename with no directory part (got ${JSON.stringify(stem)}). ` +
+        "Try {as: \"my-video\"}.",
+    );
+  }
 }
 
 // --- wire shapes ---------------------------------------------------------
@@ -1278,6 +1310,74 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           truncated: listing.truncated,
           filters: { type, category, tag, model, provider, name },
           templates: listing.rows,
+        };
+      }),
+  );
+
+  server.registerTool(
+    "create_workflow_from_template",
+    {
+      title: "Create a workflow from a gallery template",
+      description:
+        "Create a new local workflow from a gallery template found with search_templates. The " +
+        "result is an ordinary workflow file: call describe_workflow on the returned `path` (or " +
+        "on its `name`) to see its inputs, then run_workflow to run it — nothing about it is " +
+        "special afterwards. The file belongs to this server, not to ComfyUI, so it will NOT " +
+        "appear in the ComfyUI editor; list_workflows shows it tagged `origin: \"template\"`. " +
+        "Pass `as` to choose the filename when you want something more memorable than the " +
+        "template's own name, or when a workflow of that name already exists — an existing file " +
+        "is never overwritten. This takes no `host`: the gallery is not part of any ComfyUI and " +
+        "nothing is started or contacted on your machine. It does need network access, because " +
+        "the workflow itself is downloaded even though the gallery index is cached. Whether the " +
+        "template's models are installed is a separate question, and describe_workflow answers " +
+        "it per host on the next call.",
+      inputSchema: {
+        template: z
+          .string()
+          .min(1)
+          .describe("The `name` of a template from search_templates, e.g. \"video_wan2_2_14B_i2v\"."),
+        as: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Filename to save under, without the .json extension and with no directory part. " +
+              "Defaults to the template's own name.",
+          ),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ template, as }) =>
+      toolAnswer(async () => {
+        const stem = as ?? template;
+        assertPlainStem(stem);
+        const directory = createdWorkflowDir(config.env);
+        const path = join(directory, `${stem}.json`);
+        // Checked before the directory is created, so a refused call leaves
+        // nothing behind on a machine that has never fetched anything.
+        if (existsSync(path)) {
+          throw new ToolArgumentError(
+            `a workflow already exists at ${path}. Pass \`as\` to save under a different name — ` +
+              "this tool never overwrites, because that file may already have been parameterised.",
+          );
+        }
+        // Created only now: a server that never creates a workflow leaves no
+        // directory behind. `comfy templates fetch -o` also creates parents,
+        // but relying on that would make the refusal above depend on the CLI.
+        await mkdir(directory, { recursive: true });
+        const fetched = await fetchTemplate(template, path);
+        return {
+          name: fetched.name,
+          title: fetched.title,
+          output_type: fetched.output_type,
+          path: fetched.path,
+          bytes: fetched.bytes,
+          next: "describe_workflow",
         };
       }),
   );
