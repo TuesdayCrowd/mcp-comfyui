@@ -27,6 +27,7 @@ import {
 } from "./comfy/outputs.ts";
 import {
   cacheRoot,
+  ensureObjectInfoCache,
   getObjectInfo,
   objectInfoCachePath,
   ObjectInfoFetchError,
@@ -1593,11 +1594,27 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // as potential SSRF (measured 2026-08-08 against a live remote —
         // `cql_no_graph`, "Refusing to fetch object_info from non-loopback
         // host"). So a remote target is pointed at the cache this server keeps
-        // per host, which `describe_workflow` has already populated by the time
-        // a caller knows which addresses to set.
+        // per host — but naming that file with the bare, non-fetching
+        // `objectInfoCachePath` assumed something upstream (in practice,
+        // `describe_workflow`) had already populated it, which is not
+        // guaranteed: a caller may reasonably run a remote workflow it has
+        // never described. Measured directly: `comfy workflow slots --input
+        // <a path that does not exist>` fails `cql_no_graph`, "cannot read
+        // object_info: ...: No such file or directory", which leaks this
+        // server's own cache path to the caller and recommends two things
+        // this tool cannot act on — `--input` (no such parameter here) and
+        // `comfy launch` (which cannot reach a remote host at all — see
+        // CLAUDE.md's launch non-negotiable). `ensureObjectInfoCache` fetches
+        // and writes the cache itself whenever it is missing or stale, so the
+        // file this points `set-slot` at is guaranteed to exist by the time it
+        // runs. The fetch this performs costs nothing extra in the case that
+        // already worked: `ensureRunning` above has already confirmed this
+        // instance is answering, so a warm cache (the ordinary case, once
+        // `describe_workflow` has run once) is served straight from disk with
+        // no request at all.
         const schemaSource = target.local
           ? {}
-          : { objectInfoPath: objectInfoCachePath({ ...address(target), cacheDir: config.cacheDir }) };
+          : { objectInfoPath: await ensureObjectInfoCache({ ...address(target), cacheDir: config.cacheDir }) };
 
         const slotTypes =
           resolved.source === "remote"
