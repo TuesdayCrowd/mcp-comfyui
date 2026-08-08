@@ -12,6 +12,12 @@ import {
 } from "./comfy/instance.ts";
 import { cancelJob, getJobStatus, type CancelResult, type JobStatus } from "./comfy/jobs.ts";
 import {
+  DEFAULT_TEMPLATE_LIMIT,
+  MAX_TEMPLATE_LIMIT,
+  searchTemplates,
+  type TemplateFilters,
+} from "./comfy/templates.ts";
+import {
   resolveArtifactPaths,
   type ArtifactLocation,
   type ClassifiedOutputs,
@@ -581,6 +587,29 @@ async function refuseInertInputs(resolved: ResolvedWorkflow, inputs: SlotInputs 
   }
 }
 
+/**
+ * At least one filter, refused here rather than in the schema.
+ *
+ * A schema-level `.refine()` would work, but its rejection is caught by the
+ * SDK's own `McpError` path and returned as a bare `{content:[{type:"text"}]}`
+ * — the shape `toolResult.ts` exists to avoid. `manage_hosts`'s `mutationOf`
+ * made the same call for the same reason: a `ToolArgumentError` reaches the
+ * caller as `kind: "invalid_input"` like every other refusal here.
+ *
+ * `limit` is deliberately not a filter. Passing only a limit still asks for
+ * the whole gallery, just less of it, and the cost this guard exists to avoid
+ * is the gallery-wide scan, not the row count.
+ */
+function requireOneFilter(filters: TemplateFilters): void {
+  const { type, category, tag, model, provider, name } = filters;
+  if ([type, category, tag, model, provider, name].some((value) => value !== undefined)) return;
+  throw new ToolArgumentError(
+    "search_templates needs at least one of `type`, `category`, `tag`, `model`, `provider` or " +
+      "`name`. The gallery holds hundreds of templates and returning all of them would not fit " +
+      "in a useful answer. Try {type: \"video\"} or {name: \"flux\"}.",
+  );
+}
+
 // --- wire shapes ---------------------------------------------------------
 
 function instanceBody(instance: RunningInstance): Record<string, unknown> {
@@ -1029,6 +1058,30 @@ const hostArgument = z
       "unreachable.",
   );
 
+/**
+ * One gallery filter.
+ *
+ * Not an enum, on any of them. `templates ls --help` names four output kinds
+ * today, and non-negotiable #2 says every registry the CLI publishes is
+ * append-only — a closed enum here refuses a value that works the day upstream
+ * adds one.
+ */
+function filterArgument(description: string) {
+  return z.string().min(1).optional().describe(description);
+}
+
+const templateLimitArgument = z
+  .number()
+  .int()
+  .min(1)
+  .max(MAX_TEMPLATE_LIMIT)
+  .default(DEFAULT_TEMPLATE_LIMIT)
+  .describe(
+    `How many templates to return, at most ${MAX_TEMPLATE_LIMIT}. The answer still reports ` +
+      "`matched`, the true number the filters selected, so a capped result says so rather than " +
+      "looking complete.",
+  );
+
 // --- registration --------------------------------------------------------
 
 /**
@@ -1164,6 +1217,52 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           workflows: [...local, ...(remote?.workflows ?? [])],
           unreadable: listing.unreadable,
           ...(remote?.problem === undefined ? {} : { remote_unreadable: remote.problem }),
+        };
+      }),
+  );
+
+  server.registerTool(
+    "search_templates",
+    {
+      title: "Search the workflow template gallery",
+      description:
+        "Search the Comfy workflow-template gallery — hundreds of ready-made workflows covering " +
+        "text-to-image, image-to-video, upscaling, audio and more. Use this when list_workflows " +
+        "has nothing that fits: pick a template here, then create_workflow_from_template turns it " +
+        "into an ordinary local workflow that describe_workflow and run_workflow read normally. " +
+        "AT LEAST ONE FILTER IS REQUIRED — the whole gallery is far too large to return, and a " +
+        "call with no filter is refused rather than truncated. `type` is the output kind " +
+        "(`image`, `video`, `audio`, `3d`), `tag` is an exact tag such as \"Image to Video\", and " +
+        "`model`, `provider` and `name` are substring matches. `matched` reports how many " +
+        "templates the filters really selected, so `truncated: true` means narrow the filters or " +
+        "raise `limit`. This reads a gallery index, not a ComfyUI: it takes no `host`, never " +
+        "starts anything, and says nothing about whether a template's models are installed — " +
+        "describe_workflow answers that, per host, after you create the workflow. Note that a " +
+        "template's `output_type` is inherited from its gallery category rather than derived " +
+        "from the workflow, so it is occasionally wrong; `tags` are the more reliable signal.",
+      inputSchema: {
+        type: filterArgument("Output kind, e.g. \"video\". An open string — new kinds appear upstream."),
+        category: filterArgument("Exact category title, e.g. \"Video\"."),
+        tag: filterArgument("Exact tag, case-insensitive, e.g. \"Image to Video\"."),
+        model: filterArgument("Substring of a model name, e.g. \"Flux\"."),
+        provider: filterArgument("Substring of a provider name, e.g. \"Black Forest Labs\"."),
+        name: filterArgument("Substring of the template's own name, e.g. \"wan\"."),
+        limit: templateLimitArgument,
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ type, category, tag, model, provider, name, limit }) =>
+      toolAnswer(async () => {
+        const filters: TemplateFilters = { type, category, tag, model, provider, name, limit };
+        requireOneFilter(filters);
+        const listing = await searchTemplates(filters);
+        return {
+          total_in_gallery: listing.total_in_gallery,
+          matched: listing.matched,
+          shown: listing.shown,
+          truncated: listing.truncated,
+          filters: { type, category, tag, model, provider, name },
+          templates: listing.rows,
         };
       }),
   );

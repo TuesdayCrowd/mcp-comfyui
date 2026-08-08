@@ -502,7 +502,7 @@ async function failure(
 
 // --- registration --------------------------------------------------------
 
-test("registers exactly the eight default tools", async () => {
+test("registers exactly the nine default tools", async () => {
   expect(await toolNames(await connect())).toEqual([
     "cancel_job",
     "comfy_status",
@@ -512,6 +512,7 @@ test("registers exactly the eight default tools", async () => {
     "list_workflows",
     "manage_hosts",
     "run_workflow",
+    "search_templates",
   ]);
 });
 

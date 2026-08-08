@@ -32,6 +32,7 @@ import { describeError } from "../src/toolResult.ts";
  */
 const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 const SLOTS_SAMPLE = join(import.meta.dirname, "fixtures", "slots.default_image_gen.json");
+const LIMIT5 = join(import.meta.dirname, "fixtures", "templates.video-limit5.json");
 
 let workdir: string;
 let argvOut: string;
@@ -102,6 +103,7 @@ afterEach(async () => {
   delete process.env.FAKE_COMFY_DATA_FILE;
   delete process.env.FAKE_COMFY_ERROR_CODE;
   delete process.env.FAKE_COMFY_ERROR_MESSAGE;
+  delete process.env.FAKE_COMFY_TEMPLATES_FILE;
   rmSync(workdir, { recursive: true, force: true });
 });
 
@@ -437,4 +439,45 @@ test("an ordinary error is still reported as this server's own fault", () => {
   // caller's or the operator's problem, or a genuine bug here sends someone
   // round a retry loop they can never win.
   expect(describeError(new TypeError("boom")).kind).toBe("internal_error");
+});
+
+// --- search_templates -------------------------------------------------------
+
+test("search_templates refuses a call with no filter, without spawning", async () => {
+  const client = await connect(baseConfig());
+  const result = (await client.callTool({
+    name: "search_templates",
+    arguments: {},
+  })) as CallToolResult;
+
+  const body = JSON.parse(textOf(result));
+  expect(body.error.kind).toBe("invalid_input");
+  expect(body.error.message).toContain("at least one");
+  // The refusal must beat the subprocess: the fixture never ran, so it never
+  // wrote its argv file. This is the assertion the whole guard exists for.
+  expect(existsSync(argvOut)).toBe(false);
+});
+
+test("search_templates passes one filter through and reports the true match count", async () => {
+  process.env.FAKE_COMFY_MODE = "templates_ls";
+  process.env.FAKE_COMFY_TEMPLATES_FILE = LIMIT5;
+  const client = await connect(baseConfig());
+
+  const result = (await client.callTool({
+    name: "search_templates",
+    arguments: { type: "video", limit: 5 },
+  })) as CallToolResult;
+
+  const body = JSON.parse(textOf(result));
+  expect(body.matched).toBe(156);
+  expect(body.templates).toHaveLength(5);
+  expect(body.truncated).toBe(true);
+});
+
+test("search_templates is annotated read-only and takes no host", async () => {
+  const client = await connect(baseConfig());
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "search_templates");
+  expect(tool?.annotations?.readOnlyHint).toBe(true);
+  expect(Object.keys(tool?.inputSchema.properties ?? {})).not.toContain("host");
 });
