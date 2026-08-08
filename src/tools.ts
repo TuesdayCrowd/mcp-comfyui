@@ -1612,9 +1612,19 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // instance is answering, so a warm cache (the ordinary case, once
         // `describe_workflow` has run once) is served straight from disk with
         // no request at all.
-        const schemaSource = target.local
-          ? {}
-          : { objectInfoPath: await ensureObjectInfoCache({ ...address(target), cacheDir: config.cacheDir }) };
+        // Only when there is an override to apply. `applySlots` short-circuits
+        // on empty inputs and never spawns `comfy` at all (see its own
+        // docstring: running a workflow with no overrides is a normal call), so
+        // fetching node definitions for that case would make the commonest
+        // remote call — run it with its defaults — depend on an endpoint
+        // nothing downstream reads. Measured: with `/system_stats` answering
+        // and `/object_info` returning 500, an unguarded fetch failed the whole
+        // run with `object_info_unavailable` and a message claiming the
+        // instance was unreachable, which it was not.
+        const needsSchema = !target.local && Object.keys(inputs ?? {}).length > 0;
+        const schemaSource = needsSchema
+          ? { objectInfoPath: await ensureObjectInfoCache({ ...address(target), cacheDir: config.cacheDir }) }
+          : {};
 
         const slotTypes =
           resolved.source === "remote"

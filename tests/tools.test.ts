@@ -871,3 +871,61 @@ test("run_workflow fills a cold object_info cache for a non-local host before po
     rmSync(roots, { recursive: true, force: true });
   }
 });
+
+test("run_workflow with no inputs never fetches object_info, even for a non-local host", async () => {
+  // `applySlots` short-circuits on empty inputs and never spawns `comfy`, so the
+  // node definitions are not needed. Fetching them anyway made the commonest
+  // remote call — run it with its defaults — depend on an endpoint nothing
+  // downstream reads: with `/system_stats` answering and `/object_info` down,
+  // the whole run failed with `object_info_unavailable` and a message claiming
+  // the instance was unreachable, which it was not.
+  const remoteHost = "192.0.2.1"; // RFC 5737 TEST-NET-1
+  const remotePort = 8189;
+  const cacheDir = join(workdir, "cache-no-inputs");
+
+  const roots = mkdtempSync(join(tmpdir(), "mcp-comfyui-tools-remote-noinputs-"));
+  const workflowPath = join(roots, "flow.json");
+  writeFileSync(workflowPath, JSON.stringify({ nodes: [{ id: 6, type: "CLIPTextEncode" }], links: [] }));
+
+  const systemStatsUrl = `http://${remoteHost}:${remotePort}/system_stats`;
+  const objectInfoUrl = `http://${remoteHost}:${remotePort}/object_info`;
+  let objectInfoRequested = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url === systemStatsUrl) {
+      return new Response(JSON.stringify({ system: {}, devices: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url === objectInfoUrl) {
+      // Answering 500 rather than never being called is deliberate: it makes
+      // the regression fail loudly here instead of silently succeeding on a
+      // warm cache somewhere else.
+      objectInfoRequested = true;
+      return new Response("boom", { status: 500 });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    // `run` fails, so nothing submits — this test is about what happened before it.
+    process.env.FAKE_COMFY_MODE = "fail";
+
+    const client = await connect(baseConfig({ cacheDir }));
+    const result = (await client.callTool({
+      name: "run_workflow",
+      arguments: { workflow: workflowPath, host: `${remoteHost}:${remotePort}` },
+    })) as CallToolResult;
+
+    // The assertion that matters: /object_info was never asked for.
+    expect(objectInfoRequested).toBe(false);
+    // And the failure the caller sees is the run's own, not a fabricated
+    // "node definitions unavailable" about an endpoint it never needed.
+    const body = JSON.parse(textOf(result));
+    expect(body.error.kind).not.toBe("object_info_unavailable");
+  } finally {
+    globalThis.fetch = realFetch;
+    rmSync(roots, { recursive: true, force: true });
+  }
+});
