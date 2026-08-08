@@ -1326,7 +1326,8 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "appear in the ComfyUI editor; list_workflows shows it tagged `origin: \"template\"`. " +
         "Pass `as` to choose the filename when you want something more memorable than the " +
         "template's own name, or when a workflow of that name already exists — an existing file " +
-        "is never overwritten. This takes no `host`: the gallery is not part of any ComfyUI and " +
+        "is never overwritten (that check is per call, not a lock, so two concurrent calls for " +
+        "the same name can still race). This takes no `host`: the gallery is not part of any ComfyUI and " +
         "nothing is started or contacted on your machine. It does need network access, because " +
         "the workflow itself is downloaded even though the gallery index is cached. Whether the " +
         "template's models are installed is a separate question, and describe_workflow answers " +
@@ -1335,6 +1336,25 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         template: z
           .string()
           .min(1)
+          // Final review, finding 1. The template name travels to `comfy
+          // templates fetch` as a positional argument, ahead of `-o`; a value
+          // starting with `-` is read by the CLI's own parser as a flag
+          // instead of a name. `comfy/templates.ts`'s `assertNotFlag` already
+          // refuses this, but a bare thrown Error there matches none of
+          // `describeError`'s `instanceof` arms and falls through to
+          // `internal_error` — telling the caller this server has a bug when
+          // the true fault is their argument. Repeated here on the same
+          // precedent as `promptIdArgument` and `inputsArgument` above: the
+          // refine turns it into a clean schema error (the SDK's own
+          // `McpError` path, not `describeError` — see `requireOneFilter`'s
+          // comment above for why that is the tradeoff this project accepts)
+          // before any handler — and so before any subprocess or directory
+          // creation — runs, while `assertNotFlag` remains the deep guarantee
+          // for any direct caller of `fetchTemplate` that does not go through
+          // this schema.
+          .refine((value) => !value.startsWith("-"), {
+            message: "a template name cannot start with `-`; it is a `name` from search_templates",
+          })
           .describe("The `name` of a template from search_templates, e.g. \"video_wan2_2_14B_i2v\"."),
         as: z
           .string()
@@ -1359,7 +1379,11 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         const directory = createdWorkflowDir(config.env);
         const path = join(directory, `${stem}.json`);
         // Checked before the directory is created, so a refused call leaves
-        // nothing behind on a machine that has never fetched anything.
+        // nothing behind on a machine that has never fetched anything. That
+        // invariant depends on `template`'s own refusal (a name that would be
+        // read as a flag) happening even earlier, at the schema layer above —
+        // verified by a test asserting no directory exists afterwards, since
+        // this handler is never entered for that case at all.
         if (existsSync(path)) {
           throw new ToolArgumentError(
             `a workflow already exists at ${path}. Pass \`as\` to save under a different name — ` +

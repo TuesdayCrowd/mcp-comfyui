@@ -170,6 +170,8 @@ A run on another machine never has a local path, whatever its output directory i
 |---|---|---|
 | `comfy_status` | ✓ | Is ComfyUI reachable? Version, device, directories |
 | `list_workflows` | ✓ | Every workflow found, classified by content |
+| `search_templates` | ✓ | Search comfy-cli's curated workflow-template gallery |
+| `create_workflow_from_template` | | Fetch a gallery template into a new local workflow |
 | `describe_workflow` | ✓ | JSON Schema of that workflow's settable inputs |
 | `run_workflow` | | Apply inputs and execute |
 | `get_job` | ✓ | Poll a job by `prompt_id` |
@@ -178,9 +180,11 @@ A run on another machine never has a local path, whatever its output directory i
 | `manage_hosts` | | Add, change, remove or repair entries in the host registry |
 | `launch_comfyui` | | Start ComfyUI with explicit flags — only when `MCP_COMFYUI_ALLOW_LAUNCH=1` |
 
-Every tool above except `list_hosts` and `manage_hosts` takes an optional `host` saying which ComfyUI to use; omitting it uses the default. (`manage_hosts` has a `host` field too, but it means the *address to record* for the entry being written, not which instance to talk to — it talks to none.)
+Every tool above except `list_hosts`, `manage_hosts`, `search_templates` and `create_workflow_from_template` takes an optional `host` saying which ComfyUI to use; omitting it uses the default. (`manage_hosts` has a `host` field too, but it means the *address to record* for the entry being written, not which instance to talk to — it talks to none. `search_templates` and `create_workflow_from_template` talk to comfy-cli's template gallery, not to any ComfyUI, so neither has a `host` field at all.)
 
-The intended order is `list_workflows` → `describe_workflow` → `run_workflow`. Inputs are keyed by slot address (`3.seed`, `6.text`), which `describe_workflow` gives you.
+The intended order is `list_workflows` → `describe_workflow` → `run_workflow`. Inputs are keyed by slot address (`3.seed`, `6.text`), which `describe_workflow` gives you. When `list_workflows` has nothing that fits, `search_templates` → `create_workflow_from_template` turns a gallery template into an ordinary local workflow first, and the same order continues from there.
+
+`search_templates` requires at least one of `type`, `category`, `tag`, `model`, `provider` or `name` — an unfiltered call is refused before anything runs, because the gallery holds hundreds of templates. `create_workflow_from_template` writes into this server's own directory (`MCP_COMFYUI_CREATED_DIR`, default `~/.local/share/mcp-comfyui/workflows`), not yours; it takes no `host`, needs network access even though the gallery index is cached, and never overwrites an existing file.
 
 `describe_workflow` is read-only only when auto-launch is off — with it on, the tool may start ComfyUI if it has no cached `/object_info`, and `readOnlyHint` has to say so. `comfy_status` never launches under any setting; it's the tool you call to ask whether anything is running.
 

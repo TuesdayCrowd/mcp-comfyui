@@ -638,6 +638,32 @@ test("`as` names the file when it is a plain stem", async () => {
   expect(body.path).toBe(join(created, "my-video.json"));
 });
 
+test("create_workflow_from_template rejects a leading-dash template at the schema layer, before any subprocess runs or directory is created", async () => {
+  // Final review, finding 1 + finding 5. Before the `template` schema gained
+  // its own `.refine()`, this reached `fetchTemplate`'s internal
+  // `assertNotFlag`, which throws a bare `Error` that `describeError` cannot
+  // classify — reported as `internal_error`, blaming this server for bad
+  // caller input. It also ran `mkdir` on the created directory first, so a
+  // refused call still left an empty directory behind. Both are closed by
+  // rejecting at the schema layer: the handler — and therefore `mkdir` — is
+  // never entered at all. Like `promptIdArgument`'s own schema rejection
+  // (above), the SDK's own `McpError` path answers this one, not
+  // `toolAnswer`/`describeError` — so the body is a bare string, not
+  // `ToolErrorBody` JSON, and must not be parsed as such.
+  const created = join(workdir, "created-dash");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "--gallery" },
+  })) as CallToolResult;
+
+  expect(result.isError).toBe(true);
+  expect(textOf(result)).toContain("template");
+  expect(existsSync(argvOut)).toBe(false); // rejected before anything was spawned
+  expect(existsSync(created)).toBe(false); // and before the created directory exists
+});
+
 test("create_workflow_from_template is not read-only and takes no host", async () => {
   const client = await connect(baseConfig());
   const { tools } = await client.listTools();
