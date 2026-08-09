@@ -1,0 +1,8 @@
+{
+  "nodes": [
+    {"id": 3, "type": "KSampler", "widgets_values": [18446744073709551615, "randomize", 20, 8, "euler", "normal", 1]}
+  ],
+  "links": [],
+  "last_node_id": 3,
+  "last_link_id": 0
+}

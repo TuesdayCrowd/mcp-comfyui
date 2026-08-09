@@ -1,5 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { basename, isAbsolute, join } from "node:path";
+import { existsSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
+import { basename, isAbsolute, join, sep } from "node:path";
 import { z } from "zod";
 import { fetchArtifacts, type FetchedArtifact } from "./comfy/fetchOutputs.ts";
 import { fetchRemoteWorkflow, listRemoteWorkflows } from "./comfy/userdata.ts";
@@ -11,6 +13,13 @@ import {
   type RunningInstance,
 } from "./comfy/instance.ts";
 import { cancelJob, getJobStatus, type CancelResult, type JobStatus } from "./comfy/jobs.ts";
+import {
+  DEFAULT_TEMPLATE_LIMIT,
+  fetchTemplate,
+  MAX_TEMPLATE_LIMIT,
+  searchTemplates,
+  type TemplateFilters,
+} from "./comfy/templates.ts";
 import {
   resolveArtifactPaths,
   type ArtifactLocation,
@@ -26,6 +35,7 @@ import {
   ALLOW_LAUNCH_ENV,
   AUTO_LAUNCH_ENV,
   CACHE_DIR_ENV,
+  createdWorkflowDir,
   HOST_ENV,
   PORT_ENV,
   WORKSPACE_ENV,
@@ -581,6 +591,58 @@ async function refuseInertInputs(resolved: ResolvedWorkflow, inputs: SlotInputs 
   }
 }
 
+/**
+ * At least one filter, refused here rather than in the schema.
+ *
+ * A schema-level `.refine()` would work, but its rejection is caught by the
+ * SDK's own `McpError` path and returned as a bare `{content:[{type:"text"}]}`
+ * — the shape `toolResult.ts` exists to avoid. `manage_hosts`'s `mutationOf`
+ * made the same call for the same reason: a `ToolArgumentError` reaches the
+ * caller as `kind: "invalid_input"` like every other refusal here.
+ *
+ * `limit` is deliberately not a filter. Passing only a limit still asks for
+ * the whole gallery, just less of it, and the cost this guard exists to avoid
+ * is the gallery-wide scan, not the row count.
+ */
+function requireOneFilter(filters: TemplateFilters): void {
+  const { type, category, tag, model, provider, name } = filters;
+  if ([type, category, tag, model, provider, name].some((value) => value !== undefined)) return;
+  throw new ToolArgumentError(
+    "search_templates needs at least one of `type`, `category`, `tag`, `model`, `provider` or " +
+      "`name`. The gallery holds hundreds of templates and returning all of them would not fit " +
+      "in a useful answer. Try {type: \"video\"} or {name: \"flux\"}.",
+  );
+}
+
+/**
+ * A filename stem, and nothing else.
+ *
+ * `as` decides a path this server writes to, so it is refused unless it is a
+ * bare name: no separator, no `..`, no absolute path, no NUL. `outputs.ts`
+ * already refuses a `subfolder` that climbs out of its root for the same
+ * reason — a fabricated path is worse than none — and this is the write-side
+ * twin of that check. Refusing outright rather than sanitising is deliberate:
+ * a silently rewritten name is a file the caller cannot find again.
+ *
+ * @throws {ToolArgumentError} the stem would name something other than a file
+ *   directly inside the created directory.
+ */
+function assertPlainStem(stem: string): void {
+  const bad = stem.length === 0 ||
+    stem === "." ||
+    stem === ".." ||
+    stem.includes("/") ||
+    stem.includes("\\") ||
+    stem.includes("\0") ||
+    isAbsolute(stem);
+  if (bad) {
+    throw new ToolArgumentError(
+      `\`as\` must be a plain filename with no directory part (got ${JSON.stringify(stem)}). ` +
+        "Try {as: \"my-video\"}.",
+    );
+  }
+}
+
 // --- wire shapes ---------------------------------------------------------
 
 function instanceBody(instance: RunningInstance): Record<string, unknown> {
@@ -1029,6 +1091,30 @@ const hostArgument = z
       "unreachable.",
   );
 
+/**
+ * One gallery filter.
+ *
+ * Not an enum, on any of them. `templates ls --help` names four output kinds
+ * today, and non-negotiable #2 says every registry the CLI publishes is
+ * append-only — a closed enum here refuses a value that works the day upstream
+ * adds one.
+ */
+function filterArgument(description: string) {
+  return z.string().min(1).optional().describe(description);
+}
+
+const templateLimitArgument = z
+  .number()
+  .int()
+  .min(1)
+  .max(MAX_TEMPLATE_LIMIT)
+  .default(DEFAULT_TEMPLATE_LIMIT)
+  .describe(
+    `How many templates to return, at most ${MAX_TEMPLATE_LIMIT}. The answer still reports ` +
+      "`matched`, the true number the filters selected, so a capped result says so rather than " +
+      "looking complete.",
+  );
+
 // --- registration --------------------------------------------------------
 
 /**
@@ -1138,16 +1224,30 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "Pass `host` to ALSO list that ComfyUI's own saved workflows, over its HTTP API. Those " +
         "entries are tagged `source: \"remote:<host>\"`, their `name` is qualified with the host " +
         "(`rtx-video/portrait`), and their `format` is `\"unknown\"` because deciding it means " +
-        "downloading the file — describe_workflow will say if one is not a frontend graph. Every " +
-        "local entry is tagged `source: \"local\"` and can be run on any host; the local library " +
-        "and each host's own files are two separate places, and both are usable.",
+        "downloading the file — describe_workflow will say if one is not a frontend graph. " +
+        "An entry tagged `origin: \"template\"` was fetched from the gallery by " +
+        "create_workflow_from_template rather than written by hand; it behaves like any other " +
+        "local workflow. Every local entry is tagged `source: \"local\"` and can be run on any " +
+        "host; the local library and each host's own files are two separate places, and both are " +
+        "usable.",
       inputSchema: { host: hostArgument },
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ host }) =>
       toolAnswer(async () => {
         const listing = await discoverWorkflows({ env: config.env });
-        const local = listing.workflows.map((workflow) => ({ ...workflow, source: "local" }));
+        // Provenance is decided here, not in discover.ts: that module is a pure
+        // content classifier and has no business knowing which root belongs to
+        // this server. Every entry already carries an absolute `path`, so a
+        // prefix comparison is the whole implementation.
+        const created = createdWorkflowDir(config.env);
+        const local = listing.workflows.map((workflow) => ({
+          ...workflow,
+          source: "local",
+          // Absent rather than `origin: null` on an operator's own file: a key
+          // that is only ever one value carries its meaning by being there.
+          ...(workflow.path.startsWith(`${created}${sep}`) ? { origin: "template" } : {}),
+        }));
 
         // Only when a host was named. Without one this lists exactly what it
         // always listed — and the default host is usually this machine, whose
@@ -1164,6 +1264,144 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           workflows: [...local, ...(remote?.workflows ?? [])],
           unreadable: listing.unreadable,
           ...(remote?.problem === undefined ? {} : { remote_unreadable: remote.problem }),
+        };
+      }),
+  );
+
+  server.registerTool(
+    "search_templates",
+    {
+      title: "Search the workflow template gallery",
+      description:
+        "Search the Comfy workflow-template gallery — hundreds of ready-made workflows covering " +
+        "text-to-image, image-to-video, upscaling, audio and more. Use this when list_workflows " +
+        "has nothing that fits: pick a template here, then create_workflow_from_template turns it " +
+        "into an ordinary local workflow that describe_workflow and run_workflow read normally. " +
+        "AT LEAST ONE FILTER IS REQUIRED — the whole gallery is far too large to return, and a " +
+        "call with no filter is refused rather than truncated. `type` is the output kind " +
+        "(`image`, `video`, `audio`, `3d`), `tag` is an exact tag such as \"Image to Video\", and " +
+        "`model`, `provider` and `name` are substring matches. `matched` reports how many " +
+        "templates the filters really selected, so `truncated: true` means narrow the filters or " +
+        "raise `limit`. This reads a gallery index, not a ComfyUI: it takes no `host`, never " +
+        "starts anything, and says nothing about whether a template's models are installed — " +
+        "describe_workflow answers that, per host, after you create the workflow. Note that a " +
+        "template's `output_type` is inherited from its gallery category rather than derived " +
+        "from the workflow, so it is occasionally wrong; `tags` are the more reliable signal.",
+      inputSchema: {
+        type: filterArgument("Output kind, e.g. \"video\". An open string — new kinds appear upstream."),
+        category: filterArgument("Exact category title, e.g. \"Video\"."),
+        tag: filterArgument("Exact tag, case-insensitive, e.g. \"Image to Video\"."),
+        model: filterArgument("Substring of a model name, e.g. \"Flux\"."),
+        provider: filterArgument("Substring of a provider name, e.g. \"Black Forest Labs\"."),
+        name: filterArgument("Substring of the template's own name, e.g. \"wan\"."),
+        limit: templateLimitArgument,
+      },
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async ({ type, category, tag, model, provider, name, limit }) =>
+      toolAnswer(async () => {
+        const filters: TemplateFilters = { type, category, tag, model, provider, name, limit };
+        requireOneFilter(filters);
+        const listing = await searchTemplates(filters);
+        return {
+          total_in_gallery: listing.total_in_gallery,
+          matched: listing.matched,
+          shown: listing.shown,
+          truncated: listing.truncated,
+          filters: { type, category, tag, model, provider, name },
+          templates: listing.rows,
+        };
+      }),
+  );
+
+  server.registerTool(
+    "create_workflow_from_template",
+    {
+      title: "Create a workflow from a gallery template",
+      description:
+        "Create a new local workflow from a gallery template found with search_templates. The " +
+        "result is an ordinary workflow file: call describe_workflow on the returned `path` (or " +
+        "on its `name`) to see its inputs, then run_workflow to run it — nothing about it is " +
+        "special afterwards. The file belongs to this server, not to ComfyUI, so it will NOT " +
+        "appear in the ComfyUI editor; list_workflows shows it tagged `origin: \"template\"`. " +
+        "Pass `as` to choose the filename when you want something more memorable than the " +
+        "template's own name, or when a workflow of that name already exists — an existing file " +
+        "is never overwritten (that check is per call, not a lock, so two concurrent calls for " +
+        "the same name can still race). This takes no `host`: the gallery is not part of any ComfyUI and " +
+        "nothing is started or contacted on your machine. It does need network access, because " +
+        "the workflow itself is downloaded even though the gallery index is cached. Whether the " +
+        "template's models are installed is a separate question, and describe_workflow answers " +
+        "it per host on the next call.",
+      inputSchema: {
+        template: z
+          .string()
+          .min(1)
+          // Final review, finding 1. The template name travels to `comfy
+          // templates fetch` as a positional argument, ahead of `-o`; a value
+          // starting with `-` is read by the CLI's own parser as a flag
+          // instead of a name. `comfy/templates.ts`'s `assertNotFlag` already
+          // refuses this, but a bare thrown Error there matches none of
+          // `describeError`'s `instanceof` arms and falls through to
+          // `internal_error` — telling the caller this server has a bug when
+          // the true fault is their argument. Repeated here on the same
+          // precedent as `promptIdArgument` and `inputsArgument` above: the
+          // refine turns it into a clean schema error (the SDK's own
+          // `McpError` path, not `describeError` — see `requireOneFilter`'s
+          // comment above for why that is the tradeoff this project accepts)
+          // before any handler — and so before any subprocess or directory
+          // creation — runs, while `assertNotFlag` remains the deep guarantee
+          // for any direct caller of `fetchTemplate` that does not go through
+          // this schema.
+          .refine((value) => !value.startsWith("-"), {
+            message: "a template name cannot start with `-`; it is a `name` from search_templates",
+          })
+          .describe("The `name` of a template from search_templates, e.g. \"video_wan2_2_14B_i2v\"."),
+        as: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Filename to save under, without the .json extension and with no directory part. " +
+              "Defaults to the template's own name.",
+          ),
+      },
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ template, as }) =>
+      toolAnswer(async () => {
+        const stem = as ?? template;
+        assertPlainStem(stem);
+        const directory = createdWorkflowDir(config.env);
+        const path = join(directory, `${stem}.json`);
+        // Checked before the directory is created, so a refused call leaves
+        // nothing behind on a machine that has never fetched anything. That
+        // invariant depends on `template`'s own refusal (a name that would be
+        // read as a flag) happening even earlier, at the schema layer above —
+        // verified by a test asserting no directory exists afterwards, since
+        // this handler is never entered for that case at all.
+        if (existsSync(path)) {
+          throw new ToolArgumentError(
+            `a workflow already exists at ${path}. Pass \`as\` to save under a different name — ` +
+              "this tool never overwrites, because that file may already have been parameterised.",
+          );
+        }
+        // Created only now: a server that never creates a workflow leaves no
+        // directory behind. `comfy templates fetch -o` also creates parents,
+        // but relying on that would make the refusal above depend on the CLI.
+        await mkdir(directory, { recursive: true });
+        const fetched = await fetchTemplate(template, path);
+        return {
+          name: fetched.name,
+          title: fetched.title,
+          output_type: fetched.output_type,
+          path: fetched.path,
+          bytes: fetched.bytes,
+          next: "describe_workflow",
         };
       }),
   );

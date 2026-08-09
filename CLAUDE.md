@@ -63,6 +63,7 @@ src/comfy/          the CLI and instance layer
   fetchOutputs.ts   copy a remote run's artifacts here, on request only
   jobs.ts           jobs status | ls | cancel
   instance.ts       detection and guarded launch
+  templates.ts      the gallery: search and fetch. No host — it is not a ComfyUI.
 src/workflows/
   discover.ts       find workflow files, classify by CONTENT not filename
   slots.ts          comfy workflow slots -> typed Slot[]
@@ -89,6 +90,10 @@ These are not style preferences. Each was measured, and each has a test pinning 
 **1. Never let JS parse or re-serialise a workflow graph.** ComfyUI seeds reach 2^64−1; JavaScript rounds above 2^53. Measured: `set-slot --stdout` on a graph holding `18446744073709551615` returned the exact digits, and our `JSON.parse` corrupted that *untouched* seed to `18446744073709552000`. Hence the byte-copy in `setSlots.ts` and the graph-dropping in `run.ts` (`comfy run --json` echoes the whole graph as a `prompt_preview` event on every run). **Assume this recurs anywhere a comfy payload can contain a graph.**
 
 **2. Every registry from the CLI is an open string** — `error.code`, slot `type`, job `status`, run `event.type`. Upstream documents error codes as append-only, and its published schemas are already behind its own source. Closing an enum breaks the server on the next CLI release. Tests assert the published enums are incomplete, so the argument stays checkable.
+
+`comfy validate`'s 13 diagnostic codes (`unknown_enum_value`, `required_input_missing`,
+`dangling_edge`, …) appear in NONE of comfy-cli's published `error_codes.py` registry — a
+second, wholly undocumented open-string vocabulary. Measured 2026-08-07.
 
 **3. Branch on the envelope, never on the exit code.** Exit 1 covers missing file, downed server, HTTP error, conversion failure, validation failure, and execution error alike.
 
@@ -159,6 +164,19 @@ Against a live ComfyUI 0.29.0 through the compiled binary over stdio: `describe_
 - Two defects were found by this run and fixed: `UserdataError` reached the tool layer unclassified and was reported as `internal_error`; and a *mistyped workflow name* fell through to the default host's library, failed to reach it, and came back as `fetch failed` about `/api/userdata` instead of `workflow_not_found` with the 27 names that would have worked. A host consulted only as a fallback must not become the story; one the caller named still is.
 
 A real run also confirmed three things previously known only from source: `converted` and `prompt_preview` **are** emitted and are absent from comfy-cli's published event enum; `prompt_preview` carries the whole graph (landmine #12); and `queued`/`executed` carry undeclared fields (`validation_warnings`, `nodes`, structured `outputs`) that `looseObject` preserves.
+
+**Template creation against the real gallery, verified on 2026-08-08** through `dist/index.js` under `node` over real stdio (`scripts/smoke-templates.mjs`), with `MCP_COMFYUI_AUTO_LAUNCH=0` and `MCP_COMFYUI_CREATED_DIR` pointed at an isolated temp directory rather than the real default:
+
+- `search_templates {type: "video", tag: "Image to Video", limit: 5}` matched 53 templates in the live gallery and returned the 5 requested.
+- `create_workflow_from_template {template: "video_wan2_2_14B_i2v"}` fetched the real workflow and wrote 84289 bytes — a genuine frontend graph (`nodes`, `last_node_id: 164`, `last_link_id: 292`), matching the design doc's own capture of this same template.
+- `describe_workflow` on the result was not exercised in that run: no instance was reachable on this machine, and `MCP_COMFYUI_AUTO_LAUNCH=0` meant the call never tried to start one. It failed with `object_info_unavailable` and the script exited 1 — the graceful-degradation path this script exists to prove, working as designed.
+
+**The remaining step, closed on 2026-08-08** against the live Windows box at `100.86.199.90:8189` (ComfyUI **0.30.2**, registered as `xinde-win-64`), through `dist/index.js` under `node` over real stdio, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout and the **real** created-workflows directory rather than a temp one:
+
+- `search_templates {type: "video", tag: "Image to Video", limit: 5}` matched 53 of 574 and returned 5, `truncated: true`.
+- `create_workflow_from_template {template: "video_wan2_2_14B_i2v"}` wrote 84289 bytes to `~/.local/share/mcp-comfyui/workflows/`, and `list_workflows` then reported it `origin: "template"`, `format: "frontend"` — the created root is discovered, classified and tagged with no further argument.
+- `describe_workflow {workflow: "video_wan2_2_14B_i2v", host: "xinde-win-64"}` returned **44 settable, 14 inert, 0 unresolved** — matching the design-phase measurement exactly, at a nesting depth where 55 of 58 addresses are inside a subgraph. The inert set is the same fourteen: `129/98.length` (fed by `ComfyMathExpression`), `129/94.fps` (`PrimitiveFloat`), and the twelve sampler/switch addresses.
+- **The enums came from the Windows box, not this Mac.** `129/90.vae_name` offered `wan2.2_vae.safetensors`, `129/102.lora_name` offered `wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors`, and `97.image` listed that machine's own input directory. Zero unresolved means every node in a gallery template resolved against a host this server had never described before — which is the whole point of joining slots to per-host `/object_info`.
 
 ## Known gaps
 

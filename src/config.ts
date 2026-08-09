@@ -1,4 +1,5 @@
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 
 /**
  * Operator-facing configuration.
@@ -26,6 +27,17 @@ export const DEFAULT_WORKFLOW_DIR = "/Users/lawls/ComfyUI-Shared/user/default/wo
 
 /** Colon-separated, ordered, like `PATH`. */
 export const WORKFLOW_DIRS_ENV = "MCP_COMFYUI_WORKFLOW_DIRS";
+
+/**
+ * Where a workflow this server creates is written.
+ *
+ * Its own directory rather than one of the operator's, because the two have
+ * different owners: the roots in {@link WORKFLOW_DIRS_ENV} hold files a person
+ * made, and one of them is a directory ComfyUI Desktop manages. Fetched
+ * templates are this server's, disposable, and must never be mistaken for
+ * either.
+ */
+export const CREATED_DIR_ENV = "MCP_COMFYUI_CREATED_DIR";
 
 /**
  * Every setting this server has, named in one place.
@@ -94,11 +106,16 @@ export function flag(env: Environment, name: string, fallback: boolean): boolean
 }
 
 /**
- * The directories to scan for workflow files, in the operator's own order.
+ * The directories to scan for workflow files: the operator's own configured
+ * roots, in their given order, followed unconditionally by this server's own
+ * {@link createdWorkflowDir} — appended regardless of what the operator
+ * configured, not merely when they configured nothing.
  *
  * Order is preserved and load-bearing: `workflows/discover.ts` gives the first
  * root's copy of a colliding filename the bare, unqualified name, so this list
- * is a precedence order rather than a set.
+ * is a precedence order rather than a set. The created directory is placed
+ * last within that order for the same reason — see the comment on its
+ * `uniqueRoots` call below.
  *
  * Paths are resolved to absolute so that a relative entry cannot make a
  * reported workflow path depend on the working directory an MCP client happened
@@ -126,7 +143,28 @@ export function workflowRoots(env: Environment = process.env): string[] {
     .map((segment) => segment.trim())
     .filter((segment) => segment.length > 0);
 
-  return uniqueRoots(segments.length > 0 ? segments : [DEFAULT_WORKFLOW_DIR]);
+  // The created directory goes LAST, and that placement is the whole guarantee
+  // that a fetched `portrait.json` cannot displace an operator's own. Order
+  // here is a precedence order (see the doc comment above): `discover.ts` gives
+  // the first root's copy of a colliding filename the bare, unqualified name.
+  // `uniqueRoots` drops it if the operator already listed it, keeping their
+  // position rather than this one.
+  return uniqueRoots([
+    ...(segments.length > 0 ? segments : [DEFAULT_WORKFLOW_DIR]),
+    createdWorkflowDir(env),
+  ]);
+}
+
+/**
+ * The directory created workflows are written to, absolute.
+ *
+ * `~/.local/share` rather than the cache directory: a fetched workflow is
+ * something a caller may go on to parameterise and rerun, so losing it to a
+ * cache sweep would lose work. Nothing creates this directory — the first
+ * write does, so a server that never creates a workflow leaves nothing behind.
+ */
+export function createdWorkflowDir(env: Environment = process.env): string {
+  return resolve(setting(env, CREATED_DIR_ENV) ?? join(homedir(), ".local", "share", "mcp-comfyui", "workflows"));
 }
 
 /** Resolve to absolute and drop repeats, keeping first-seen order. */

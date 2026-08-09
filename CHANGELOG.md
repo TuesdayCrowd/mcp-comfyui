@@ -6,6 +6,27 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `search_templates` and `create_workflow_from_template`: find a workflow in
+  comfy-cli's template gallery and materialise it locally. A fetched template is
+  frontend format, so `describe_workflow` and `run_workflow` read it with no
+  change to the pipeline — verified on 2026-08-08 against a live remote ComfyUI
+  0.30.2, where `video_wan2_2_14B_i2v` described as 44 settable inputs, 14
+  decoys correctly refused, and **zero unresolved**, with every enum drawn from
+  that box's own models.
+- `MCP_COMFYUI_CREATED_DIR`, appended **last** to the workflow roots so a fetched
+  workflow can never shadow one you made. Entries under it list as
+  `origin: "template"`.
+
+### Notes
+
+- Workflow *authoring* is deliberately not built. `comfy workflow compose` works,
+  but emits API format, which `comfy workflow slots` hard-rejects and which no
+  API→UI conversion anywhere in comfy-cli can undo — a composed workflow could be
+  run and never described. `comfy nodes path` does not route. Both measured; see
+  `docs/plans/2026-08-07-workflow-creation-design.md`.
+
 ### Fixed
 
 - **The publish workflow type-checked with the wrong TypeScript.** `npx jsr

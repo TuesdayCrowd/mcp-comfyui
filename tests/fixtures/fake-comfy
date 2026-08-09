@@ -34,6 +34,9 @@
 #   $FAKE_COMFY_JOBS_LS_ERROR      jobs ls: error code to fail with instead
 #   $FAKE_COMFY_JOBS_CANCEL_FILE   jobs cancel: JSON file served as data
 #   $FAKE_COMFY_JOBS_CANCEL_ERROR  jobs cancel: error code to fail with instead
+#   $FAKE_COMFY_TEMPLATES_FILE     templates_ls: JSON file served as data
+#   $FAKE_COMFY_TEMPLATE_FILE      templates_fetch: file copied to the -o path
+#   $FAKE_COMFY_TEMPLATE_NAME      templates_fetch: name echoed back in data.name
 
 [ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
 
@@ -245,6 +248,33 @@ case "$FAKE_COMFY_MODE" in
     printf '{"schema":"envelope/1","type":"envelope","ok":false,"command":"launch","version":"0.0.0","where":null,"data":null,"error":{"code":"%s","message":"%s","hint":null,"details":null}}\n' \
       "$FAKE_COMFY_ERROR_CODE" "$FAKE_COMFY_ERROR_MESSAGE"
     exit 1 ;;
+  templates_ls)
+    # `comfy templates ls`, serving a captured gallery response as data.
+    # Modelled on data_file rather than on jobs: `templates` needs no
+    # subcommand dispatch here, because only `ls` is served by this mode.
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"templates","version":"0.0.0","where":null,"data":'
+    cat "$FAKE_COMFY_TEMPLATES_FILE"
+    printf ',"error":null}\n'
+    exit 0 ;;
+  templates_fetch)
+    # `comfy templates fetch <name> -o <path>`, copying a fixture workflow to
+    # the requested destination. Modelled on run_capture's argv walk. The copy
+    # is a byte copy: nothing here may reformat the JSON, because the test that
+    # matters asserts a 2^64-1 widget value survives (non-negotiable #1).
+    take=0
+    dest=
+    for arg in "$@"; do
+      if [ "$take" = 1 ]; then dest="$arg"; break; fi
+      [ "$arg" = "-o" ] && take=1
+    done
+    if [ -n "$dest" ] && [ -n "$FAKE_COMFY_TEMPLATE_FILE" ]; then
+      mkdir -p "$(dirname "$dest")"
+      cp "$FAKE_COMFY_TEMPLATE_FILE" "$dest"
+    fi
+    size=0
+    [ -n "$dest" ] && [ -f "$dest" ] && size=$(wc -c < "$dest" | tr -d ' ')
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"templates fetch","version":"0.0.0","where":null,"data":{"name":"%s","title":"Fixture Template","output_type":"video","bytes":%s},"error":null}\n' "$FAKE_COMFY_TEMPLATE_NAME" "$size"
+    exit 0 ;;
   *)
     echo "$OK"
     exit 0 ;;

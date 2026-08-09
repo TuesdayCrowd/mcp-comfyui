@@ -3,7 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerTools, resolveSlotTypes, type ToolConfig } from "../src/tools.ts";
@@ -32,6 +32,9 @@ import { describeError } from "../src/toolResult.ts";
  */
 const FAKE_COMFY = join(import.meta.dirname, "fixtures", "fake-comfy");
 const SLOTS_SAMPLE = join(import.meta.dirname, "fixtures", "slots.default_image_gen.json");
+const LIMIT5 = join(import.meta.dirname, "fixtures", "templates.video-limit5.json");
+/** A frontend-format workflow carrying a 2^64-1 value, for the fetch tests below. */
+const BIGSEED = join(import.meta.dirname, "fixtures", "template.bigseed.json");
 
 let workdir: string;
 let argvOut: string;
@@ -102,6 +105,9 @@ afterEach(async () => {
   delete process.env.FAKE_COMFY_DATA_FILE;
   delete process.env.FAKE_COMFY_ERROR_CODE;
   delete process.env.FAKE_COMFY_ERROR_MESSAGE;
+  delete process.env.FAKE_COMFY_TEMPLATES_FILE;
+  delete process.env.FAKE_COMFY_TEMPLATE_FILE;
+  delete process.env.FAKE_COMFY_TEMPLATE_NAME;
   rmSync(workdir, { recursive: true, force: true });
 });
 
@@ -121,6 +127,11 @@ function baseConfig(overrides: Partial<ToolConfig> = {}): ToolConfig {
     env: { MCP_COMFYUI_HOSTS_FILE: join(workdir, "hosts.json") },
     ...overrides,
   };
+}
+
+/** `baseConfig` with extra env, keeping the hosts-file redirect it sets. */
+function configWithEnv(extra: Record<string, string>): ToolConfig {
+  return baseConfig({ env: { MCP_COMFYUI_HOSTS_FILE: join(workdir, "hosts.json"), ...extra } });
 }
 
 /**
@@ -437,4 +448,227 @@ test("an ordinary error is still reported as this server's own fault", () => {
   // caller's or the operator's problem, or a genuine bug here sends someone
   // round a retry loop they can never win.
   expect(describeError(new TypeError("boom")).kind).toBe("internal_error");
+});
+
+// --- search_templates -------------------------------------------------------
+
+test("search_templates refuses a call with no filter, without spawning", async () => {
+  const client = await connect(baseConfig());
+  const result = (await client.callTool({
+    name: "search_templates",
+    arguments: {},
+  })) as CallToolResult;
+
+  // Checked BEFORE the body: this is the property the guard exists for, and
+  // asserting it first is what lets the test tell "no guard" apart from "guard
+  // ran too late". Both produce the same error kind.
+  expect(existsSync(argvOut)).toBe(false);
+
+  const body = JSON.parse(textOf(result));
+  expect(body.error.kind).toBe("invalid_input");
+  expect(body.error.message).toContain("at least one");
+});
+
+test("search_templates passes one filter through and reports the true match count", async () => {
+  process.env.FAKE_COMFY_MODE = "templates_ls";
+  process.env.FAKE_COMFY_TEMPLATES_FILE = LIMIT5;
+  const client = await connect(baseConfig());
+
+  const result = (await client.callTool({
+    name: "search_templates",
+    arguments: { type: "video", limit: 5 },
+  })) as CallToolResult;
+
+  const body = JSON.parse(textOf(result));
+  expect(body.matched).toBe(156);
+  expect(body.templates).toHaveLength(5);
+  expect(body.truncated).toBe(true);
+});
+
+test("search_templates is annotated read-only and takes no host", async () => {
+  const client = await connect(baseConfig());
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "search_templates");
+  expect(tool?.annotations?.readOnlyHint).toBe(true);
+  expect(Object.keys(tool?.inputSchema.properties ?? {})).not.toContain("host");
+});
+
+// --- origin: "template" on list_workflows -----------------------------------
+
+test("list_workflows tags an entry under the created root, and only that entry", async () => {
+  const roots = join(workdir, "origin-roots");
+  const created = join(workdir, "origin-created");
+  mkdirSync(roots, { recursive: true });
+  mkdirSync(created, { recursive: true });
+  const graph = JSON.stringify({ nodes: [], links: [] });
+  writeFileSync(join(roots, "mine.json"), graph);
+  writeFileSync(join(created, "fetched.json"), graph);
+
+  const client = await connect(configWithEnv({
+    MCP_COMFYUI_WORKFLOW_DIRS: roots,
+    MCP_COMFYUI_CREATED_DIR: created,
+  }));
+  const result = (await client.callTool({
+    name: "list_workflows",
+    arguments: {},
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+
+  const mine = body.workflows.find((w: { name: string }) => w.name === "mine");
+  const fetched = body.workflows.find((w: { name: string }) => w.name === "fetched");
+  expect(fetched.origin).toBe("template");
+  expect(mine.origin).toBeUndefined();
+});
+
+test("a created workflow colliding with an operator's does not take the bare name", async () => {
+  const roots = join(workdir, "collide-roots");
+  const created = join(workdir, "collide-created");
+  mkdirSync(roots, { recursive: true });
+  mkdirSync(created, { recursive: true });
+  const graph = JSON.stringify({ nodes: [], links: [] });
+  writeFileSync(join(roots, "portrait.json"), graph);
+  writeFileSync(join(created, "portrait.json"), graph);
+
+  const client = await connect(configWithEnv({
+    MCP_COMFYUI_WORKFLOW_DIRS: roots,
+    MCP_COMFYUI_CREATED_DIR: created,
+  }));
+  const result = (await client.callTool({
+    name: "list_workflows",
+    arguments: {},
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+
+  // The bare name belongs to the operator's copy. The fetched one is still
+  // listed and still reachable, but under a disambiguated name — this is the
+  // whole point of appending the created root last.
+  const bare = body.workflows.find((w: { name: string }) => w.name === "portrait");
+  expect(bare.path.startsWith(roots)).toBe(true);
+  expect(bare.origin).toBeUndefined();
+  expect(body.workflows.filter((w: { origin?: string }) => w.origin === "template")).toHaveLength(1);
+});
+
+test("a sibling directory sharing the created prefix is not tagged", async () => {
+  const created = mkdtempSync(join(tmpdir(), "mcp-comfyui-prefix-"));
+  const sibling = `${created}-other`;
+  mkdirSync(sibling);
+  writeFileSync(join(sibling, "decoy.json"), JSON.stringify({ nodes: [], links: [] }));
+
+  const client = await connect(configWithEnv({
+    MCP_COMFYUI_WORKFLOW_DIRS: sibling,
+    MCP_COMFYUI_CREATED_DIR: created,
+  }));
+  const result = (await client.callTool({
+    name: "list_workflows",
+    arguments: {},
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.workflows.find((w: { name: string }) => w.name === "decoy").origin).toBeUndefined();
+
+  rmSync(created, { recursive: true, force: true });
+  rmSync(sibling, { recursive: true, force: true });
+});
+
+// --- create_workflow_from_template ------------------------------------------
+
+/** Point the fixture at a frontend-format workflow carrying a 2^64-1 value. */
+function useFetchMode(): void {
+  process.env.FAKE_COMFY_MODE = "templates_fetch";
+  process.env.FAKE_COMFY_TEMPLATE_FILE = BIGSEED;
+  process.env.FAKE_COMFY_TEMPLATE_NAME = "fixture_template";
+}
+
+test("create_workflow_from_template writes into the created directory and returns the path", async () => {
+  useFetchMode();
+  const created = join(workdir, "created");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template" },
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.path).toBe(join(created, "fixture_template.json"));
+  expect(existsSync(body.path)).toBe(true);
+});
+
+test("an existing target is refused and the existing file is untouched", async () => {
+  useFetchMode();
+  const created = join(workdir, "created2");
+  mkdirSync(created, { recursive: true });
+  const target = join(created, "fixture_template.json");
+  writeFileSync(target, "ORIGINAL");
+
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template" },
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.error.kind).toBe("invalid_input");
+  // A substring as loose as "as" also matches "Pass" — assert the existing
+  // path instead, which only this message names.
+  expect(body.error.message).toContain(target);
+  expect(readFileSync(target, "utf8")).toBe("ORIGINAL");
+});
+
+test("`as` cannot climb out of the created directory", async () => {
+  useFetchMode();
+  const created = join(workdir, "created3");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  for (const bad of ["../escape", "sub/dir", "..", ".", "/absolute", "a b"]) {
+    const result = (await client.callTool({
+      name: "create_workflow_from_template",
+      arguments: { template: "fixture_template", as: bad },
+    })) as CallToolResult;
+    const body = JSON.parse(textOf(result));
+    expect(body.error.kind).toBe("invalid_input");
+  }
+  expect(existsSync(join(workdir, "escape.json"))).toBe(false);
+});
+
+test("`as` names the file when it is a plain stem", async () => {
+  useFetchMode();
+  const created = join(workdir, "created4");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template", as: "my-video" },
+  })) as CallToolResult;
+  const body = JSON.parse(textOf(result));
+  expect(body.path).toBe(join(created, "my-video.json"));
+});
+
+test("create_workflow_from_template rejects a leading-dash template at the schema layer, before any subprocess runs or directory is created", async () => {
+  // Final review, finding 1 + finding 5. Before the `template` schema gained
+  // its own `.refine()`, this reached `fetchTemplate`'s internal
+  // `assertNotFlag`, which throws a bare `Error` that `describeError` cannot
+  // classify — reported as `internal_error`, blaming this server for bad
+  // caller input. It also ran `mkdir` on the created directory first, so a
+  // refused call still left an empty directory behind. Both are closed by
+  // rejecting at the schema layer: the handler — and therefore `mkdir` — is
+  // never entered at all. Like `promptIdArgument`'s own schema rejection
+  // (above), the SDK's own `McpError` path answers this one, not
+  // `toolAnswer`/`describeError` — so the body is a bare string, not
+  // `ToolErrorBody` JSON, and must not be parsed as such.
+  const created = join(workdir, "created-dash");
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "--gallery" },
+  })) as CallToolResult;
+
+  expect(result.isError).toBe(true);
+  expect(textOf(result)).toContain("template");
+  expect(existsSync(argvOut)).toBe(false); // rejected before anything was spawned
+  expect(existsSync(created)).toBe(false); // and before the created directory exists
+});
+
+test("create_workflow_from_template is not read-only and takes no host", async () => {
+  const client = await connect(baseConfig());
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "create_workflow_from_template");
+  expect(tool?.annotations?.readOnlyHint).toBe(false);
+  expect(tool?.annotations?.destructiveHint).toBe(false);
+  expect(Object.keys(tool?.inputSchema.properties ?? {})).not.toContain("host");
 });

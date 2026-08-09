@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { DEFAULT_WORKFLOW_DIR, workflowRoots } from "../src/config.ts";
+import { createdWorkflowDir, DEFAULT_WORKFLOW_DIR, workflowRoots } from "../src/config.ts";
 import {
   type WorkflowFile,
   type WorkflowListing,
@@ -13,8 +13,20 @@ import {
 
 /**
  * No test in this file may read the operator's real workflow directory or
- * contact a server: every root is a fresh temp directory written by the test
- * itself, and every `workflowRoots` call is passed an explicit environment.
+ * contact a server: every scanned root is a fresh temp directory written by
+ * the test itself.
+ *
+ * Most tests hand `discoverWorkflows` an explicit `roots` array, which
+ * bypasses `workflowRoots`/the environment entirely — nothing to guard there.
+ * The "config" section below calls `workflowRoots` directly to inspect its
+ * *return value*, never to scan anything, so an env that omits
+ * `MCP_COMFYUI_CREATED_DIR` there cannot read a real directory either. The one
+ * call that must set it is `discoverWorkflows({ env })`: `workflowRoots`
+ * always appends {@link createdWorkflowDir}'s result as a live scan root, and
+ * an env that leaves `MCP_COMFYUI_CREATED_DIR` unset resolves that to the
+ * operator's real `~/.local/share/mcp-comfyui/workflows` — silently correct
+ * only while nothing has ever written there. Every such call must pin it to a
+ * temp directory too, on the same reasoning as `MCP_COMFYUI_WORKFLOW_DIRS`.
  */
 
 let roots: string[] = [];
@@ -531,12 +543,18 @@ test("ordering does not depend on the ambient locale", async () => {
 // --- config -----------------------------------------------------------------
 
 test("the default root is the user's ComfyUI workflow directory", () => {
-  expect(workflowRoots({})).toEqual([DEFAULT_WORKFLOW_DIR]);
+  // workflowRoots() also appends the created-workflows directory, last — see
+  // config.test.ts for that guarantee in isolation; here it is just accounted
+  // for, never reordered away.
+  expect(workflowRoots({})).toEqual([DEFAULT_WORKFLOW_DIR, createdWorkflowDir({})]);
   expect(DEFAULT_WORKFLOW_DIR).toBe("/Users/lawls/ComfyUI-Shared/user/default/workflows");
 });
 
 test("MCP_COMFYUI_WORKFLOW_DIRS overrides the default", () => {
-  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "/a/one" })).toEqual(["/a/one"]);
+  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "/a/one" })).toEqual([
+    "/a/one",
+    createdWorkflowDir({}),
+  ]);
 });
 
 test("MCP_COMFYUI_WORKFLOW_DIRS splits on colons, like PATH", () => {
@@ -544,6 +562,7 @@ test("MCP_COMFYUI_WORKFLOW_DIRS splits on colons, like PATH", () => {
     "/a/one",
     "/b/two",
     "/c/three",
+    createdWorkflowDir({}),
   ]);
 });
 
@@ -552,6 +571,7 @@ test("configured order is preserved", () => {
   expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "/z/last:/a/first" })).toEqual([
     "/z/last",
     "/a/first",
+    createdWorkflowDir({}),
   ]);
 });
 
@@ -561,6 +581,7 @@ test("empty and blank segments are dropped", () => {
   expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "/a/one::/b/two:" })).toEqual([
     "/a/one",
     "/b/two",
+    createdWorkflowDir({}),
   ]);
 });
 
@@ -568,6 +589,7 @@ test("a duplicated root is listed once", () => {
   expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "/a/one:/a/one:/b/two" })).toEqual([
     "/a/one",
     "/b/two",
+    createdWorkflowDir({}),
   ]);
 });
 
@@ -581,18 +603,32 @@ test("a relative root is resolved against the working directory", () => {
 test("an empty or blank override falls back to the default", () => {
   // A shell that exports an unset variable yields "", which means the operator
   // said nothing — not that they want no directories searched at all.
-  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "" })).toEqual([DEFAULT_WORKFLOW_DIR]);
-  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "   " })).toEqual([DEFAULT_WORKFLOW_DIR]);
-  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: ":::" })).toEqual([DEFAULT_WORKFLOW_DIR]);
+  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "" })).toEqual([DEFAULT_WORKFLOW_DIR, createdWorkflowDir({})]);
+  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: "   " })).toEqual([
+    DEFAULT_WORKFLOW_DIR,
+    createdWorkflowDir({}),
+  ]);
+  expect(workflowRoots({ MCP_COMFYUI_WORKFLOW_DIRS: ":::" })).toEqual([
+    DEFAULT_WORKFLOW_DIR,
+    createdWorkflowDir({}),
+  ]);
 });
 
 test("discoverWorkflows falls back to the configured roots", async () => {
   // Called with no roots at all it must consult the environment rather than
-  // scanning nothing. Pointed at a temp dir so the real one is never read.
+  // scanning nothing. Pointed at a temp dir so the real one is never read —
+  // and MCP_COMFYUI_CREATED_DIR is pinned to a second temp dir for the same
+  // reason: workflowRoots() appends createdWorkflowDir(env) unconditionally,
+  // and leaving it unset here would make this call scan this developer's
+  // real ~/.local/share/mcp-comfyui/workflows once anything (e.g. Task 6)
+  // ever writes a fetched template there.
   const root = makeRoot();
   write(root, "graph.json", frontend());
+  const created = makeRoot();
 
-  const listing = await discoverWorkflows({ env: { MCP_COMFYUI_WORKFLOW_DIRS: root } });
+  const listing = await discoverWorkflows({
+    env: { MCP_COMFYUI_WORKFLOW_DIRS: root, MCP_COMFYUI_CREATED_DIR: created },
+  });
 
   expect(names(listing)).toEqual(["graph"]);
 });

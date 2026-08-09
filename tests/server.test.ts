@@ -35,6 +35,8 @@ const FIXTURES = join(import.meta.dirname, "fixtures");
 const FAKE_COMFY = join(FIXTURES, "fake-comfy-dispatch");
 const OBJECT_INFO_SAMPLE = join(FIXTURES, "object_info.sample.json");
 const SLOTS_SAMPLE = join(FIXTURES, "slots.default_image_gen.json");
+/** A frontend-format workflow with one settable slot, from Task 5's fetch tests. */
+const SLOTS_CAPABLE_TEMPLATE = join(FIXTURES, "template.bigseed.json");
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 /**
@@ -142,6 +144,8 @@ function denoServe(handler: (request: Request) => Response | Promise<Response>):
 
 let workdir: string;
 let roots: string;
+/** Where `MCP_COMFYUI_CREATED_DIR` points this run, unwritten — `workflowRoots()` still reports it. */
+let createdDir: string;
 let cacheDir: string;
 let argvOut: string;
 let servers: TestServer[] = [];
@@ -173,6 +177,7 @@ const MANAGED_ENV = [
   "FAKE_COMFY_DISPATCH_LOG",
   "FAKE_COMFY_WORKFLOW_COPY",
   "MCP_COMFYUI_WORKFLOW_DIRS",
+  "MCP_COMFYUI_CREATED_DIR",
   "MCP_COMFYUI_CACHE_DIR",
   "MCP_COMFYUI_HOST",
   "MCP_COMFYUI_PORT",
@@ -197,6 +202,12 @@ beforeEach(async () => {
   process.env.COMFY_BIN = FAKE_COMFY;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
   process.env.MCP_COMFYUI_WORKFLOW_DIRS = roots;
+  // Pointed inside this test's own directory, unwritten, so an exact `roots`
+  // or listing assertion here is deterministic rather than depending on this
+  // developer's real home directory, which `workflowRoots()` would otherwise
+  // append.
+  createdDir = join(workdir, "created");
+  process.env.MCP_COMFYUI_CREATED_DIR = createdDir;
   process.env.MCP_COMFYUI_CACHE_DIR = cacheDir;
   // Pointed inside this test's own directory even though nothing writes one:
   // otherwise every test here would read whoever's real
@@ -502,16 +513,18 @@ async function failure(
 
 // --- registration --------------------------------------------------------
 
-test("registers exactly the eight default tools", async () => {
+test("registers exactly the ten default tools", async () => {
   expect(await toolNames(await connect())).toEqual([
     "cancel_job",
     "comfy_status",
+    "create_workflow_from_template",
     "describe_workflow",
     "get_job",
     "list_hosts",
     "list_workflows",
     "manage_hosts",
     "run_workflow",
+    "search_templates",
   ]);
 });
 
@@ -522,12 +535,14 @@ test("the read-only tools are annotated read-only", async () => {
   }
 });
 
-test("the two tools that change something are annotated not read-only", async () => {
+test("the three tools that change something are annotated not read-only", async () => {
   // A client that hides or auto-approves read-only tools must not auto-approve
-  // a GPU render or the interruption of one.
+  // a GPU render, the interruption of one, or a fetch that writes a new
+  // workflow file to disk.
   const list = await tools(await connect());
   expect(toolNamed(list, "run_workflow").annotations?.readOnlyHint).toBe(false);
   expect(toolNamed(list, "cancel_job").annotations?.readOnlyHint).toBe(false);
+  expect(toolNamed(list, "create_workflow_from_template").annotations?.readOnlyHint).toBe(false);
 });
 
 test("cancel_job is annotated destructive and idempotent", async () => {
@@ -688,7 +703,9 @@ test("list_workflows enumerates the configured root and names the handles", asyn
   expect(workflows.map((entry) => entry["name"])).toEqual(["flow", "other"]);
   expect(workflows[0]?.["format"]).toBe("frontend");
   expect(workflows[0]?.["path"]).toBe(join(roots, "flow.json"));
-  expect(body["roots"]).toEqual([roots]);
+  // `workflowRoots()` always appends the created-workflows directory, last —
+  // see config.test.ts for that guarantee in isolation.
+  expect(body["roots"]).toEqual([roots, createdDir]);
 });
 
 test("a corrupt workflow is listed with its problem rather than failing the listing", async () => {
@@ -3017,4 +3034,71 @@ test("the build makes dist/ describe its own module format", async () => {
 
   expect(result.stderr).not.toContain("outside a module");
   expect(result.code).toBe(0);
+});
+
+// --- template creation needs no new pipeline ------------------------------
+
+test("a fetched template is describable by the existing pipeline, unchanged", async () => {
+  // The whole design rests on this: `templates fetch` writes frontend format,
+  // so describe_workflow reads it with no conversion step. If this fails, the
+  // feature does not work, however green the unit tests are. Driven over real
+  // stdio against the real dist/index.js, on this file's own pattern for that
+  // (see the stdio-landmine tests above), because that is the path a real MCP
+  // client actually takes — connect()'s in-memory transport never touches it.
+  const child = spawnDist({
+    ...process.env,
+    FAKE_COMFY_MODE: "templates_fetch",
+    FAKE_COMFY_TEMPLATE_FILE: SLOTS_CAPABLE_TEMPLATE,
+    FAKE_COMFY_TEMPLATE_NAME: "fixture_template",
+  });
+
+  // Two round trips, not one pipelined write: the SDK dispatches incoming
+  // requests as they arrive rather than queueing them, so a list_workflows
+  // sent before create_workflow_from_template's response has come back could
+  // race its async file write and see a directory that does not have the new
+  // file in it yet — a flake that would have nothing to do with the wiring
+  // this test exists to prove.
+  await writeStdin(child, INITIALIZE_LINE);
+  await writeStdin(
+    child,
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "create_workflow_from_template", arguments: { template: "fixture_template" } },
+    })}\n`,
+  );
+  const afterCreate = await readUntil(child.stdout, 2, 10_000); // the initialize response, then this one
+
+  await writeStdin(
+    child,
+    `${JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "list_workflows", arguments: {} },
+    })}\n`,
+  );
+  const afterList = await readUntil(child.stdout, 1, 10_000); // one more line, on the same stream
+
+  child.kill("SIGKILL");
+  child.stdout.cancel();
+  child.stderr.cancel();
+  await child.status;
+
+  const lines = `${afterCreate}${afterList}`.split("\n").filter((line) => line.trim() !== "");
+  const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
+  const byId = new Map(messages.filter((m) => m["id"] !== undefined).map((m) => [m["id"], m]));
+
+  const created = byId.get(2)?.["result"] as { content: Array<{ text: string }> };
+  const createdBody = JSON.parse(created.content[0]!.text) as Record<string, unknown>;
+  expect(createdBody["path"]).toBe(join(createdDir, "fixture_template.json"));
+
+  const listed = byId.get(3)?.["result"] as { content: Array<{ text: string }> };
+  const listedBody = JSON.parse(listed.content[0]!.text) as Record<string, unknown>;
+  const entry = (listedBody["workflows"] as Array<Record<string, unknown>>).find(
+    (workflow) => workflow["name"] === "fixture_template",
+  );
+  expect(entry?.["origin"]).toBe("template");
+  expect(entry?.["format"]).toBe("frontend");
 });
