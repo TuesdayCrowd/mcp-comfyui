@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerTools, resolveSlotTypes, type ToolConfig } from "../src/tools.ts";
 import { describeError } from "../src/toolResult.ts";
+import { objectInfoCachePath } from "../src/comfy/objectInfo.ts";
 
 /**
  * Unit-level coverage for `src/tools.ts`'s own logic, below the level of the
@@ -671,4 +672,260 @@ test("create_workflow_from_template is not read-only and takes no host", async (
   expect(tool?.annotations?.readOnlyHint).toBe(false);
   expect(tool?.annotations?.destructiveHint).toBe(false);
   expect(Object.keys(tool?.inputSchema.properties ?? {})).not.toContain("host");
+});
+
+// --- run_workflow: object_info source for a non-local host -----------------
+//
+// comfy-cli refuses to fetch `/object_info` from a non-loopback address in
+// local mode ("potential SSRF") — measured 2026-08-08 against a live remote —
+// so `run_workflow`'s handler points `set-slot` at this server's own per-host
+// cache (`objectInfoCachePath`) instead of the live `--host`/`--port` for a
+// non-local target. That decision is made entirely inline in the handler
+// closure — it is not `resolveSlotTypes` (whose own signature only widened to
+// *accept* an `objectInfoPath`; its body already forwarded whatever `location`
+// it was given, before and after, so calling it directly cannot tell the fix
+// apart from its absence) and there is no other exported seam for it.
+//
+// Reaching it through a real tool call requires `ensureRunning`'s remote
+// branch to observe a *running* instance at a non-local address. This suite's
+// `--allow-net=127.0.0.1,[::1],192.0.2.1` makes that impossible to satisfy
+// honestly: 127.0.0.1/[::1] are always `local` (`isLocalAddress`), and
+// 192.0.2.1 (RFC 5737 TEST-NET-1) is on no interface anywhere and answers
+// nothing — confirmed by `tests/server.test.ts`'s own `run_workflow` test
+// against that exact address, whose load-bearing assertion is
+// `existsSync(argvOut) === false`: `ensureRunning` throws before `comfy` is
+// even spawned, for every call this suite can make against a "remote" host.
+// `Deno.serve` cannot bind `192.0.2.1` either, so there is no way to stand up
+// a real "reachable, non-local" fixture the way `serveOtherInstance()` does
+// with two loopback ports.
+//
+// The one remaining seam is `detectInstance`'s own `fetch` call
+// (`comfy/instance.ts`) for `/system_stats`. Faking just that one response
+// lets `ensureRunning` see the remote as running and the call proceed into
+// the fixed code with `target.local === false`, without touching the real
+// network at all — nothing else on this path uses raw `fetch`:
+// `resolveSlotTypes`, `applySlots` and `runWorkflow` all go through the fake
+// `comfy` CLI fixture, not HTTP.
+//
+// A second concern, found while adding this test: a bare `objectInfoCachePath`
+// only *names* the cache file, it never checks the file is actually there.
+// Measured directly against the real CLI: `comfy workflow slots --input
+// <a path that does not exist>` fails `cql_no_graph`, "cannot read
+// object_info: ...: No such file or directory" — so a remote `run_workflow`
+// call for a workflow nobody had `describe_workflow`d yet (nothing had ever
+// populated the cache) would fail this way, leaking this server's own cache
+// path and recommending two things this tool cannot act on. `run_workflow`
+// now calls `ensureObjectInfoCache` instead, which fetches and writes the
+// cache itself when it is missing or stale. The test below keeps a warm
+// cache (the ordinary case, once `describe_workflow` has run once) so it
+// stays about the `--input` argv shape and not about the fetch; the cold
+// case — an empty `cacheDir`, and the cache file actually appearing on disk
+// afterward — is `run_workflow fills a cold object_info cache ...`, right
+// after it.
+test("run_workflow points set-slot at the per-host object_info cache for a non-local host, not --host/--port", async () => {
+  const remoteHost = "192.0.2.1"; // RFC 5737 TEST-NET-1: on no interface, answers nothing for real
+  const remotePort = 8189;
+  const cacheDir = join(workdir, "cache");
+
+  const roots = mkdtempSync(join(tmpdir(), "mcp-comfyui-tools-remote-"));
+  const workflowPath = join(roots, "flow.json");
+  // A widget-backed node with no incoming link on `text`, so
+  // `refuseInertInputs` — which runs before `ensureRunning`, straight off the
+  // file — does not refuse the call before this test ever reaches the fetch
+  // patch or the code under test.
+  writeFileSync(workflowPath, JSON.stringify({ nodes: [{ id: 6, type: "CLIPTextEncode" }], links: [] }));
+
+  // A warm cache, so `ensureObjectInfoCache` (below) reads it straight from
+  // disk and this test stays about the `--input` argv shape, not the fetch —
+  // the cold case has its own test, right after this one.
+  mkdirSync(cacheDir, { recursive: true });
+  const expectedCachePath = objectInfoCachePath({ host: remoteHost, port: remotePort, cacheDir });
+  writeFileSync(expectedCachePath, JSON.stringify({ CLIPTextEncode: { input: { required: {} } } }));
+
+  const probeUrl = `http://${remoteHost}:${remotePort}/system_stats`;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url === probeUrl) {
+      return new Response(JSON.stringify({ system: {}, devices: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    // set-slot fails deliberately. `applySlots` then throws, so
+    // `runWorkflow`'s own `comfy run` is never spawned and never overwrites
+    // `argvOut` — the single-shot `$FAKE_COMFY_ARGV_OUT` capture then holds
+    // EXACTLY the `set-slot` invocation this test is about.
+    // `$FAKE_COMFY_ARGV_LOG` only accumulates in the fixture's `jobs` mode
+    // (append-only fixture — not extended here), so this is the only way to
+    // isolate one call's argv out of run_workflow's several without touching
+    // it.
+    serveFailure("workflow_slot_invalid", "boom");
+
+    const client = await connect(baseConfig({ cacheDir }));
+    const result = (await client.callTool({
+      name: "run_workflow",
+      arguments: {
+        workflow: workflowPath,
+        host: `${remoteHost}:${remotePort}`,
+        // No JSON-parseable value, so `resolveSlotTypes` skips its own CLI
+        // round trip entirely (see "never spawns the CLI for ordinary,
+        // unambiguous values" above) — the only comfy invocation this call
+        // makes is `applySlots`'s `set-slot`.
+        inputs: { "6.text": "hello" },
+      },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true); // the forced set-slot failure
+    expect(existsSync(argvOut)).toBe(true); // and something WAS spawned
+    const argv = readFileSync(argvOut, "utf8").trim().split(" ");
+
+    const inputIndex = argv.indexOf("--input");
+    expect(inputIndex).toBeGreaterThanOrEqual(0); // -1 without the fix: no --input at all
+    expect(argv[inputIndex + 1]).toBe(expectedCachePath);
+    // Without the fix, set-slot is pointed at the live server instead, and
+    // comfy-cli refuses that outright as potential SSRF against a non-loopback
+    // host — measured 2026-08-08 against a live remote — which is the bug
+    // this fix closes.
+    expect(argv).not.toContain("--host");
+    expect(argv).not.toContain("--port");
+  } finally {
+    globalThis.fetch = realFetch;
+    rmSync(roots, { recursive: true, force: true });
+  }
+});
+
+test("run_workflow fills a cold object_info cache for a non-local host before pointing set-slot at it", async () => {
+  const remoteHost = "192.0.2.1"; // RFC 5737 TEST-NET-1: on no interface, answers nothing for real
+  const remotePort = 8189;
+  const cacheDir = join(workdir, "cache"); // fresh — nothing has ever written here
+
+  const roots = mkdtempSync(join(tmpdir(), "mcp-comfyui-tools-remote-cold-"));
+  const workflowPath = join(roots, "flow.json");
+  writeFileSync(workflowPath, JSON.stringify({ nodes: [{ id: 6, type: "CLIPTextEncode" }], links: [] }));
+
+  const expectedCachePath = objectInfoCachePath({ host: remoteHost, port: remotePort, cacheDir });
+  expect(existsSync(expectedCachePath)).toBe(false); // the premise: genuinely cold
+
+  const servedObjectInfo = { CLIPTextEncode: { input: { required: {} } } };
+  const systemStatsUrl = `http://${remoteHost}:${remotePort}/system_stats`;
+  const objectInfoUrl = `http://${remoteHost}:${remotePort}/object_info`;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url === systemStatsUrl) {
+      return new Response(JSON.stringify({ system: {}, devices: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    // The behaviour under test: without it, nothing here ever fetches
+    // `/object_info` at all, and a real, non-mocked request to a TEST-NET-1
+    // address would either hang for this module's own 30s fetch timeout or
+    // fall through to `realFetch` and try the real network — neither of
+    // which this suite may do.
+    if (url === objectInfoUrl) {
+      return new Response(JSON.stringify(servedObjectInfo), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    // set-slot fails deliberately, same reasoning as the test above: it keeps
+    // `argvOut` holding exactly the `set-slot` invocation this test checks,
+    // and it happens well after the cache-fill this test is really about.
+    serveFailure("workflow_slot_invalid", "boom");
+
+    const client = await connect(baseConfig({ cacheDir }));
+    const result = (await client.callTool({
+      name: "run_workflow",
+      arguments: {
+        workflow: workflowPath,
+        host: `${remoteHost}:${remotePort}`,
+        inputs: { "6.text": "hello" },
+      },
+    })) as CallToolResult;
+
+    expect(result.isError).toBe(true); // the forced set-slot failure
+
+    // The load-bearing assertion: the cold cache is no longer cold. Without
+    // the fix (a bare `objectInfoCachePath`, never fetching), this file is
+    // never written and `set-slot` would have been pointed at a path that
+    // does not exist — which the real CLI fails outright, `cql_no_graph`,
+    // "cannot read object_info: ...: No such file or directory" (measured
+    // directly against the installed comfy-cli).
+    expect(existsSync(expectedCachePath)).toBe(true);
+    expect(JSON.parse(readFileSync(expectedCachePath, "utf8"))).toEqual(servedObjectInfo);
+
+    expect(existsSync(argvOut)).toBe(true);
+    const argv = readFileSync(argvOut, "utf8").trim().split(" ");
+    const inputIndex = argv.indexOf("--input");
+    expect(inputIndex).toBeGreaterThanOrEqual(0);
+    expect(argv[inputIndex + 1]).toBe(expectedCachePath);
+  } finally {
+    globalThis.fetch = realFetch;
+    rmSync(roots, { recursive: true, force: true });
+  }
+});
+
+test("run_workflow with no inputs never fetches object_info, even for a non-local host", async () => {
+  // `applySlots` short-circuits on empty inputs and never spawns `comfy`, so the
+  // node definitions are not needed. Fetching them anyway made the commonest
+  // remote call — run it with its defaults — depend on an endpoint nothing
+  // downstream reads: with `/system_stats` answering and `/object_info` down,
+  // the whole run failed with `object_info_unavailable` and a message claiming
+  // the instance was unreachable, which it was not.
+  const remoteHost = "192.0.2.1"; // RFC 5737 TEST-NET-1
+  const remotePort = 8189;
+  const cacheDir = join(workdir, "cache-no-inputs");
+
+  const roots = mkdtempSync(join(tmpdir(), "mcp-comfyui-tools-remote-noinputs-"));
+  const workflowPath = join(roots, "flow.json");
+  writeFileSync(workflowPath, JSON.stringify({ nodes: [{ id: 6, type: "CLIPTextEncode" }], links: [] }));
+
+  const systemStatsUrl = `http://${remoteHost}:${remotePort}/system_stats`;
+  const objectInfoUrl = `http://${remoteHost}:${remotePort}/object_info`;
+  let objectInfoRequested = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (url === systemStatsUrl) {
+      return new Response(JSON.stringify({ system: {}, devices: [] }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url === objectInfoUrl) {
+      // Answering 500 rather than never being called is deliberate: it makes
+      // the regression fail loudly here instead of silently succeeding on a
+      // warm cache somewhere else.
+      objectInfoRequested = true;
+      return new Response("boom", { status: 500 });
+    }
+    return realFetch(input, init);
+  }) as typeof fetch;
+
+  try {
+    // `run` fails, so nothing submits — this test is about what happened before it.
+    process.env.FAKE_COMFY_MODE = "fail";
+
+    const client = await connect(baseConfig({ cacheDir }));
+    const result = (await client.callTool({
+      name: "run_workflow",
+      arguments: { workflow: workflowPath, host: `${remoteHost}:${remotePort}` },
+    })) as CallToolResult;
+
+    // The assertion that matters: /object_info was never asked for.
+    expect(objectInfoRequested).toBe(false);
+    // And the failure the caller sees is the run's own, not a fabricated
+    // "node definitions unavailable" about an endpoint it never needed.
+    const body = JSON.parse(textOf(result));
+    expect(body.error.kind).not.toBe("object_info_unavailable");
+  } finally {
+    globalThis.fetch = realFetch;
+    rmSync(roots, { recursive: true, force: true });
+  }
 });
