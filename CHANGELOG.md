@@ -4,6 +4,20 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6] — 2026-08-09
+
+### Fixed
+
+- **Documentation accuracy pass.** `MCP_COMFYUI_CREATED_DIR` reached the tool
+  descriptions in 0.6.5 but not the README configuration table, which is the
+  canonical list of every setting this server has — it was the one variable in
+  `config.ts` missing from it.
+- **Ground truth #15 over-generalised, and CLAUDE.md repeated it.** Both said an
+  input that is *link-fed* is inert. An input fed from a subgraph *boundary* is
+  link-fed and is the only address that works; the real test is the link's
+  origin, which `classifyInput` has always implemented. Stating it loosely is
+  what produced the backwards diagnosis #26 records.
+
 ## [0.6.5] — 2026-08-08
 
 ### Added
