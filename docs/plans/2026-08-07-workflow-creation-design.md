@@ -1,6 +1,16 @@
 # Creating workflows
 
-**Status:** designed, not implemented.
+**Status:** implemented and released in 0.6.5 on 2026-08-08 — see `CHANGELOG.md`
+and PRs #8, #9, #11 and #12. This document is kept as the record of the
+decisions and the ground truth behind them, not as a description of the code;
+where the two differ, the code and `CLAUDE.md` are current.
+
+Two things the live trial changed after this was written. The "Error handling"
+section's network-failure shape was **not** measured at design time and now is
+(`template_fetch_failed`, in a clean envelope). And running a fetched template
+on a *remote* host exposed two bugs this design did not anticipate, both since
+fixed and recorded as ground truth #24 and #25 — neither is a defect in the
+design below, but a reader mining this for "what works" should read those first.
 **Date:** 2026-08-07
 
 This server can find, describe, parameterise and run a workflow that already
