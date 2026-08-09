@@ -86,6 +86,7 @@ A `deno task compile` task is also available if a self-contained platform binary
 | Variable | Default | Meaning |
 |---|---|---|
 | `MCP_COMFYUI_WORKFLOW_DIRS` | `~/ComfyUI-Shared/user/default/workflows` | Colon-separated roots to scan, like `PATH` |
+| `MCP_COMFYUI_CREATED_DIR` | `~/.local/share/mcp-comfyui/workflows` | Where `create_workflow_from_template` writes. Scanned **last**, so a fetched workflow can never shadow one of yours |
 | `MCP_COMFYUI_AUTO_LAUNCH` | **on** | May the server start ComfyUI when a tool needs one and nothing answers? |
 | `MCP_COMFYUI_ALLOW_LAUNCH` | off | May a *model* start one, with startup flags of its own? Registers `launch_comfyui` |
 | `MCP_COMFYUI_WORKSPACE` | unset | ComfyUI directory to launch from |
