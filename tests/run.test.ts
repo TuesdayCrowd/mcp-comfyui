@@ -1143,6 +1143,117 @@ test("an address this server cannot parse (no dot) is unconfirmed rather than gu
   expect(result.effectiveParameters).toEqual([{ address: "malformed", status: "unconfirmed", requested: 42 }]);
 });
 
+// --- subgraph-interior addresses: slash-joined here, colon-joined on submit -
+
+// A subgraph-interior address is slash-joined — `129/93.text`, exactly what
+// `comfy workflow slots` reports and `set-slot` accepts (this server's own
+// addressing, built by `discover.ts`'s `analyseScope`). Subgraph expansion in
+// `comfy_cli.workflow_to_api` renames the same interior node to a
+// COLON-joined id in the graph it actually submits — `expanded["id"] =
+// f"{outer_id}:{inner.get('id')}"`, measured directly against the installed
+// comfy-cli and confirmed by a three-way `convert_ui_to_api` comparison on a
+// real template (`video_wan2_2_14B_i2v.json`): editing `129/93.text` via
+// `set-slot` survives conversion into the submitted graph's `"129:93"` node
+// untouched.
+//
+// Before this fix, `submittedValueOf` indexed the submitted graph with the
+// address's own, unmodified nodeId — `prompt["129/93"]` — which can never
+// match the graph's actual key, `"129:93"`. Every subgraph-interior address
+// was therefore reported `missing` unconditionally, regardless of whether the
+// value actually took effect: a false negative, not a broken address. This is
+// the reported production symptom (`129/93.text` reported `missing` on a
+// completed job) — and, per the same measurement, the value was very likely
+// applied correctly; only the confirmation was lying.
+//
+// `discover.ts`'s classification of a boundary-origin (`-10`) link as
+// `effective` (never a decoy) is unchanged and unrelated to this fix — see
+// its own doc comment and `discover.test.ts`'s "any negative origin id is
+// treated as the subgraph boundary" — measurement shows that classification
+// is correct: `129/93.text` is the only address that actually controls this
+// value, and the top-level instance node's own widget
+// (`129.text`) is not even settable through comfy-cli for this subgraph
+// schema (`workflow_slot_invalid`, no `proxyWidgets` mapping).
+
+test("a subgraph-interior (slash-joined) address is matched against the submitted graph's colon-joined node key", async () => {
+  const graph = JSON.stringify({ "129:93": promptNode("CLIPTextEncode", { text: "dragon warrior" }) });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "129/93.text": "dragon warrior" },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    { address: "129/93.text", status: "confirmed", requested: "dragon warrior", submitted: "dragon warrior" },
+  ]);
+});
+
+test("a doubly-nested subgraph address translates every segment, not just the first", async () => {
+  // Each level of `_expand_one_subgraph` colon-joins onto an already
+  // colon-joined outer id, so a two-level address must translate BOTH
+  // slashes — pins `replaceAll`, not a single `replace` of the first slash.
+  const graph = JSON.stringify({ "17:45:9": promptNode("CLIPTextEncode", { text: "nested" }) });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "17/45/9.text": "nested" },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    { address: "17/45/9.text", status: "confirmed", requested: "nested", submitted: "nested" },
+  ]);
+});
+
+test("a subgraph-interior address the submitted graph disagrees with is a mismatch, not a false confirm", async () => {
+  // Pins that the translated key still runs through the ordinary valuesMatch
+  // comparison, not a shortcut that treats "the translated key exists" as
+  // automatic confirmation. This is the exact real-world shape the reported
+  // production symptom describes: a caller's requested text against a
+  // template's default.
+  const graph = JSON.stringify({
+    "129:93": promptNode("CLIPTextEncode", { text: "The white dragon warrior stands still" }),
+  });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "129/93.text": "The card tilts and catches" },
+  });
+
+  expect(result.effectiveParameters).toEqual([
+    {
+      address: "129/93.text",
+      status: "mismatch",
+      requested: "The card tilts and catches",
+      submitted: "The white dragon warrior stands still",
+    },
+  ]);
+});
+
+test("a subgraph-interior address absent from the submitted graph is still reported missing, not confused with a sibling", async () => {
+  // A DIFFERENT interior node under the same outer instance (129/98, not
+  // 129/93) must not be mistaken for the requested one — pins an exact-key
+  // translation, not a prefix or substring match on the outer id.
+  const graph = JSON.stringify({ "129:98": promptNode("ComfyMathExpression", { expression: "a" }) });
+  serveStream(
+    `${[promptPreviewLine(graph), ...completedEvents(), envelopeLine(completedPayload())].join("\n")}\n`,
+  );
+
+  const result = await runWorkflow(await prepare(), {
+    wait: true,
+    requestedValues: { "129/93.text": "anything" },
+  });
+
+  expect(result.effectiveParameters).toEqual([{ address: "129/93.text", status: "missing", requested: "anything" }]);
+});
+
 // --- the fixtures are the real contract ----------------------------------
 
 /** The subset of JSON Schema the two copied contracts use. */
