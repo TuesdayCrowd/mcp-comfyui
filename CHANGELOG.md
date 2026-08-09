@@ -4,7 +4,7 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.5] — 2026-08-08
 
 ### Added
 
@@ -29,6 +29,25 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **`run_workflow` with `inputs` could not work against any remote host.**
+  comfy-cli refuses to fetch `/object_info` from a non-loopback address in local
+  mode — "potential SSRF" — so pointing `set-slot` at the live server, which is
+  right for a local host, made every remote run with an override fail
+  `cql_no_graph`. Remote targets now use this server's own per-host cache, and
+  fill it first when it is cold. The fetch happens only when there is an
+  override to apply: `applySlots` never spawns `comfy` for a defaults-only run,
+  and fetching node definitions for one made the commonest remote call depend on
+  an endpoint nothing downstream reads. The 2026-08-07 multi-host verification
+  covered `comfy_status`, `describe_workflow` and `list_workflows` against a
+  remote, but never a run with inputs, so this path had no coverage at all.
+- **Every subgraph-interior address was reported `missing` after a run, even
+  when its value had been applied correctly.** Subgraph interiors are renamed
+  `outer:inner` with a colon during API conversion, while `comfy workflow slots`
+  addresses them `outer/inner` with a slash, so the lookup that verifies a
+  submitted value could never match. The address is now translated before the
+  lookup. This was a false negative in the report only — the values themselves
+  were reaching ComfyUI. Confirmed against a live remote: five overrides,
+  including a subgraph-interior one, all read back `confirmed`.
 - **The publish workflow type-checked with the wrong TypeScript.** `npx jsr
   publish` downloads its own Deno rather than the version `setup-deno` pins, so
   the publish step's type-check ran on whichever TypeScript that download
