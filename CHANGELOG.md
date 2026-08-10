@@ -4,6 +4,23 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.9] — 2026-08-09
+
+### Added
+
+- **`overwrite` on `create_workflow_from_template`.** Re-fetching a template the
+  gallery has updated needed a new filename before this, which was the thing
+  actually driving the created directory to accumulate files. Off by default: a
+  workflow you fetched earlier may have been parameterised since.
+
+### Fixed
+
+- **The existence check is now atomic.** It was an `existsSync` separated from
+  the write by an `await`, so two calls for the same name could both see nothing
+  and both write. It is now a create-exclusive write, and the kernel decides.
+  A failed fetch removes the placeholder rather than leaving a zero-byte file
+  that `list_workflows` would report as an `invalid` workflow nobody created.
+
 ## [0.6.8] — 2026-08-09
 
 ### Added
