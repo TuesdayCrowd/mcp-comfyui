@@ -13,6 +13,7 @@ import {
   type RunningInstance,
 } from "./comfy/instance.ts";
 import { cancelJob, getJobStatus, type CancelResult, type JobStatus } from "./comfy/jobs.ts";
+import { validateWorkflow } from "./comfy/validate.ts";
 import {
   DEFAULT_TEMPLATE_LIMIT,
   fetchTemplate,
@@ -1481,6 +1482,59 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
             schema: described.schema,
             unresolved: described.unresolved,
             inert: described.inert,
+          };
+        } finally {
+          staged?.dispose();
+        }
+      }),
+  );
+
+  server.registerTool(
+    "validate_workflow",
+    {
+      title: "Validate a workflow without running it",
+      description:
+        "Check whether ComfyUI would accept a workflow, without submitting it. Answers in well " +
+        "under a second against the cached node definitions, so it normally works with ComfyUI " +
+        "stopped. Use it before run_workflow when a run is expensive, or after an edit you are " +
+        "unsure about — a graph that fails here would otherwise fail after the queue, the model " +
+        "load and however much of a render ComfyUI got through first. " +
+        "A workflow being invalid is a normal answer, not an error: `valid: false` comes back " +
+        "with an `errors` list naming the node, the field and, for a bad dropdown value, the " +
+        "values that would have worked. " +
+        "`warnings` are advisory and a clean workflow routinely has several — they are capped, " +
+        "and `warning_count` is the true total. **`valid: true` is a structural guarantee, not a " +
+        "semantic one**: it means every node exists, every required input is present, every " +
+        "value is in range and every edge is wired, not that the result will look like what you " +
+        "asked for. Pass `host` to check against a particular ComfyUI's installed models, which " +
+        "is what decides whether a checkpoint or LoRA name is valid at all.",
+      inputSchema: { workflow: workflowArgument, host: hostArgument },
+      // Same conditional as describe_workflow and for the same reason: with
+      // auto-launch on, filling a cold object_info cache may start ComfyUI.
+      annotations: { readOnlyHint: !config.autoLaunch, openWorldHint: true },
+    },
+    async ({ workflow, host }) =>
+      toolAnswer(async () => {
+        const { target, named } = await resolveCallTarget(config, host, workflow);
+        const resolved = await resolveWorkflow(workflow, config, target, named);
+        const location = { ...address(target), cacheDir: config.cacheDir };
+        // The cache has to exist on disk, not merely be readable: the CLI is
+        // given a path. `ensureObjectInfoCache` fetches only when it is missing
+        // or stale, so the ordinary warm case costs no request — and for a
+        // remote host it is the only schema source the CLI will accept at all
+        // (ground truth #24).
+        await withObjectInfo(location, config, target);
+        const objectInfoPath = await ensureObjectInfoCache(location);
+
+        // Same staging rule as describe_workflow: the CLI reads a file, and a
+        // workflow that lives on the host is not one yet.
+        const staged = resolved.source === "remote" ? await stageWorkflow(resolved) : null;
+        try {
+          const report = await validateWorkflow(staged?.path ?? resolved.path, { objectInfoPath });
+          return {
+            target: targetBody(target),
+            workflow: { name: resolved.name, path: resolved.path, source: resolved.source },
+            ...report,
           };
         } finally {
           staged?.dispose();

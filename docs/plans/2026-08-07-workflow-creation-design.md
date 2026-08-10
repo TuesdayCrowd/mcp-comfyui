@@ -145,6 +145,13 @@ including cases where the working address is in the same listing:
 `129/94.fps` names `PrimitiveFloat` node 162 but not `129/162.value`. So
 single-hop resolution works and the rest does not. See "Out of scope".
 
+> **Superseded in 0.6.7.** The framing above ("single-hop works, deeper does
+> not") was wrong: two of the nine failed because the graph-only resolver cannot
+> see a widget that has not been *converted to an input*, which has nothing to do
+> with hop count. Resolution now runs against the CLI's slot listing and reaches
+> 14 of 14 on this template. Kept as written because it records what was believed
+> at the time, and the correction is the point.
+
 ### compose — why it is not the vehicle
 
 `comfy workflow compose` builds an API-format graph from a YAML blueprint of
@@ -587,11 +594,6 @@ Accepted rather than solved. Each is disclosed in a tool description.
 - **Writing into a named host's own library.** `comfy workflow save` has no
   `--host`/`--port`, and `src/comfy/userdata.ts` is read-only. Doing this means
   a POST path in `userdata.ts`, which is its own design.
-- **Finishing `candidate_addresses`.** `inertInputsOf` resolves the single-hop
-  case — each of the five switch decoys correctly reports
-  `["129/131.value"]` — but leaves the other nine empty, including ones whose
-  working address is in the same listing: `129/94.fps` names `PrimitiveFloat`
-  node 162 without naming `129/162.value`. So this is a gap in coverage, not an
-  absent feature. Pre-existing in `discover.ts`, surfaced by testing this work
-  rather than caused by it, and worth its own change — it would make every
-  subgraph workflow easier to drive, not only fetched ones.
+- **~~Finishing `candidate_addresses`~~ — done in 0.6.7.** `describe_workflow` now
+  resolves a replacement address against the CLI's slot listing rather than the
+  graph alone, taking the measured template from 5 of 14 to 14 of 14.

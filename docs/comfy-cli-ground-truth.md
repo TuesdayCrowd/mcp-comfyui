@@ -117,3 +117,14 @@ On failure `ok:false` and `error:{code,message,hint,details}`.
     `129.unet_name`, `129.value` and the invented `129.not_a_thing` all return the byte-identical shape, so "rejected" carries no information about whether the name was real. Cause: `cql/engine.py:1710,1874` read only `instance.properties.proxyWidgets`, the **older** subgraph scheme; 0.30.2 puts the curated parameter list on the subgraph *definition* as `sg["inputs"][].linkIds`, which comfy-cli never reads. The in-source comment anticipates a *stale* `proxyWidgets`, not an *absent* one — this reads as an unhandled schema version rather than a decision.
 
     **The interior address is the effective one**, and the instance's own widget value is dead. Proven by a three-way `convert_ui_to_api` comparison: pristine → default text; `set-slot 129/93.text=MARKER` → `MARKER` survives conversion; mutating node 129's own `widgets_values[0]` → converted output **unchanged**. `_rewrite_internal_input` severs an interior link whose origin is the boundary sentinel `-10` and never re-attaches the outer node's widget in its place. So a boundary-fed interior input is **not** a decoy — treating it as one would refuse the only address that works.
+
+27. **`comfy validate` breaks the envelope contract: an invalid workflow is `ok:false` with `error:null` and a fully populated `data`.** Every other command in this CLI answers `ok:false` with an `error` object, and `src/comfy/envelope.ts` treats the combination of `ok:false` and no error as a contract violation — correctly, for all of them. Measured 2026-08-09 on a graph with a bad enum and an out-of-range integer:
+
+    ```
+    exit 1 | ok:false | error:null
+    data: {"valid":false,"error_count":2,"warning_count":19,"errors":[…],"warnings":[…]}
+    ```
+
+    Verified through this project's own code: `runComfy(["--json","validate",…])` on that file threw `EnvelopeParseError`, so the ordinary question "is this workflow valid?" came back as "this server and the CLI disagree about the shape of an answer". Anything wrapping `validate` must therefore use `runComfyRaw` and decode the envelope itself, treating `ok:false` **with** an error as a failure and `ok:false` **without** one as a negative answer. `src/comfy/validate.ts` does exactly that.
+
+    Two further shapes worth knowing before designing around this command. **A workflow that validates clean still carries warnings** — `video_wan2_2_14B_i2v` reports 19, nearly all `edge_type_mismatch` from one `ComfySwitchNode` whose output type ComfyUI's catalogue cannot express — so warnings are noise to be capped, not a signal to surface whole. And **`valid: true` is structural, not semantic**: it means every node exists, every required input is present, every value is in range and every edge is wired. It does not mean the graph does what was asked. Landmine #15 is the standing proof of that difference.

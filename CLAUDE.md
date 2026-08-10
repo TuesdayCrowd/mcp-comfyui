@@ -64,6 +64,7 @@ src/comfy/          the CLI and instance layer
   jobs.ts           jobs status | ls | cancel
   instance.ts       detection and guarded launch
   templates.ts      the gallery: search and fetch. No host — it is not a ComfyUI.
+  validate.ts       comfy validate; decodes its own envelope (landmine #27)
 src/workflows/
   discover.ts       find workflow files, classify by CONTENT not filename
   slots.ts          comfy workflow slots -> typed Slot[]

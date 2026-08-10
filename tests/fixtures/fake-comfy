@@ -36,6 +36,8 @@
 #   $FAKE_COMFY_JOBS_CANCEL_ERROR  jobs cancel: error code to fail with instead
 #   $FAKE_COMFY_TEMPLATES_FILE     templates_ls: JSON file served as data
 #   $FAKE_COMFY_TEMPLATE_FILE      templates_fetch: file copied to the -o path
+#   $FAKE_COMFY_VALIDATE_FILE     validate: JSON file served as data
+#   $FAKE_COMFY_VALIDATE_OK        validate: envelope ok flag, "true" or "false" (default true)
 #   $FAKE_COMFY_TEMPLATE_NAME      templates_fetch: name echoed back in data.name
 
 [ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
@@ -274,6 +276,17 @@ case "$FAKE_COMFY_MODE" in
     size=0
     [ -n "$dest" ] && [ -f "$dest" ] && size=$(wc -c < "$dest" | tr -d ' ')
     printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"templates fetch","version":"0.0.0","where":null,"data":{"name":"%s","title":"Fixture Template","output_type":"video","bytes":%s},"error":null}\n' "$FAKE_COMFY_TEMPLATE_NAME" "$size"
+    exit 0 ;;
+  validate)
+    # `comfy validate`. The ok flag is a SEPARATE knob from the payload because
+    # the real command decouples them: an invalid workflow comes back ok:false
+    # with error:null and a fully populated data (measured 2026-08-09), which is
+    # not the envelope contract every other command follows. A mode that forced
+    # ok:true could not reproduce the case this whole module exists to handle.
+    printf '{"schema":"envelope/1","type":"envelope","ok":%s,"command":"validate","version":"0.0.0","where":null,"data":' "${FAKE_COMFY_VALIDATE_OK:-true}"
+    cat "$FAKE_COMFY_VALIDATE_FILE"
+    printf ',"error":null}\n'
+    [ "${FAKE_COMFY_VALIDATE_OK:-true}" = "true" ] || exit 1
     exit 0 ;;
   *)
     echo "$OK"

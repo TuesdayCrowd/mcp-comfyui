@@ -174,6 +174,7 @@ A run on another machine never has a local path, whatever its output directory i
 | `search_templates` | ✓ | Search comfy-cli's curated workflow-template gallery |
 | `create_workflow_from_template` | | Fetch a gallery template into a new local workflow |
 | `describe_workflow` | ✓ | JSON Schema of that workflow's settable inputs |
+| `validate_workflow` | ✓ | Would ComfyUI accept this graph? Offline, sub-second |
 | `run_workflow` | | Apply inputs and execute |
 | `get_job` | ✓ | Poll a job by `prompt_id` |
 | `cancel_job` | | Stop a running job |
@@ -187,7 +188,9 @@ The intended order is `list_workflows` → `describe_workflow` → `run_workflow
 
 `search_templates` requires at least one of `type`, `category`, `tag`, `model`, `provider` or `name` — an unfiltered call is refused before anything runs, because the gallery holds hundreds of templates. `create_workflow_from_template` writes into this server's own directory (`MCP_COMFYUI_CREATED_DIR`, default `~/.local/share/mcp-comfyui/workflows`), not yours; it takes no `host`, needs network access even though the gallery index is cached, and never overwrites an existing file.
 
-`describe_workflow` is read-only only when auto-launch is off — with it on, the tool may start ComfyUI if it has no cached `/object_info`, and `readOnlyHint` has to say so. `comfy_status` never launches under any setting; it's the tool you call to ask whether anything is running.
+`validate_workflow` answers "would ComfyUI accept this?" without submitting — in well under a second, against the cached node definitions, so it normally works with ComfyUI stopped. A graph that fails there would otherwise fail after the queue, the model load and however much of a render ComfyUI got through first. A workflow being invalid is a normal answer rather than an error: `valid: false` comes back with the node, the field and, for a bad dropdown, the values that would have worked. Warnings are advisory and a clean workflow routinely has several, so they are capped while `warning_count` stays honest. **`valid: true` is structural, not semantic** — every node exists, every required input is present, every value is in range, every edge is wired. Not that the result will look like what you asked for.
+
+`describe_workflow` and `validate_workflow` are read-only only when auto-launch is off — with it on, either may start ComfyUI if it has no cached `/object_info`, and `readOnlyHint` has to say so. `comfy_status` never launches under any setting; it's the tool you call to ask whether anything is running.
 
 ## Design notes
 
