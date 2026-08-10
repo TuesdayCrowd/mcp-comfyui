@@ -879,7 +879,25 @@ function decoyWorkflowBody(): string {
 test("describe_workflow excludes a decoy address from schema.properties and lists it under inert", async () => {
   writeWorkflow("flow", decoyWorkflowBody());
   seedObjectInfoCache();
-  serveSlots(); // the real 13-slot default_image_gen listing, which includes 3.seed
+  // A listing that matches the graph above, rather than the unrelated 13-slot
+  // sample. `describe_workflow` now resolves a decoy's candidate against the
+  // listing — the vocabulary `set-slot` actually accepts — so a fixture whose
+  // listing and graph describe different files would test a mismatch that
+  // cannot occur in production, where both come from the same workflow.
+  const listing = join(workdir, "decoy-slots.json");
+  writeFileSync(
+    listing,
+    JSON.stringify({
+      workflow: join(workdir, "workflows", "flow.json"),
+      id: "flow",
+      slots: [
+        { address: "3.seed", name: "seed", type: "INT", current_value: 0, instance_id: "3", node_type: "KSampler" },
+        { address: "99.value", name: "value", type: "INT", current_value: 5, instance_id: "99", node_type: "PrimitiveInt" },
+      ],
+    }),
+  );
+  process.env.FAKE_COMFY_MODE = "data_file";
+  process.env.FAKE_COMFY_DATA_FILE = listing;
 
   const body = await ok(await connect(), "describe_workflow", { workflow: "flow" });
 
