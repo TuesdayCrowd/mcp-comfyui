@@ -4,6 +4,20 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7] — 2026-08-09
+
+### Fixed
+
+- **`describe_workflow` now says what to set instead of a decoy.** It named the
+  upstream node supplying the value but could offer a replacement address only 5
+  times in 14 on a real gallery template; it is now 14 of 14. Two causes: the
+  graph-only resolver reads a node's `inputs[]` array, where a widget appears
+  only once it has been *converted* to an input — so an ordinary widget was
+  invisible to it — and the rest needed a second hop through a switch bank fed by
+  one boolean. Resolution now runs against the CLI's own slot listing, which is
+  the vocabulary `set-slot` accepts, scoped so that two subgraphs each holding a
+  node `162` stay distinct.
+
 ## [0.6.6] — 2026-08-09
 
 ### Fixed
