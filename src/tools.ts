@@ -1,5 +1,5 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { existsSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { basename, isAbsolute, join, sep } from "node:path";
 import { z } from "zod";
@@ -1334,9 +1334,9 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "special afterwards. The file belongs to this server, not to ComfyUI, so it will NOT " +
         "appear in the ComfyUI editor; list_workflows shows it tagged `origin: \"template\"`. " +
         "Pass `as` to choose the filename when you want something more memorable than the " +
-        "template's own name, or when a workflow of that name already exists — an existing file " +
-        "is never overwritten (that check is per call, not a lock, so two concurrent calls for " +
-        "the same name can still race). This takes no `host`: the gallery is not part of any ComfyUI and " +
+        "template's own name. An existing file is not replaced unless you pass `overwrite: true` " +
+        "— use that to re-fetch a template the gallery has updated, and `as` when you want to " +
+        "keep both. This takes no `host`: the gallery is not part of any ComfyUI and " +
         "nothing is started or contacted on your machine. It does need network access, because " +
         "the workflow itself is downloaded even though the gallery index is cached. Whether the " +
         "template's models are installed is a separate question, and describe_workflow answers " +
@@ -1373,6 +1373,15 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
             "Filename to save under, without the .json extension and with no directory part. " +
               "Defaults to the template's own name.",
           ),
+        overwrite: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Replace the file if one of that name already exists. False by default: a workflow " +
+              "you fetched earlier may have been parameterised since, and losing that silently is " +
+              "worse than a refusal you can answer. Turn it on to re-fetch a template the gallery " +
+              "has updated.",
+          ),
       },
       annotations: {
         readOnlyHint: false,
@@ -1381,29 +1390,52 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         openWorldHint: true,
       },
     },
-    async ({ template, as }) =>
+    async ({ template, as, overwrite }) =>
       toolAnswer(async () => {
         const stem = as ?? template;
         assertPlainStem(stem);
         const directory = createdWorkflowDir(config.env);
         const path = join(directory, `${stem}.json`);
-        // Checked before the directory is created, so a refused call leaves
-        // nothing behind on a machine that has never fetched anything. That
-        // invariant depends on `template`'s own refusal (a name that would be
-        // read as a flag) happening even earlier, at the schema layer above —
-        // verified by a test asserting no directory exists afterwards, since
-        // this handler is never entered for that case at all.
-        if (existsSync(path)) {
-          throw new ToolArgumentError(
-            `a workflow already exists at ${path}. Pass \`as\` to save under a different name — ` +
-              "this tool never overwrites, because that file may already have been parameterised.",
-          );
-        }
-        // Created only now: a server that never creates a workflow leaves no
-        // directory behind. `comfy templates fetch -o` also creates parents,
-        // but relying on that would make the refusal above depend on the CLI.
+        // Created before the guard below, because the guard IS a file write.
+        // A server that never creates a workflow still leaves no directory
+        // behind: `template`'s own refusal (a name that would be read as a
+        // flag) happens earlier, at the schema layer, so this handler is never
+        // entered for that case at all.
         await mkdir(directory, { recursive: true });
-        const fetched = await fetchTemplate(template, path);
+
+        // `wx` — create-exclusive, which fails atomically if the path is taken.
+        // This replaces an `existsSync` check that was a real if narrow TOCTOU:
+        // two concurrent calls for the same name could both see nothing and
+        // both write, and the second would silently win. The kernel decides
+        // here instead, so exactly one of them can proceed.
+        //
+        // An empty placeholder is safe to leave for the CLI: measured, `comfy
+        // templates fetch -o` overwrites an existing file, including a
+        // zero-byte one.
+        let placed = false;
+        if (!overwrite) {
+          try {
+            writeFileSync(path, "", { flag: "wx" });
+            placed = true;
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+            throw new ToolArgumentError(
+              `a workflow already exists at ${path}. Pass \`overwrite: true\` to replace it, or ` +
+                "`as` to save under a different name. It is not replaced by default because that " +
+                "file may already have been parameterised.",
+            );
+          }
+        }
+
+        let fetched;
+        try {
+          fetched = await fetchTemplate(template, path);
+        } catch (err) {
+          // Do not leave the placeholder behind as an empty, unreadable
+          // "workflow" that `list_workflows` would then report as `invalid`.
+          if (placed) rmSync(path, { force: true });
+          throw err;
+        }
         return {
           name: fetched.name,
           title: fetched.title,

@@ -929,3 +929,73 @@ test("run_workflow with no inputs never fetches object_info, even for a non-loca
     rmSync(roots, { recursive: true, force: true });
   }
 });
+
+test("overwrite: true replaces an existing workflow", async () => {
+  useFetchMode();
+  const created = join(workdir, "created-ow");
+  mkdirSync(created, { recursive: true });
+  const target = join(created, "fixture_template.json");
+  writeFileSync(target, "ORIGINAL");
+
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template", overwrite: true },
+  })) as CallToolResult;
+
+  const body = JSON.parse(textOf(result));
+  expect(body.path).toBe(target);
+  expect(readFileSync(target, "utf8")).not.toBe("ORIGINAL");
+});
+
+test("the refusal names overwrite as the way through, and leaves the file alone", async () => {
+  useFetchMode();
+  const created = join(workdir, "created-ow2");
+  mkdirSync(created, { recursive: true });
+  const target = join(created, "fixture_template.json");
+  writeFileSync(target, "ORIGINAL");
+
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "fixture_template" },
+  })) as CallToolResult;
+
+  const body = JSON.parse(textOf(result));
+  expect(body.error.kind).toBe("invalid_input");
+  expect(body.error.message).toContain("overwrite: true");
+  expect(readFileSync(target, "utf8")).toBe("ORIGINAL");
+});
+
+test("a failed fetch leaves no empty placeholder behind", async () => {
+  // The exclusive-create guard writes a zero-byte file before the CLI runs. If
+  // the fetch then fails, that file must go: `list_workflows` classifies by
+  // CONTENT, so an empty one would be reported as a workflow that is `invalid`
+  // — a phantom the caller never asked to create and cannot explain.
+  process.env.FAKE_COMFY_MODE = "fail_code";
+  process.env.FAKE_COMFY_ERROR_CODE = "template_not_found";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "no such template";
+  const created = join(workdir, "created-ow3");
+
+  const client = await connect(configWithEnv({ MCP_COMFYUI_CREATED_DIR: created }));
+  const result = (await client.callTool({
+    name: "create_workflow_from_template",
+    arguments: { template: "nope" },
+  })) as CallToolResult;
+
+  expect(result.isError).toBe(true);
+  expect(existsSync(join(created, "nope.json"))).toBe(false);
+});
+
+// NO TEST for the concurrent case, deliberately. The guard is `writeFileSync`
+// with the `wx` flag — create-exclusive, so the kernel decides which of two
+// callers wins rather than a check that another call can slip past. It replaced
+// an `existsSync` check separated from the write by an `await`, which was a real
+// window.
+//
+// It is not tested here because it cannot be: this suite drives the server over
+// InMemoryTransport, which serialises tool calls, so two "concurrent" calls run
+// strictly one after the other and a check-then-write passes just as cleanly.
+// Verified — a faithful revert to the pre-fix shape kills no test in this file.
+// A test asserting atomicity here would pass for a reason unrelated to what it
+// claims, which is worse than no test at all.
