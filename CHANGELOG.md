@@ -4,6 +4,27 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.8] — 2026-08-09
+
+### Added
+
+- **`validate_workflow`** — would ComfyUI accept this graph, without submitting it?
+  Answers in well under a second against the cached node definitions, so it
+  normally works with ComfyUI stopped, and catches what would otherwise fail
+  after the queue, the model load and part of a render. A workflow being invalid
+  is a normal answer, not an error: `valid: false` arrives with the node, the
+  field and, for a bad dropdown, the values that would have worked. `valid: true`
+  is a **structural** guarantee — nodes exist, required inputs present, values in
+  range, edges wired — not a semantic one.
+
+### Notes
+
+- `comfy validate` breaks the envelope contract every other command follows: an
+  invalid workflow answers `ok:false` with `error:null` and a fully populated
+  `data`, which this project's envelope decoder treats as a contract violation
+  and throws on. Measured, and recorded as ground truth #27; `src/comfy/validate.ts`
+  decodes the envelope itself for exactly this reason.
+
 ## [0.6.7] — 2026-08-09
 
 ### Fixed
