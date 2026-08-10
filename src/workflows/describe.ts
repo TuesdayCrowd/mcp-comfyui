@@ -499,11 +499,94 @@ function describeSlot(
  * would still invite a caller to set a value nothing reads. Omitted or empty
  * behaves exactly as this function did before decoy detection existed.
  */
+/**
+ * How far {@link resolveCandidates} will chase a decoy chain.
+ *
+ * `discover.ts` stops at one hop deliberately, and for the data it has that is
+ * the only honest answer — it can only see a widget that the graph has
+ * *converted to an input*, so a clean widget one hop away is often invisible to
+ * it and a second hop would compound a guess. Here the CLI's own listing names
+ * every settable address, so a hop lands on evidence rather than on inference.
+ *
+ * Four rather than unbounded: measured chains in real workflows are one or two
+ * hops (a switch bank fed by one boolean is the deepest seen), and a bound is
+ * what keeps a malformed or hostile listing from walking forever. The `seen`
+ * set already stops a cycle; this stops a long chain that is not a cycle.
+ */
+const MAX_CANDIDATE_HOPS = 4;
+
+/**
+ * The address(es) a caller should set instead of a decoy, found in the CLI's own
+ * slot listing rather than in the graph.
+ *
+ * Breadth-first from the decoy's upstream node, taking the first hop that yields
+ * any address the listing offers and this description has not itself called
+ * inert. Returning every clean address on that node rather than picking one is
+ * deliberate: `PrimitiveInt` has a single `value` and the choice is obvious, but
+ * a multi-widget upstream genuinely offers several and this module has no basis
+ * for preferring one — naming them all is honest where guessing would not be.
+ *
+ * **Scope is part of a node's identity.** A slot's `instance_id` carries the
+ * whole path (`129/162`), while a decoy's upstream is a bare local id (`162`),
+ * so the id is resolved against the decoy's own scope. Two subgraphs each
+ * holding a node `162` are two different nodes, and offering the wrong one would
+ * be worse than offering none — it would look right.
+ *
+ * Returns an empty array rather than inventing anything when the chain runs out,
+ * exceeds {@link MAX_CANDIDATE_HOPS}, or leaves the listing entirely.
+ */
+function resolveCandidates(
+  decoy: Slot,
+  upstream: InertUpstream,
+  byInstance: ReadonlyMap<string, Slot[]>,
+  inertInputs: ReadonlyMap<string, InertInput>,
+): string[] {
+  // Everything up to and including the last `/`, or "" for a top-level node.
+  const scope = decoy.instance_id.slice(0, decoy.instance_id.lastIndexOf("/") + 1);
+  const visited = new Set<string>();
+  let frontier = [upstream.node_id];
+
+  for (let hop = 0; hop < MAX_CANDIDATE_HOPS && frontier.length > 0; hop++) {
+    const clean: string[] = [];
+    const next: string[] = [];
+
+    for (const nodeId of frontier) {
+      const instance = `${scope}${nodeId}`;
+      if (visited.has(instance)) continue;
+      visited.add(instance);
+
+      for (const candidate of byInstance.get(instance) ?? []) {
+        const decoyed = inertInputs.get(candidate.address);
+        if (decoyed === undefined) {
+          clean.push(candidate.address);
+          continue;
+        }
+        // Another decoy: its own upstream is the next place to look.
+        if (decoyed.upstream !== null) next.push(decoyed.upstream.node_id);
+      }
+    }
+
+    if (clean.length > 0) return clean;
+    frontier = next;
+  }
+
+  return [];
+}
+
 export function describeSlots(
   slots: Slot[],
   objectInfo: ObjectInfo,
   inertInputs: ReadonlyMap<string, InertInput> = new Map(),
 ): WorkflowDescription {
+  // Built once, not per decoy: a 210-slot listing with a dozen decoys would
+  // otherwise rescan the whole array a dozen times.
+  const byInstance = new Map<string, Slot[]>();
+  for (const slot of slots) {
+    const group = byInstance.get(slot.instance_id);
+    if (group === undefined) byInstance.set(slot.instance_id, [slot]);
+    else group.push(slot);
+  }
+
   // A Map, then `Object.fromEntries`: assigning `properties[slot.address]` sets
   // the prototype rather than an own property when the address is `__proto__`,
   // which would leave `Object.keys` empty and the serialised `properties` `{}`
@@ -531,7 +614,16 @@ export function describeSlots(
         address: slot.address,
         name: slot.name,
         node_type: slot.node_type,
-        upstream: decoy.upstream,
+        // `discover.ts`'s own candidates are replaced rather than merged. Its
+        // list is a strict subset of what the listing can prove — it sees only
+        // widgets the graph converted to inputs — and carrying both would mean
+        // publishing two answers to one question with no rule for which wins.
+        // Its version remains the right answer for `run_workflow`, which
+        // refuses a decoy without ever holding a listing.
+        upstream: decoy.upstream === null ? null : {
+          ...decoy.upstream,
+          candidate_addresses: resolveCandidates(slot, decoy.upstream, byInstance, inertInputs),
+        },
       });
       continue;
     }

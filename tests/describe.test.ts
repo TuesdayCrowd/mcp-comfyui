@@ -644,6 +644,16 @@ test("a decoy address is excluded from schema.properties", () => {
 });
 
 test("a decoy address is listed in `inert` instead, with its name and node type", () => {
+  // The graph's own candidate is deliberately NOT passed through. This mock
+  // claims node 7 offers `7.value`; in this real listing node 7 is a
+  // `CLIPTextEncode` whose settable address is `7.text`, and that is what comes
+  // back. The listing is the authority, because it is the vocabulary `set-slot`
+  // actually accepts — an address this description cannot vouch for is worse
+  // than none, since a caller would set it and watch the value vanish, which is
+  // the whole failure `inert` exists to prevent.
+  //
+  // `node_id` and `node_type` still come from the graph untouched: they say
+  // which node supplies the value, which the listing does not know.
   const inert = new Map([
     decoy("3.seed", { node_id: "7", node_type: "PrimitiveInt", candidate_addresses: ["7.value"] }),
   ]);
@@ -655,7 +665,7 @@ test("a decoy address is listed in `inert` instead, with its name and node type"
       address: "3.seed",
       name: "seed",
       node_type: "KSampler",
-      upstream: { node_id: "7", node_type: "PrimitiveInt", candidate_addresses: ["7.value"] },
+      upstream: { node_id: "7", node_type: "PrimitiveInt", candidate_addresses: ["7.text"] },
     },
   ]);
 });
@@ -854,3 +864,129 @@ function assertValidJsonSchema(described: WorkflowDescription): void {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Candidate resolution: what to set INSTEAD of a decoy
+// ---------------------------------------------------------------------------
+//
+// `discover.ts` names a decoy's upstream node but resolves an address for it
+// only when that node's own widget appears in the graph's `inputs[]` array —
+// which happens only once a widget has been *converted to an input*. An
+// ordinary widget lives in `widgets_values` and the node-type schema, so the
+// graph-only resolver is blind to exactly the clean addresses it should
+// recommend. Measured on `video_wan2_2_14B_i2v`: 9 of 14 decoys came back with
+// no candidate, two because of that blindness and seven because the answer was
+// one hop further than a single hop.
+//
+// `describeSlots` has what the graph does not: the CLI's own slot listing,
+// which names every settable address in its own vocabulary. These pin the
+// resolution done there.
+
+/** A slot as `comfy workflow slots` reports one. */
+function slotAt(address: string, nodeType: string, name = address.split(".")[1]!): Slot {
+  return {
+    address,
+    name,
+    type: "INT",
+    current_value: 0,
+    instance_id: address.slice(0, address.lastIndexOf(".")),
+    node_type: nodeType,
+  };
+}
+
+test("a candidate is found on the upstream node even when the graph could not name one", () => {
+  // Cause A: `129/94.fps` is fed by PrimitiveFloat 162, whose `value` widget is
+  // not in the graph's `inputs[]` at all — so `inertInputsOf` reported the node
+  // and an empty candidate list. The listing knows `129/162.value` exists.
+  const slots = [slotAt("129/94.fps", "CreateVideo"), slotAt("129/162.value", "PrimitiveFloat")];
+  const inert = new Map([
+    decoy("129/94.fps", { node_id: "162", node_type: "PrimitiveFloat", candidate_addresses: [] }),
+  ]);
+
+  const described = describeSlots(slots, objectInfo, inert);
+
+  expect(described.inert[0]?.upstream?.candidate_addresses).toEqual(["129/162.value"]);
+});
+
+test("a candidate one hop further is found when the upstream's own widget is itself a decoy", () => {
+  // Cause B: `129/86.steps` <- ComfySwitchNode 119, whose `switch` widget is
+  // itself link-fed from PrimitiveBoolean 131. One hop lands on another decoy;
+  // the answer is `129/131.value`.
+  const slots = [
+    slotAt("129/86.steps", "KSamplerAdvanced"),
+    slotAt("129/119.switch", "ComfySwitchNode"),
+    slotAt("129/131.value", "PrimitiveBoolean"),
+  ];
+  const inert = new Map([
+    decoy("129/86.steps", { node_id: "119", node_type: "ComfySwitchNode", candidate_addresses: [] }),
+    decoy("129/119.switch", { node_id: "131", node_type: "PrimitiveBoolean", candidate_addresses: [] }),
+  ]);
+
+  const described = describeSlots(slots, objectInfo, inert);
+
+  const steps = described.inert.find((entry) => entry.address === "129/86.steps");
+  expect(steps?.upstream?.candidate_addresses).toEqual(["129/131.value"]);
+});
+
+test("a node id repeated in another subgraph is never offered across scopes", () => {
+  // `instance_id` carries the whole path, so `129/162` and `200/162` are two
+  // different nodes that happen to share a local id. Matching on the bare id
+  // would offer the wrong subgraph's address — which would be worse than
+  // offering none, because it looks right.
+  const slots = [slotAt("129/94.fps", "CreateVideo"), slotAt("200/162.value", "PrimitiveFloat")];
+  const inert = new Map([
+    decoy("129/94.fps", { node_id: "162", node_type: "PrimitiveFloat", candidate_addresses: [] }),
+  ]);
+
+  const described = describeSlots(slots, objectInfo, inert);
+
+  expect(described.inert[0]?.upstream?.candidate_addresses).toEqual([]);
+});
+
+test("a decoy chain that loops back on itself terminates instead of hanging", () => {
+  // Constructed, not observed: a graph cannot really cycle, but this function
+  // walks caller-supplied data and must not depend on that.
+  const slots = [slotAt("1.a", "N"), slotAt("2.b", "N"), slotAt("3.c", "N")];
+  const inert = new Map([
+    decoy("1.a", { node_id: "2", node_type: "N", candidate_addresses: [] }),
+    decoy("2.b", { node_id: "3", node_type: "N", candidate_addresses: [] }),
+    decoy("3.c", { node_id: "2", node_type: "N", candidate_addresses: [] }),
+  ]);
+
+  const described = describeSlots(slots, objectInfo, inert);
+
+  expect(described.inert.find((e) => e.address === "1.a")?.upstream?.candidate_addresses).toEqual([]);
+});
+
+test("an upstream node absent from the listing yields no candidate rather than a guess", () => {
+  const slots = [slotAt("129/94.fps", "CreateVideo")];
+  const inert = new Map([
+    decoy("129/94.fps", { node_id: "162", node_type: "PrimitiveFloat", candidate_addresses: [] }),
+  ]);
+
+  const described = describeSlots(slots, objectInfo, inert);
+
+  expect(described.inert[0]?.upstream?.candidate_addresses).toEqual([]);
+});
+
+test("a node reached by two paths at once contributes its address once, not twice", () => {
+  // The `visited` set is not about termination — MAX_CANDIDATE_HOPS already
+  // bounds that, and the cycle test above passes with or without it. It is
+  // about a frontier that holds the same node twice: node 5 here is reached
+  // through both 2 and 3 in a single hop, and scanning it twice would report
+  // `5.value` twice. A duplicated candidate is a small wrongness that reads as
+  // two options where there is one.
+  // `1.a` -> node 2. Node 2 has TWO decoy widgets, `2.b` and `2.d`, and both are
+  // fed from node 5 — so one hop puts 5 in the frontier twice.
+  const slots = [slotAt("1.a", "N"), slotAt("2.b", "N"), slotAt("2.d", "N"), slotAt("5.value", "PrimitiveInt")];
+  const inert = new Map([
+    decoy("1.a", { node_id: "2", node_type: "N", candidate_addresses: [] }),
+    decoy("2.b", { node_id: "5", node_type: "PrimitiveInt", candidate_addresses: [] }),
+    decoy("2.d", { node_id: "5", node_type: "PrimitiveInt", candidate_addresses: [] }),
+  ]);
+
+  const described = describeSlots(slots, objectInfo, inert);
+
+  const first = described.inert.find((entry) => entry.address === "1.a");
+  expect(first?.upstream?.candidate_addresses).toEqual(["5.value"]);
+});
