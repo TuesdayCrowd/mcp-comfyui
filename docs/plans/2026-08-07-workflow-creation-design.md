@@ -574,6 +574,20 @@ Accepted rather than solved. Each is disclosed in a tool description.
   103 "Use Cases" rows typed `image` when they are video; not independently
   re-measured. The filter is still worth having, and re-ranking client-side
   would mean this server maintaining an opinion about upstream's gallery schema.
+
+  > **SUPERSEDED — left in place rather than edited, because the correction is
+  > the point.** Re-measured 2026-08-11 and again 2026-08-12: the count is **47
+  > of 103**, not 28, and the mechanism is stronger than "inherited". Grouping
+  > all 578 gallery rows by category gives `output_type` cardinality *exactly 1*
+  > in every category, so the field **is** `category_title` restated, and five of
+  > the eight categories collapse to `image`. The 28 could be neither reproduced
+  > nor refuted — this document does not record the method behind it — so 47 is a
+  > fresh measurement rather than a replay; every rule tried lands above 28,
+  > including the most conservative. "Sometimes wrong" also understates it: a tag
+  > query recovers 43 of the 47 (91.5%), and `--type video` recovers **none**.
+  > A second-hand number survived four days of being cited because it lived only
+  > in a plan document; it now lives in `docs/comfy-cli-ground-truth.md` as
+  > entries #28 and #29, which is the file this project trusts.
 - **`fetch` has no offline fallback.** An air-gapped machine gets a failure here
   even when its own ComfyUI is reachable.
 - **The created directory is never garbage-collected.** Files accumulate.

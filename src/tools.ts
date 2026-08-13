@@ -1293,9 +1293,15 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "templates the filters really selected, so `truncated: true` means narrow the filters or " +
         "raise `limit`. This reads a gallery index, not a ComfyUI: it takes no `host`, never " +
         "starts anything, and says nothing about whether a template's models are installed — " +
-        "describe_workflow answers that, per host, after you create the workflow. Note that a " +
-        "template's `output_type` is inherited from its gallery category rather than derived " +
-        "from the workflow, so it is occasionally wrong; `tags` are the more reliable signal.",
+        "describe_workflow answers that, per host, after you create the workflow. A template's " +
+        "`output_type` is its gallery category restated — every category maps to exactly one " +
+        "value, and five of the eight map to `image`, so `type` is only meaningful for " +
+        "`video`, `audio` and `3d`. Measured 2026-08-12: 47 of the 103 `Use Cases` templates " +
+        "produce video while typed `image`, and `type: \"video\"` matches none of them. Filter " +
+        "by `tag` instead — it is exact and case-insensitive with no substring matching, so " +
+        "use a whole tag: \"Image to Video\", \"Text to Video\", \"Video Edit\", \"Reference to " +
+        "Video\", \"Audio to Video\", \"Video to Video\", \"Video\", or \"FLF2V\" (first-last-frame " +
+        "to video, which the word \"video\" will not find).",
       inputSchema: {
         type: filterArgument("Output kind, e.g. \"video\". An open string — new kinds appear upstream."),
         category: filterArgument("Exact category title, e.g. \"Video\"."),

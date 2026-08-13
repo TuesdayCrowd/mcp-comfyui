@@ -616,6 +616,18 @@ test("describe_workflow's description names the address form its keys take", asy
   expect(description).toContain("3.seed");
 });
 
+test("search_templates' description names the video tag a caller cannot guess", async () => {
+  // Ground truth #28/#29: `type: "video"` matches none of the 47 `Use Cases`
+  // templates that produce video, and `--tag` has no substring matching — so a
+  // caller who does not already know the literal string "FLF2V" cannot reach
+  // those 11 templates by any query they would think to write. This assertion
+  // dies if the description is trimmed back to a generic caveat, which is the
+  // regression that matters. The 47 is deliberately NOT pinned: the gallery
+  // grows, and a test that fails when upstream adds a template gets deleted.
+  const description = toolNamed(await tools(await connect()), "search_templates").description ?? "";
+  expect(description).toContain("FLF2V");
+});
+
 // --- input schemas -------------------------------------------------------
 
 test("run_workflow accepts a slot value as a string, a number or a boolean", async () => {
