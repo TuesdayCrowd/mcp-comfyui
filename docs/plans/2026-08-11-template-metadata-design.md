@@ -1,6 +1,11 @@
 # Template metadata, and the three blocks upstream
 
-**Status:** designed, not implemented. Stages below are all `Not Started`.
+**Status:** implemented 2026-08-12. All three stages below are `Complete`; their
+`Not Started` markers are left as written, since this document is a record of
+what was decided rather than a live checklist. Every number was re-measured on
+implementation rather than transcribed, per Stage 2's own instruction — the
+results reproduced this document exactly, and the measurements now live in
+`docs/comfy-cli-ground-truth.md` as entries #28–#31.
 **Date:** 2026-08-11
 
 The 2026-08-07 workflow-creation design shipped in 0.6.5 and left four things

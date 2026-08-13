@@ -4,6 +4,46 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`search_templates` said "occasionally wrong" about a field that is wrong for
+  46% of a category.** A template's `output_type` is not merely *inherited from*
+  its gallery category — measured against the live gallery, it **is** the
+  category restated: grouping all 578 rows by `category_title` gives
+  `output_type` cardinality exactly 1 in every category, with no
+  counterexamples, and five of the eight categories collapse to `image`. So
+  `type` is only meaningful for `video`, `audio` and `3d`. **47 of the 103 `Use
+  Cases` templates produce video while typed `image`**, and `type: "video"`
+  matches none of them — not degraded, structurally incapable. The old wording
+  sent a caller to a filter that returns zero of what they asked for. The
+  description now says the measured thing and names the video tag vocabulary,
+  because `tag` is exact and case-insensitive with **no substring matching**
+  (`--tag "Vid"` matches nothing) and one of the eight tags is `FLF2V` —
+  first-last-frame-to-video, which carries no substring a caller would guess and
+  which 11 `Use Cases` templates are unreachable without. Tags are the better
+  signal but not a perfect one: they recover 43 of the 47 (91.5%), and they are
+  wrong in both directions.
+
+### Notes
+
+- **The gallery measurements are in the ground-truth register now, as entries
+  #28–#31.** Every template fact this project holds lived only in a plan
+  document until now, which is how a second-hand "28 of 103" — a figure whose
+  method was never recorded, and which is really 47 — survived four days of
+  being cited. All four entries were re-run on implementation rather than
+  transcribed, and the two that were pure source claims (`comfy nodes path` does
+  not anchor on its source type; the four saved-workflow verbs take no
+  `--host`/`--port`) are now recorded with line numbers for **both** the
+  installed build and the checkout, which differ by 20–40 lines and would
+  otherwise read as a rotten citation after an upgrade. Ground truth #27 gains
+  the same treatment: its diagnostic vocabulary is 13 codes on the installed
+  comfy-cli and 14 upstream, the addition being `no_options_available`, and all
+  14 remain absent from `error_codes.py`.
+- No behaviour changed. One tool description, one register, and a superseded
+  bullet annotated rather than edited in the 2026-08-07 design document.
+
 ## [0.6.9] — 2026-08-09
 
 ### Added
