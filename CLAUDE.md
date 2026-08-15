@@ -92,9 +92,18 @@ These are not style preferences. Each was measured, and each has a test pinning 
 
 **2. Every registry from the CLI is an open string** — `error.code`, slot `type`, job `status`, run `event.type`. Upstream documents error codes as append-only, and its published schemas are already behind its own source. Closing an enum breaks the server on the next CLI release. Tests assert the published enums are incomplete, so the argument stays checkable.
 
-`comfy validate`'s 13 diagnostic codes (`unknown_enum_value`, `required_input_missing`,
+`comfy validate`'s diagnostic codes (`unknown_enum_value`, `required_input_missing`,
 `dangling_edge`, …) appear in NONE of comfy-cli's published `error_codes.py` registry — a
-second, wholly undocumented open-string vocabulary. Measured 2026-08-07.
+second, wholly undocumented open-string vocabulary. Measured 2026-08-07, re-counted
+2026-08-12: **13 on the installed build and 14 upstream**, the addition being
+`no_options_available`. The prediction this rule exists to guard against has already come
+true once, and cost nothing because the enum was never closed. Ground truth #27.
+
+The template gallery is a third such registry, and the coarsest: `output_type` is
+`category_title` restated, not a property of the workflow, so 47 of the 103 `Use Cases`
+templates are typed `image` while producing video and `--type video` matches none of them.
+Ground truth #28–#29; do not try to "fix" the field by deriving it — see the reasoning in
+`templates.ts`.
 
 **3. Branch on the envelope, never on the exit code.** Exit 1 covers missing file, downed server, HTTP error, conversion failure, validation failure, and execution error alike.
 

@@ -3,19 +3,31 @@ import { snippet } from "./envelope.ts";
 import { runComfy, type RunOptions } from "./exec.ts";
 
 /**
- * `comfy templates`, the curated workflow gallery — 574 entries at the time of
- * writing, and the only workflow-creation surface in comfy-cli whose output
+ * `comfy templates`, the curated workflow gallery — 578 entries as of
+ * 2026-08-12, and the only workflow-creation surface in comfy-cli whose output
  * this server can actually use. `templates fetch` writes **frontend format**,
  * which is what `comfy workflow slots` reads, so a fetched template is an
  * ordinary local workflow and needs no new pipeline.
  *
- * Two things shape this module.
+ * Three things shape this module.
  *
  * - **A filter is mandatory, and `--limit` is not optional either.** The
- *   unfiltered listing is 199,382 bytes over 574 rows. An MCP tool result goes
- *   into a context window, so the cap belongs in the argv, not in a `.slice()`
- *   after the bytes have already crossed the pipe. `--limit 5` measures 2,072
- *   bytes for the same query.
+ *   unfiltered listing is 200,675 bytes over 578 rows (199,382 over 574 when
+ *   this was written — the gallery grows, so treat the figure as a magnitude).
+ *   An MCP tool result goes into a context window, so the cap belongs in the
+ *   argv, not in a `.slice()` after the bytes have already crossed the pipe.
+ *   `--limit 5` measures 2,072 bytes for the same query, unchanged across that
+ *   growth because the cap binds before the rows do.
+ * - **`output_type` is `category_title` restated, and this module must not try
+ *   to fix that.** Cardinality is exactly 1 within every category and five of
+ *   the eight collapse to `image`, so 47 of the 103 `Use Cases` templates are
+ *   typed `image` while producing video. Deriving the real answer means reading
+ *   each workflow's output nodes, which is a separate network fetch per
+ *   template — 578 downloads to answer one filtered query — and at fetch time,
+ *   where the graph is already on disk, it would mean `JSON.parse` on a
+ *   workflow graph inside this server, which non-negotiable #1 forbids. The
+ *   field is echoed unchanged and the tool description says what it really is.
+ *   See ground truth #28/#29.
  * - **`--query` is advertised and does not work.** `templates ls --help`
  *   documents a CQL grammar; invoking it returns `cql_query_invalid`, "CQL
  *   grammar queries are not available." It is never passed, and no caller is

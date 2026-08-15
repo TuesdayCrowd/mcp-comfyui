@@ -44,10 +44,16 @@ const MAX_WARNINGS = 5;
  * and `message` were present on every diagnostic seen, so only those are
  * required, and `looseObject` keeps whatever else arrives.
  *
- * `code` is `z.string()` and never an enum. The 13 codes this command emits
- * appear in NONE of comfy-cli's published `error_codes.py` registry — a second,
- * wholly undocumented vocabulary — so closing it would break this server on a
- * release that adds a fourteenth.
+ * `code` is `z.string()` and never an enum. The 13 codes the installed build
+ * emits appear in NONE of comfy-cli's published `error_codes.py` registry — a
+ * second, wholly undocumented vocabulary — so closing it would break this
+ * server on a release that adds a fourteenth.
+ *
+ * **That release exists.** Re-counted 2026-08-12: comfy-cli at
+ * `v1.15.0-1-g220f99a` emits 14, adding `no_options_available` for a COMBO
+ * field whose `object_info` declares an explicitly empty option list. Nothing
+ * here needed changing, which is the point — the open string carried a code
+ * this file had never heard of, exactly as designed. Ground truth #27.
  */
 const DiagnosticSchema = z.looseObject({
   code: z.string(),

@@ -41,8 +41,26 @@ All notable changes to this project are recorded here. The format follows
   the same treatment: its diagnostic vocabulary is 13 codes on the installed
   comfy-cli and 14 upstream, the addition being `no_options_available`, and all
   14 remain absent from `error_codes.py`.
-- No behaviour changed. One tool description, one register, and a superseded
-  bullet annotated rather than edited in the 2026-08-07 design document.
+- **Documentation accuracy sweep**, since the measurements above falsified
+  claims elsewhere. The README now says to filter templates by `tag` rather than
+  `type` and names the vocabulary, which is where a reader would otherwise hit
+  the same trap the tool description used to set. `comfy/templates.ts` said the
+  gallery held 574 entries in 199,382 bytes; it is 578 in 200,675, and the
+  module now records *why* the coarse `output_type` is echoed rather than
+  derived, so the next reader does not rediscover the two reasons and try to fix
+  it. (`--limit 5` is still exactly 2,072 bytes — re-measured, unchanged across
+  that growth, because the cap binds before the rows do.) Dated verification
+  records that cite 574 were left alone: they say what was true when they were
+  written, which is the whole point of a dated record.
+- **`comfy validate`'s open-string enum earned its keep.** `validate.ts` warned
+  that closing the code enum "would break this server on a release that adds a
+  fourteenth". That release exists — comfy-cli `v1.15.0-1-g220f99a` emits 14,
+  adding `no_options_available` — and this server needed no change to absorb it,
+  because the enum was never closed. The comment and CLAUDE.md now record it as
+  a measured fact rather than a hypothetical.
+- No behaviour changed. One tool description, one register, a documentation
+  sweep, and a superseded bullet annotated rather than edited in the 2026-08-07
+  design document.
 
 ## [0.6.9] — 2026-08-09
 
