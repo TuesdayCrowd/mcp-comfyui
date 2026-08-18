@@ -4,6 +4,90 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`describe_workflow` returns the workflow's own canvas notes.** `validate_workflow`
+  can already tell you that seven of a workflow's inputs name a model this host
+  does not have; it cannot tell you where to get them. The workflow's author
+  usually can — measured on the gallery template `video_wan2_2_14B_i2v`, its
+  "Model Links" note carries a HuggingFace URL for **exactly the seven files
+  validate reported missing**, and its "VRAM Usage" note carries the other thing
+  a caller cannot otherwise learn (≈536s on a 4090, or ≈97s with the 4-step
+  LoRA). `notes` is a flat sibling of `schema`/`unresolved`/`inert`, so no
+  existing consumer can break. The text is carried verbatim and **nothing is
+  extracted from it**: one real note embeds GitHub issue links alongside its
+  model links, so "first URL wins" would sometimes hand back a bug tracker.
+  Costs close to nothing — `comfy workflow notes` measures 0.32-0.34s and is
+  issued concurrently with the `slots` and decoy reads, overlapping almost
+  entirely — and its failure is explicitly non-fatal: the description still
+  arrives, with `notes_unreadable` saying why. Capped like `run_workflow`'s
+  events, with `notes_truncated` disclosing the cut and `count` staying true.
+- **Node definitions that have aged out are served anyway, rather than failing.**
+  The order is now fresh cache → live fetch → launch and refetch → **stale
+  cache**. Previously that last arrow was a throw, which left `describe_workflow`
+  and `validate_workflow` unable to answer in precisely their own motivating
+  scenario — ComfyUI stopped, a complete 1.4MB per-host copy sitting on the disk,
+  13 days old against a 24-hour TTL. Auto-launch keeps its exact previous
+  meaning and freshness still wins whenever a GPU is available. The staleness is
+  disclosed rather than hidden: both tools report `object_info: {stale: true,
+  age_hours, path}` when they answered from the floor, and no `object_info` key
+  means the definitions were current. Both descriptions say what that implies —
+  `/object_info` changes when something is **installed**, so a stale read can
+  under-report a model that is really present, and re-running once ComfyUI is
+  reachable is what confirms it.
+
+### Fixed
+
+- **The stale-cache floor had a hole under its own motivating case.** The
+  fallback was reached only when the launch path *returned*; when it **threw** —
+  the CLI's own verdict (`not_in_workspace`, `port_in_use`), a host entry with
+  `autoLaunch: false`, or a launch that starts nothing and spends the full
+  five-minute readiness budget — the floor was skipped entirely and the call
+  hard-failed with a complete usable answer on the disk. Auto-launch is on by
+  default, so this was the default path rather than a corner, and it made the
+  new description sentence false where it mattered most. Every route out of the
+  launch arrow now reaches the floor. On a stale **miss** after a failed launch
+  the **launch** error is what the caller is told, not the pre-launch fetch
+  error: it is the same rule the `already_running` branch already applies — keep
+  the diagnosis reflecting the most recently established fact about the machine —
+  and unlike "fetch failed" it names a fix.
+- **A note with no `subgraph` key would have made every workflow's notes
+  unreadable.** `z.unknown()` is permissive about a field's *value* and strict
+  about its *presence*, which is exactly backwards for a field whose populated
+  shape has never been observed: probed directly, a note payload with the key
+  absent failed with "expected nonoptional, received undefined". Now
+  `.optional()`, with a hand-built test pinning it — the same open-registry
+  reasoning that keeps a note's `type` an open string, applied to a key rather
+  than a value.
+- **A hung `comfy workflow notes` could hold a finished description for two
+  minutes.** It inherited `runComfy`'s 120-second default while being joined to
+  the load-bearing `slots` read, which inverts the design's own principle that a
+  notes failure is not fatal. It now runs on a 15-second budget — roughly forty
+  times the measured 0.32-0.34s — so a hang degrades to `notes_unreadable`
+  instead of stalling the tool.
+
+### Notes
+
+- **The `comfy workflow notes` measurements are in the ground-truth register
+  now, as entries #32–#34**, rather than living only in a plan document: that it
+  needs no server, host/port or schema source; that its envelope's `command`
+  collapses from `"workflow notes"` to `"workflow"` on **any** failure (measured
+  for `workflow slots` too, so it is a group behaviour and must never be branched
+  on); its two error codes, one of which cannot distinguish an API-format
+  workflow from JSON that is not a workflow at all; and that global flags still
+  precede the subcommand, with no exception for a brand-new one. Entry #34
+  records why a model-discovery tool was designed and then cut: `comfy models` is
+  100% non-functional without a running server and `models show` is cloud-only.
+- **Three test gaps closed alongside.** `notes_truncated` had zero coverage — the
+  spread emitting it could have been deleted, hardcoded or inverted with the
+  suite still green. The two cap tests asserted "fewer than" rather than the
+  exact boundary and survived a `MAX_NOTES = 5` mutant. And the staged-remote
+  notes test asserted only a title, which the fake CLI serves whatever path it is
+  asked about, so it would have passed against a build handing `listNotes` a
+  nonexistent path; it now pins the argument through the dispatch log.
+
 ## [0.6.10] — 2026-08-15
 
 ### Fixed

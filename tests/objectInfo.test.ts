@@ -19,6 +19,7 @@ import {
   ensureObjectInfoCache,
   getObjectInfo,
   objectInfoCachePath,
+  readStaleCache,
 } from "../src/comfy/objectInfo.ts";
 
 /**
@@ -456,6 +457,40 @@ test("refresh never joins a fetch already in flight", async () => {
   await Promise.all([leader, refreshing]);
 
   expect(requests).toHaveLength(2);
+});
+
+test("readStaleCache serves a file older than any TTL, and reports its age", async () => {
+  // The whole point of the floor: the diagnostic tools are needed exactly when
+  // ComfyUI is down, which is exactly when the cache has had time to age out.
+  const path = objectInfoCachePath({ port: 8188, cacheDir });
+  writeFileSync(path, JSON.stringify({ KSampler: { input: {} } }));
+  age(path, 14 * 24 * 60 * 60 * 1000);
+
+  const hit = await readStaleCache({ port: 8188, cacheDir });
+
+  expect(hit).not.toBeNull();
+  expect(hit!.path).toBe(path);
+  expect(hit!.objectInfo["KSampler"]).toBeDefined();
+  expect(hit!.ageMs).toBeGreaterThan(13 * 24 * 60 * 60 * 1000);
+});
+
+test("readStaleCache never fetches — no cache file means null, not a request", async () => {
+  // The defect this replaces: getObjectInfo is not a cache read. On a miss it
+  // falls through to a live fetch whatever the TTL said, so using it as the
+  // fallback would mean a second 30-second wait before re-throwing.
+  const port = serve();
+
+  const hit = await readStaleCache({ port, cacheDir });
+
+  expect(hit).toBeNull();
+  expect(requests).toHaveLength(0);
+});
+
+test("readStaleCache treats an unreadable cache as a miss, not a throw", async () => {
+  const path = objectInfoCachePath({ port: 8188, cacheDir });
+  writeFileSync(path, "{ truncated mid-wr");
+
+  expect(await readStaleCache({ port: 8188, cacheDir })).toBeNull();
 });
 
 test("a finished fetch does not evict another that is still running", async () => {

@@ -39,6 +39,8 @@
 #   $FAKE_COMFY_VALIDATE_FILE     validate: JSON file served as data
 #   $FAKE_COMFY_VALIDATE_OK        validate: envelope ok flag, "true" or "false" (default true)
 #   $FAKE_COMFY_TEMPLATE_NAME      templates_fetch: name echoed back in data.name
+#   $FAKE_COMFY_NOTES_FILE     notes_file: JSON file served as data; unset means
+#                              a workflow that carries no notes
 
 [ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
 
@@ -287,6 +289,22 @@ case "$FAKE_COMFY_MODE" in
     cat "$FAKE_COMFY_VALIDATE_FILE"
     printf ',"error":null}\n'
     [ "${FAKE_COMFY_VALIDATE_OK:-true}" = "true" ] || exit 1
+    exit 0 ;;
+  notes_file)
+    # `comfy workflow notes`. A separate mode from data_file rather than a
+    # reuse of it, because describe_workflow arms `slots` with data_file in the
+    # same call and one $FAKE_COMFY_DATA_FILE cannot be two payloads.
+    #
+    # Unset means an empty listing rather than an error: a workflow with no
+    # notes is an ordinary state (half of the real ones measured), so this is
+    # the right default for every test that does not care about notes.
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"workflow notes","version":"0.0.0","where":null,"data":'
+    if [ -n "$FAKE_COMFY_NOTES_FILE" ]; then
+      cat "$FAKE_COMFY_NOTES_FILE"
+    else
+      printf '{"workflow":"","notes":[]}'
+    fi
+    printf ',"error":null}\n'
     exit 0 ;;
   *)
     echo "$OK"
