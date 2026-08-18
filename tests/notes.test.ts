@@ -29,6 +29,8 @@ afterEach(() => {
   delete process.env.FAKE_COMFY_DATA_FILE;
   delete process.env.FAKE_COMFY_ERROR_CODE;
   delete process.env.FAKE_COMFY_ERROR_MESSAGE;
+  delete process.env.FAKE_COMFY_NOTES_FILE;
+  delete process.env.FAKE_COMFY_NOTES_MODE;
   rmSync(workdir, { recursive: true, force: true });
 });
 
@@ -146,4 +148,33 @@ test("global flags precede the subcommand, and no schema source is sent", async 
 
   const argv = readFileSync(argvOut, "utf8").trim();
   expect(argv).toBe("--skip-prompt workflow notes /w/flow.json");
+});
+
+test("the dispatcher answers a notes call from its own file, not the slots one", async () => {
+  // describe_workflow makes both calls in one tool call. The dispatcher picks
+  // the mode per subcommand; notes needs its own file variable so it cannot
+  // collide with the $FAKE_COMFY_DATA_FILE that `slots` is armed with.
+  const notesFile = join(workdir, "notes.json");
+  writeFileSync(notesFile, JSON.stringify({ workflow: "/w/f.json", notes: [note({ title: "N" })] }));
+  process.env.COMFY_BIN = join(import.meta.dirname, "fixtures", "fake-comfy-dispatch");
+  process.env.FAKE_COMFY_NOTES_FILE = notesFile;
+  servePayloadFile(CAPTURED); // `slots` would still get the capture, via data_file
+
+  const listing = await listNotes("/w/f.json");
+
+  expect(listing.count).toBe(1);
+  expect(listing.notes[0]?.title).toBe("N");
+});
+
+test("an unarmed notes call is an empty listing, not a fixture error", async () => {
+  // The default has to be a state a real workflow can be in. A workflow with
+  // no notes is ordinary; a `fixture_missing` failure would make every
+  // existing describe_workflow test start reporting notes_unreadable.
+  process.env.COMFY_BIN = join(import.meta.dirname, "fixtures", "fake-comfy-dispatch");
+  delete process.env.FAKE_COMFY_NOTES_FILE;
+
+  const listing = await listNotes("/w/f.json");
+
+  expect(listing.count).toBe(0);
+  expect(listing.notes).toEqual([]);
 });

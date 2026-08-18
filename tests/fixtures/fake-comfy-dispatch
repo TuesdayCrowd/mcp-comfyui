@@ -13,6 +13,7 @@
 #                              see below, this one is opt-in rather than
 #                              defaulted, to keep every test written before
 #                              `run_workflow` could make this call unchanged)
+#   $FAKE_COMFY_NOTES_MODE     mode for a `workflow notes` call (default: notes_file)
 #   $FAKE_COMFY_DISPATCH_LOG   file every invocation's argv is APPENDED to. The
 #                              fixture's own $FAKE_COMFY_ARGV_OUT is overwritten
 #                              per call and so only ever holds the last of the
@@ -37,6 +38,11 @@ for arg in "$@"; do
     # for it; every other test's behaviour is exactly what it was before this
     # case existed.
     slots) [ -n "$FAKE_COMFY_SLOTS_MODE" ] && FAKE_COMFY_MODE="$FAKE_COMFY_SLOTS_MODE"; break ;;
+    # `describe_workflow` makes a `workflow notes` call alongside its `slots`
+    # one. Unlike `slots`, this DOES default: an unarmed notes call must be a
+    # workflow that carries no notes, not a fixture error, so that every test
+    # written before notes existed keeps getting a clean description.
+    notes)    FAKE_COMFY_MODE="${FAKE_COMFY_NOTES_MODE:-notes_file}"; break ;;
   esac
 done
 export FAKE_COMFY_MODE
