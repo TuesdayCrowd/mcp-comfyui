@@ -496,9 +496,42 @@ function completedPayload(over: Record<string, unknown> = {}): Record<string, un
   };
 }
 
-/** The argv the fake recorded. No path in these tests contains a space. */
+/**
+ * The argv the fake recorded. No path in these tests contains a space.
+ *
+ * Only for a tool call that makes ONE CLI call, or several in sequence where
+ * the last is the one being asserted about. `loggedArgv` is the answer for
+ * anything concurrent — see the reasoning there.
+ */
 function argv(): string[] {
   return readFileSync(argvOut, "utf8").trim().split(" ");
+}
+
+/**
+ * The argv of the first logged invocation whose subcommand is `subcommand`.
+ *
+ * `argv()` cannot answer this for a tool call that runs the CLI concurrently.
+ * $FAKE_COMFY_ARGV_OUT is truncate-written (`fake-comfy:45`), and
+ * describe_workflow issues its `slots` and `notes` calls together (the
+ * `Promise.all` in `src/tools.ts`), so the two writers overwrite each other in
+ * place: both open the file, then the shorter `notes` line lands over the
+ * longer `slots` line and leaves its tail behind. The result is two lines, and
+ * `argv()`'s whole-file `split(" ")` yields an argument glued to a newline
+ * (`".../flow.json\n--input"`) whenever the race falls that way — measured
+ * here at roughly 1 run in 3.
+ *
+ * The dispatch log is APPENDED to instead, one line per invocation, so it must
+ * be read line by line and never split as a whole. Matching the subcommand as
+ * a whole argument rather than as a substring keeps this immune to how many
+ * other invocations were logged and in what order.
+ */
+function loggedArgv(log: string, subcommand: string): string[] {
+  const lines = readFileSync(log, "utf8").split("\n").filter((line) => line.length > 0);
+  const line = lines.find((invocation) => invocation.split(" ").includes(subcommand));
+  if (line === undefined) {
+    throw new Error(`no \`${subcommand}\` invocation in the dispatch log: ${JSON.stringify(lines)}`);
+  }
+  return line.split(" ");
 }
 
 /** A client wired to a freshly built server over a linked in-memory pair. */
@@ -899,8 +932,7 @@ test("describe_workflow works with the server down, from the cached node definit
   const body = await ok(await connect(), "describe_workflow", { workflow: "flow" });
 
   expect(body["slot_count"]).toBe(13);
-  const lines = readFileSync(log, "utf8").trim().split("\n");
-  const slots = lines.find((line) => line.includes(" slots ")) as string;
+  const slots = loggedArgv(log, "slots");
   expect(slots).toContain("--input");
   expect(slots).toContain(cachePath);
 });
@@ -909,12 +941,36 @@ test("describe_workflow resolves a workflow by the name list_workflows gave", as
   const path = writeWorkflow("flow");
   seedObjectInfoCache();
   serveSlots();
+  // Not `argv()`: the concurrent `slots` and `notes` calls race to truncate
+  // $FAKE_COMFY_ARGV_OUT, which made this assertion fail about 1 run in 3 with
+  // the resolved path glued to the next line's first argument.
+  const log = join(workdir, "dispatch.log");
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
 
   const body = await ok(await connect(), "describe_workflow", { workflow: "flow" });
 
   expect((body["workflow"] as Record<string, unknown>)["name"]).toBe("flow");
   expect((body["workflow"] as Record<string, unknown>)["path"]).toBe(path);
-  expect(argv()).toContain(path);
+  expect(loggedArgv(log, "slots")).toContain(path);
+});
+
+test("a logged invocation is found whatever order the concurrent calls landed in", () => {
+  // The regression guard for the flake above, made deterministic: the two
+  // orderings are written by hand, because the real ones cannot be forced.
+  // Reading the log as one string instead of line by line fails the second
+  // case, which is the bug this pins.
+  const log = join(workdir, "dispatch.log");
+  const flow = join(roots, "flow.json");
+  const cache = join(cacheDir, "object_info-127.0.0.1-8188.json");
+  const slots = `--skip-prompt workflow slots ${flow} --input ${cache}`;
+  const notes = `--skip-prompt workflow notes ${flow}`;
+
+  for (const order of [[slots, notes], [notes, slots]]) {
+    writeFileSync(log, `${order.join("\n")}\n`);
+    expect(loggedArgv(log, "slots")).toContain(flow);
+    expect(loggedArgv(log, "slots")).toContain(cache);
+    expect(loggedArgv(log, "notes")).toEqual(["--skip-prompt", "workflow", "notes", flow]);
+  }
 });
 
 test("describe_workflow resolves a workflow by absolute path too", async () => {
@@ -2998,11 +3054,10 @@ test("a workflow that exists only on a host runs there, byte-exact", async () =>
   // Flag POSITION, not merely presence: `--json` is a Typer root flag and
   // precedes the subcommand, while `--host` is the subcommand's own and
   // follows it. Both orderings now appear in one argv.
-  const lines = readFileSync(log, "utf8").trim().split("\n");
-  const setSlot = (lines.find((line) => line.includes("set-slot")) as string).split(" ");
+  const setSlot = loggedArgv(log, "set-slot");
   expect(setSlot.indexOf("--json")).toBe(-1); // set-slot is not a --json command
   expect(setSlot.indexOf("set-slot")).toBeLessThan(setSlot.indexOf("--host"));
-  const run = (lines.find((line) => line.includes(" run ")) as string).split(" ");
+  const run = loggedArgv(log, "run");
   expect(run.indexOf("--json")).toBeGreaterThan(run.indexOf("run"));
   expect(run.indexOf("run")).toBeLessThan(run.indexOf("--host"));
   expect(run[run.indexOf("--port") + 1]).toBe(String(port));
@@ -3062,8 +3117,8 @@ test("notes are read from the staged copy of a host's own workflow", async () =>
   const body = await ok(await connect(), "describe_workflow", { workflow: "box/portrait" });
 
   expect((body.notes as Array<Record<string, unknown>>)[0]!.title).toBe("Remote");
-  const notes = (readFileSync(log, "utf8").trim().split("\n").find((line) => line.includes(" notes "))) as string;
-  const file = notes.split(" ").pop() as string;
+  const notes = loggedArgv(log, "notes");
+  const file = notes[notes.length - 1] as string;
   // A staged copy under this run's own temp prefix — not the `box/portrait`
   // handle and not the host's `workflows/portrait.json`, neither of which is a
   // file on this machine. (It is gone by now: describe_workflow disposes the
