@@ -1,6 +1,6 @@
 {
   "name": "@tuesdaycrowd/mcp-comfyui",
-  "version": "0.6.10",
+  "version": "0.6.11",
   "license": "Unlicense",
   "exports": "./src/index.ts",
   "imports": {
