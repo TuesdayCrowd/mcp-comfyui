@@ -718,9 +718,9 @@ For the staged-workflow test, reuse whichever helper this file already uses to s
 Run: `deno task test:one tests/server.test.ts`
 Expected: FAIL — `body.notes` is undefined, and the description contains neither string.
 
-- [ ] **Step 3: Add `notes` to `WorkflowDescription`**
+- [ ] **Step 3: Record why `WorkflowDescription` does NOT gain `notes`**
 
-In `src/workflows/describe.ts`, extend the interface at :147 and its docblock. `describeSlots` does **not** change signature — it is a pure function over data the caller fetched, and notes come from a separate CLI call the tool layer makes.
+This step adds a comment and changes no code. `describeSlots` keeps its signature: it is a pure function over data the caller already fetched, and notes come from a separate CLI call the tool layer makes.
 
 ```ts
 export interface WorkflowDescription {
@@ -1045,18 +1045,23 @@ test("a fresh cache carries no staleness block at all", async () => {
 });
 
 test("no cache at all still fails, without a second fetch", async () => {
-  // Asserted by request count, not by the error: the error is identical
-  // whether or not a pointless second 30-second fetch happened first, so only
-  // the counter can tell the two apart.
+  // Asserted by request COUNT, not by the error: the error is identical
+  // whether or not a pointless second full-timeout fetch happened first, so
+  // only the counter can tell the two apart.
+  //
+  // The instance must ANSWER (with a failure) rather than be a dead port —
+  // a dead port increments no counter, so asserting 0 against one would pass
+  // whether the code fetched once, twice, or never, and prove nothing.
+  const failing = serveObjectInfo({ status: 500 });
   serveSlots();
 
   const error = await failure(await connect(), "describe_workflow", {
     workflow: "default_image_gen",
-    host: `127.0.0.1:${deadPort}`,
+    host: `127.0.0.1:${failing.port}`,
   });
 
   expect(error.kind).toBe("object_info_unavailable");
-  expect(objectInfoRequests).toBe(0); // deadPort answers nothing; nothing retried it
+  expect(objectInfoRequests).toBe(1); // one attempt, no stale retry behind it
 });
 
 test("launching still wins over the stale cache", async () => {
