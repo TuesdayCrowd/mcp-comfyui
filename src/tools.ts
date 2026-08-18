@@ -117,6 +117,21 @@ const WAIT_TIMEOUT_MS = 300_000;
 /** The widest budget a caller may ask for: half an hour, for a video workflow. */
 const MAX_TIMEOUT_SECONDS = 1_800;
 
+/**
+ * Budget for `comfy workflow notes`, and deliberately far shorter than
+ * `runComfy`'s 120s default.
+ *
+ * Notes are decorative and their failure is explicitly non-fatal, while the
+ * `slots` call beside them is load-bearing — but they are issued together, so
+ * inheriting the default would let a hung notes call hold an otherwise-complete
+ * description for two minutes. The command is a local JSON parse with no server
+ * in it at all and measures 0.32-0.34s against an 84KB workflow, so 15 seconds
+ * is roughly forty times the observed cost: long enough that a slow disk or a
+ * cold Python start never trips it, short enough that a hang degrades to
+ * `notes_unreadable` instead of stalling the tool.
+ */
+const NOTES_TIMEOUT_MS = 15_000;
+
 const MIN_PORT = 1;
 const MAX_PORT = 65535;
 
@@ -922,6 +937,10 @@ function runBody(
  * GPU is available. The only change is the last arrow, which used to be a
  * throw — leaving both diagnostic tools unable to answer precisely when the
  * caller most needs them, with a complete copy of the answer sitting on disk.
+ *
+ * Every route out of the launch arrow reaches that last one, including the
+ * routes where the launch itself throws. A fallback the default path can miss
+ * is not a floor.
  */
 async function withObjectInfo(
   location: { host?: string; port?: number; cacheDir?: string },
@@ -937,7 +956,31 @@ async function withObjectInfo(
     // refuse it, and that refusal would replace the fetch error — which is the
     // one that says what actually went wrong — with one about launching.
     if (config.autoLaunch && resolved.local) {
-      const ensured = await ensureRunning(config, resolved);
+      let ensured;
+      try {
+        ensured = await ensureRunning(config, resolved);
+      } catch (launchFailed) {
+        // **The floor is behind the launch, not instead of it.** A launch does
+        // not only fail by returning — `ensureInstance` refuses outright when
+        // this host's own entry sets `autoLaunch: false`, the CLI delivers its
+        // own verdict (`not_in_workspace`, `port_in_use`), and a launch that
+        // starts nothing spends the full five-minute readiness budget and then
+        // throws. Letting any of those escape here skips the fallback in
+        // exactly the scenario it was built for: ComfyUI stopped, an aged but
+        // complete copy of the answer sitting on the disk. Auto-launch is on by
+        // default, so this is the default path, not a corner.
+        //
+        // **The launch error is what survives a stale miss, not the fetch
+        // error**, on the same rule the `already_running` branch below applies:
+        // keep the diagnosis that reflects the most recently established fact
+        // about the machine. `already_running` establishes nothing new — the
+        // instance was up the whole time, so the fetch error stands — while an
+        // attempted launch does, and says something "fetch failed" cannot. The
+        // CLI's verdict names a fix, `InstanceUnavailableError` names the
+        // setting that changes it, and "could not read node definitions:
+        // fetch failed" is implied by all of them anyway.
+        return await orStale(location, launchFailed);
+      }
       // It was up all along, so the address is not the problem; the original
       // diagnosis is the better one and a retry would only obscure it.
       if (ensured.outcome !== "already_running") {
@@ -1561,7 +1604,10 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
             // decoy analysis is pure JS over the raw graph, and `listSlots` never
             // sees the link topology that decides it.
             inertInputsOfFile(file),
-            listNotes(file).then(
+            // On its own short budget: see {@link NOTES_TIMEOUT_MS}. The three
+            // are joined, so the decorative one must not be able to hold the
+            // load-bearing one for `runComfy`'s full default.
+            listNotes(file, { timeoutMs: NOTES_TIMEOUT_MS }).then(
               (value) => ({ ok: true as const, value }),
               (err: unknown) => ({ ok: false as const, reason: err instanceof Error ? err.message : String(err) }),
             ),

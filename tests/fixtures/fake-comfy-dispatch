@@ -14,6 +14,9 @@
 #                              defaulted, to keep every test written before
 #                              `run_workflow` could make this call unchanged)
 #   $FAKE_COMFY_NOTES_MODE     mode for a `workflow notes` call (default: notes_file)
+#   $FAKE_COMFY_LAUNCH_MODE    mode for a `launch` call (default: none — opt-in,
+#                              exactly like $FAKE_COMFY_SLOTS_MODE and for the
+#                              same compatibility reason)
 #   $FAKE_COMFY_DISPATCH_LOG   file every invocation's argv is APPENDED to. The
 #                              fixture's own $FAKE_COMFY_ARGV_OUT is overwritten
 #                              per call and so only ever holds the last of the
@@ -43,6 +46,13 @@ for arg in "$@"; do
     # workflow that carries no notes, not a fixture error, so that every test
     # written before notes existed keeps getting a clean description.
     notes)    FAKE_COMFY_MODE="${FAKE_COMFY_NOTES_MODE:-notes_file}"; break ;;
+    # Auto-launch fires from inside a tool handler, so `describe_workflow` and
+    # `validate_workflow` can each make a `launch` call alongside their own —
+    # and a test about a launch that FAILS needs the other call still
+    # answering. Opt-in like `slots`, never defaulted: every launch test
+    # written before this case relies on `launch` falling through to whatever
+    # $FAKE_COMFY_MODE the test already armed.
+    launch)   [ -n "$FAKE_COMFY_LAUNCH_MODE" ] && FAKE_COMFY_MODE="$FAKE_COMFY_LAUNCH_MODE"; break ;;
   esac
 done
 export FAKE_COMFY_MODE

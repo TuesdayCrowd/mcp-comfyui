@@ -172,6 +172,7 @@ const MANAGED_ENV = [
   "FAKE_COMFY_HANG",
   "FAKE_COMFY_WARNINGS",
   "FAKE_COMFY_SET_SLOT_MODE",
+  "FAKE_COMFY_LAUNCH_MODE",
   "FAKE_COMFY_RUN_MODE",
   "FAKE_COMFY_JOBS_MODE",
   "FAKE_COMFY_JOBS_STATUS_FILE",
@@ -985,6 +986,46 @@ test("a workflow with no notes describes cleanly, with no unreadable marker", as
 
   expect(body.notes).toEqual([]);
   expect(body.notes_unreadable).toBeUndefined();
+});
+
+test("an oversized note is capped, and the response says the list was cut", async () => {
+  // The cap is what stops a stranger's markdown from filling the caller's
+  // context, so the marker that discloses it needs a test of its own: without
+  // this, `notes_truncated` could be deleted, hardcoded false or inverted and
+  // the whole suite would still pass.
+  //
+  // Mutant: drop the `notes_truncated` spread from describe_workflow's body.
+  // This test dies on the undefined.
+  writeWorkflow("default_image_gen");
+  seedObjectInfoCache();
+  serveSlots();
+  serveNotes([{
+    id: 66,
+    type: "MarkdownNote",
+    title: "Model Links",
+    text: "x".repeat(50_000), // MAX_NOTE_TEXT is 8,000
+    subgraph: null,
+  }]);
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  expect(body.notes_truncated).toBe(true);
+  const notes = body.notes as Array<Record<string, unknown>>;
+  expect(String(notes[0]!.text).length).toBe(8_000);
+});
+
+test("a note that fits carries no truncation marker at all", async () => {
+  // The other half, and the reason the assertion above cannot be satisfied by
+  // hardcoding `true`: absence is the signal here, as everywhere else in this
+  // response.
+  writeWorkflow("default_image_gen");
+  seedObjectInfoCache();
+  serveSlots();
+  serveNotes([{ id: 66, type: "MarkdownNote", title: "Short", text: "fits", subgraph: null }]);
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  expect(body.notes_truncated).toBeUndefined();
 });
 
 test("a notes failure does not cost the description", async () => {
@@ -2454,6 +2495,87 @@ test("launching still wins over the stale cache", async () => {
   expect(body["object_info"]).toBeUndefined();
 });
 
+/**
+ * Arm a launch that fails with the CLI's own verdict, leaving whatever else
+ * the tool call spawns answering normally.
+ *
+ * Pinned through the dispatch wrapper's own `launch` case rather than through
+ * `$FAKE_COMFY_MODE`: a tool that auto-launches makes two CLI calls for one
+ * tool call, and the other one still has to answer.
+ */
+function launchFails(code: string, message: string): void {
+  process.env.FAKE_COMFY_LAUNCH_MODE = "launch_fail";
+  process.env.FAKE_COMFY_ERROR_CODE = code;
+  process.env.FAKE_COMFY_ERROR_MESSAGE = message;
+}
+
+test("a launch that FAILS still falls through to the stale cache", async () => {
+  // The floor's own motivating case, on the DEFAULT path: auto-launch is on,
+  // the host is local, ComfyUI is stopped and the cache has aged out. The
+  // launch attempt is not a detour around the floor — it is what stands
+  // between the caller and it, and before this the whole call hard-failed with
+  // a complete usable answer sitting on the disk.
+  //
+  // Mutant: revert `withObjectInfo`'s launch call to a bare `await
+  // ensureRunning(...)`. This test dies with `not_in_workspace` reaching the
+  // caller instead of a description.
+  writeWorkflow("default_image_gen");
+  const port = nothingRunning();
+  cacheAged("127.0.0.1", port, TWO_WEEKS);
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+  serveSlots();
+  launchFails("not_in_workspace", "ComfyUI is not available.");
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  // The launch really was attempted — the floor is behind it, not instead of
+  // it — and the answer still came back, disclosed as stale.
+  expect(await settledInvocationsOf(log, "launch", 1)).toHaveLength(1);
+  expect(body["schema"]).toBeDefined();
+  const info = body["object_info"] as Record<string, unknown>;
+  expect(info["stale"]).toBe(true);
+  expect(info["age_hours"] as number).toBeGreaterThan(300);
+});
+
+test("validate_workflow survives a failed launch the same way", async () => {
+  // The second call site, for the same reason it needed its own test the first
+  // time: validate takes an independent trip for the `--input` path, and a
+  // floor that only describe_workflow can reach is half a floor.
+  writeWorkflow("default_image_gen");
+  const port = nothingRunning();
+  cacheAged("127.0.0.1", port, TWO_WEEKS);
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  launchFails("port_in_use", "port 8188 is already bound");
+  process.env.FAKE_COMFY_MODE = "validate";
+  process.env.FAKE_COMFY_VALIDATE_FILE = VALIDATE_SAMPLE;
+
+  const body = await ok(await connect(), "validate_workflow", { workflow: "default_image_gen" });
+
+  expect(body["valid"]).toBeDefined();
+  expect((body["object_info"] as Record<string, unknown>)["stale"]).toBe(true);
+});
+
+test("with nothing on disk either, the LAUNCH failure is what the caller is told", async () => {
+  // The precedence decision, pinned. Two errors are live when the floor misses
+  // after a failed launch: the pre-launch fetch ("fetch failed") and the launch
+  // verdict. The launch verdict wins, on the same rule `withObjectInfo`'s
+  // `already_running` branch already applies — keep the error that reflects the
+  // most recently established fact about the machine. A launch ATTEMPT
+  // establishes one, and `not_in_workspace` names a fix where "fetch failed"
+  // only restates what the launch failure already implies.
+  writeWorkflow("default_image_gen");
+  nothingRunning(); // and no cache written for it at all
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  serveSlots();
+  launchFails("not_in_workspace", "ComfyUI is not available.");
+
+  const error = await failure(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  expect(error["code"]).toBe("not_in_workspace");
+  expect(error["kind"]).not.toBe("object_info_unavailable");
+});
+
 test("the configured workspace reaches comfy launch as a root flag", async () => {
   writeWorkflow("flow");
   launchable(2);
@@ -2930,10 +3052,24 @@ test("notes are read from the staged copy of a host's own workflow", async () =>
   serveSlots();
   copyFileSync(OBJECT_INFO_SAMPLE, join(cacheDir, `object_info-127.0.0.1-${port}.json`));
   serveNotes([{ id: 1, type: "MarkdownNote", title: "Remote", text: "staged", subgraph: null }]);
+  // The title alone proves nothing: the fake CLI ignores its path argument and
+  // serves $FAKE_COMFY_NOTES_FILE whatever it is asked about, so that assertion
+  // would pass against a build that handed `listNotes` a path that does not
+  // exist. What has to be pinned is the ARGUMENT — the same reason this test's
+  // sibling above switched to the dispatch log.
+  const log = cliLog();
 
   const body = await ok(await connect(), "describe_workflow", { workflow: "box/portrait" });
 
   expect((body.notes as Array<Record<string, unknown>>)[0]!.title).toBe("Remote");
+  const notes = (readFileSync(log, "utf8").trim().split("\n").find((line) => line.includes(" notes "))) as string;
+  const file = notes.split(" ").pop() as string;
+  // A staged copy under this run's own temp prefix — not the `box/portrait`
+  // handle and not the host's `workflows/portrait.json`, neither of which is a
+  // file on this machine. (It is gone by now: describe_workflow disposes the
+  // staging directory before it returns, which `leakedTempDirs()` also checks.)
+  expect(file.startsWith(join(tmpdir(), TEMP_PREFIX))).toBe(true);
+  expect(file).not.toContain("box/portrait");
 });
 
 /**

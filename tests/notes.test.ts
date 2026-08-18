@@ -81,6 +81,24 @@ test("a note type absent from today's vocabulary is carried, not refused", async
   expect(listing.notes[0]?.type).toBe("HoloNote");
 });
 
+test("a note that carries no subgraph key at all is decoded, not refused", async () => {
+  // Non-negotiable #2 again, for a field rather than a value. `subgraph` is
+  // typed permissively BECAUSE its populated shape has never been observed —
+  // but `z.unknown()` is permissive about the value and strict about the KEY,
+  // so a CLI release that stops emitting it would turn every workflow's notes
+  // into `notes_unreadable`. Hand-built, because today's build always sends it.
+  //
+  // Mutant: drop `.optional()` from `NoteSchema.subgraph`. This test dies with
+  // "expected nonoptional, received undefined".
+  const bare = { id: 7, type: "MarkdownNote", title: "T", text: "body" };
+  servePayload({ workflow: "/w/flow.json", count: 1, notes: [bare] });
+
+  const listing = await listNotes("/w/flow.json");
+
+  expect(listing.notes[0]?.title).toBe("T");
+  expect(listing.notes[0]?.subgraph).toBeUndefined();
+});
+
 test("a workflow with no notes is an empty listing, not a failure", async () => {
   servePayload({ workflow: "/w/flow.json", count: 0, notes: [] });
 
@@ -97,7 +115,10 @@ test("too many notes are capped, and count still reports the true total", async 
 
   const listing = await listNotes("/w/flow.json");
 
-  expect(listing.notes.length).toBeLessThan(many.length);
+  // The exact boundary, not merely "fewer": `toBeLessThan` survives a
+  // `MAX_NOTES = 5` mutant, and the cap is a promise about how much a caller's
+  // context can be filled.
+  expect(listing.notes.length).toBe(24);
   expect(listing.count).toBe(many.length);
   expect(listing.truncated).toBe(true);
 });
@@ -111,7 +132,8 @@ test("an oversized note's text is trimmed, and the listing says so", async () =>
 
   const listing = await listNotes("/w/flow.json");
 
-  expect(listing.notes[0]!.text.length).toBeLessThan(50_000);
+  // MAX_NOTE_TEXT exactly, for the same reason as the note count above.
+  expect(listing.notes[0]!.text.length).toBe(8_000);
   expect(listing.truncated).toBe(true);
 });
 

@@ -50,7 +50,15 @@ const MAX_NOTE_TEXT = 8_000;
  * `subgraph` is typed `unknown` because its populated shape has never been
  * observed. Every note measured carries `null`, and no workflow on hand has a
  * note inside a subgraph, so committing to a string id or a nested object would
- * be a guess. Carrying it opaquely costs nothing and cannot be wrong.
+ * be a guess.
+ *
+ * **`.optional()` is load-bearing, not decoration.** Under zod 4 a bare
+ * `z.unknown()` is permissive about the VALUE and strict about the KEY — probed
+ * directly, `{id, type, title, text}` with no `subgraph` at all fails with
+ * "expected nonoptional, received undefined" — which is exactly backwards for a
+ * field whose populated shape is unmeasured. Without it, the release that stops
+ * emitting `subgraph` turns every workflow's notes into `notes_unreadable`,
+ * which is the same append-only hazard non-negotiable #2 keeps `type` open for.
  */
 export const NoteSchema = z.object({
   id: z.number(),
@@ -58,7 +66,7 @@ export const NoteSchema = z.object({
   title: z.string(),
   /** The note's body, raw. Nothing is extracted from it — see the module doc. */
   text: z.string(),
-  subgraph: z.unknown(),
+  subgraph: z.unknown().optional(),
 });
 
 export type Note = z.infer<typeof NoteSchema>;
@@ -85,7 +93,12 @@ export interface NoteListing {
 }
 
 export interface ListNotesOptions {
-  /** Budget for the CLI call. Defaults to `runComfy`'s 120 seconds. */
+  /**
+   * Budget for the CLI call. Defaults to `runComfy`'s 120 seconds, which is
+   * four hundred times this command's measured cost — so the server's own
+   * caller passes a short one rather than taking it (`NOTES_TIMEOUT_MS` in
+   * `tools.ts`, with the reasoning).
+   */
   timeoutMs?: number;
 }
 
