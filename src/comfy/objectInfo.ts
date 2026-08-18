@@ -234,6 +234,40 @@ async function readCache(path: string, ttlMs: number): Promise<ObjectInfo | null
 }
 
 /**
+ * Whatever is on disk, at any age, without ever going to the network.
+ *
+ * This exists because {@link getObjectInfo} is not a cache read: on a
+ * `readCache` miss it falls through to a live fetch regardless of `ttlMs`, so
+ * `ttlMs: Infinity` cannot express "serve the cache or admit there isn't one" —
+ * it would mean a second full-timeout request against an address that just
+ * failed, and, if that request happened to succeed, a `stale: true` answer
+ * about data `writeCache` had just refreshed.
+ *
+ * Every failure is a miss, the same contract as {@link readCache}: a file
+ * truncated mid-write by a crash is a realistic state, and the caller asked for
+ * node definitions rather than an audit of the cache.
+ *
+ * The path comes back because `validate_workflow` needs it — the CLI resolves
+ * schemas from `--input <path>`, so a caller served stale definitions must be
+ * able to hand the CLI the same file rather than asking for it again.
+ *
+ * No future-dated guard: {@link readCache} needs one because a future mtime
+ * would read as permanently *fresh*, but this function makes no freshness
+ * claim at all, so a negative `ageMs` is reported as-is.
+ */
+export async function readStaleCache(
+  location: ObjectInfoLocation = {},
+): Promise<{ objectInfo: ObjectInfo; path: string; ageMs: number } | null> {
+  const path = objectInfoCachePath(location);
+  try {
+    const { mtimeMs } = await stat(path);
+    return { objectInfo: parse(await readFile(path, "utf8")), path, ageMs: Date.now() - mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Write via a temp file and rename, so a crash or a concurrent writer can never
  * leave a half-written payload where `--input` will read it. The bytes are the
  * server's own, unreserialized.
