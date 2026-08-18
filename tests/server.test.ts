@@ -10,6 +10,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -17,6 +18,7 @@ import { join } from "node:path";
 import { createServer, SERVER_VERSION } from "../src/server.ts";
 import { toolConfig } from "../src/tools.ts";
 import { clearJobLedger } from "../src/jobLedger.ts";
+import { objectInfoCachePath } from "../src/comfy/objectInfo.ts";
 
 /**
  * The MCP surface, exercised through a real client over a real transport.
@@ -37,6 +39,8 @@ const OBJECT_INFO_SAMPLE = join(FIXTURES, "object_info.sample.json");
 const SLOTS_SAMPLE = join(FIXTURES, "slots.default_image_gen.json");
 /** A frontend-format workflow with one settable slot, from Task 5's fetch tests. */
 const SLOTS_CAPABLE_TEMPLATE = join(FIXTURES, "template.bigseed.json");
+/** A minimal `comfy validate` payload — one clean, zero-diagnostic result. */
+const VALIDATE_SAMPLE = join(FIXTURES, "validate.sample.json");
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 /**
@@ -178,6 +182,8 @@ const MANAGED_ENV = [
   "FAKE_COMFY_WORKFLOW_COPY",
   "FAKE_COMFY_NOTES_FILE",
   "FAKE_COMFY_NOTES_MODE",
+  "FAKE_COMFY_VALIDATE_FILE",
+  "FAKE_COMFY_VALIDATE_OK",
   "MCP_COMFYUI_WORKFLOW_DIRS",
   "MCP_COMFYUI_CREATED_DIR",
   "MCP_COMFYUI_CACHE_DIR",
@@ -299,6 +305,38 @@ function serveInstance(body: unknown = SYSTEM_STATS): number {
 }
 
 /**
+ * Unlike `serveInstance`, this one's `/object_info` actually answers — with the
+ * real sample payload by default, or with the given HTTP status when a test
+ * needs the request to be observably ATTEMPTED (via `objectInfoRequests`) and
+ * to fail anyway. `serveInstance`'s deliberate 404 already proves "unreachable
+ * schema"; this exists for the stale-cache floor's tests, which need either a
+ * live instance whose definitions are fetchable, or one that answers but still
+ * fails — as opposed to a dead port, against which a request COUNT proves
+ * nothing (a dead port increments no counter whether it was tried once, twice
+ * or never).
+ */
+function serveObjectInfo(opts: { status?: number } = {}): { port: number } {
+  const bound = denoServe((request) => {
+    const path = new URL(request.url).pathname;
+    if (path === "/object_info") {
+      objectInfoRequests += 1;
+      return opts.status !== undefined
+        ? new Response("error", { status: opts.status })
+        : new Response(readFileSync(OBJECT_INFO_SAMPLE, "utf8"), {
+            headers: { "content-type": "application/json" },
+          });
+    }
+    return path === "/system_stats"
+      ? new Response(JSON.stringify(SYSTEM_STATS), { headers: { "content-type": "application/json" } })
+      : new Response("not found", { status: 404 });
+  });
+  servers.push(bound);
+  const port = portOf(bound);
+  process.env.MCP_COMFYUI_PORT = String(port);
+  return { port };
+}
+
+/**
  * A ComfyUI whose `argv` names directories this test owns, so a `/view` URL it
  * emits can be resolved back to a real file without touching this machine's own
  * ComfyUI-Shared directory.
@@ -365,6 +403,17 @@ function seedObjectInfoCache(): string {
   copyFileSync(OBJECT_INFO_SAMPLE, path);
   return path;
 }
+
+/** Put a usable object_info on disk for a host, dated `ageMs` in the past. */
+function cacheAged(host: string, port: number, ageMs: number): string {
+  const path = objectInfoCachePath({ host, port, cacheDir });
+  copyFileSync(OBJECT_INFO_SAMPLE, path);
+  const when = new Date(Date.now() - ageMs);
+  utimesSync(path, when, when);
+  return path;
+}
+
+const TWO_WEEKS = 14 * 24 * 60 * 60 * 1000;
 
 /** Serve a captured payload as the envelope's `data`. */
 function serveData(value: unknown): void {
@@ -629,6 +678,16 @@ test("describe_workflow's description points at validate_workflow and frames not
   const description = toolNamed(await tools(await connect()), "describe_workflow").description ?? "";
   expect(description).toContain("validate_workflow");
   expect(description).toContain("notes");
+});
+
+test("both tools' descriptions explain what a stale answer means", async () => {
+  const list = await tools(await connect());
+
+  for (const name of ["describe_workflow", "validate_workflow"]) {
+    const description = toolNamed(list, name).description ?? "";
+    expect(description).toContain("stale");
+    expect(description).toContain("age_hours");
+  }
 });
 
 test("search_templates' description names the video tag a caller cannot guess", async () => {
@@ -2242,6 +2301,101 @@ test("a fetch that failed against a running ComfyUI is not retried", async () =>
   expect(error["kind"]).toBe("object_info_unavailable");
   expect(objectInfoRequests).toBe(1);
   expect(await settledInvocationsOf(log, "launch", 0)).toEqual([]);
+});
+
+// --- the stale-cache floor -------------------------------------------------
+
+test("describe_workflow answers from a cache older than the TTL, and says so", async () => {
+  // Nothing is listening on `deadPort`, so the live fetch fails and the floor
+  // is the only thing that can answer.
+  writeWorkflow("default_image_gen");
+  cacheAged("127.0.0.1", deadPort, TWO_WEEKS);
+  serveSlots();
+
+  const body = await ok(await connect(), "describe_workflow", {
+    workflow: "default_image_gen",
+    host: `127.0.0.1:${deadPort}`,
+  });
+
+  const info = body["object_info"] as Record<string, unknown>;
+  expect(body["schema"]).toBeDefined();
+  expect(info["stale"]).toBe(true);
+  expect(info["age_hours"] as number).toBeGreaterThan(300);
+});
+
+test("validate_workflow answers from a stale cache too", async () => {
+  // The test that would have caught the defect this design shipped with on its
+  // first pass. validate takes a SECOND, independent trip through
+  // ensureObjectInfoCache to get the --input path; patching withObjectInfo
+  // alone leaves that trip re-running the 24h check and throwing.
+  writeWorkflow("default_image_gen");
+  cacheAged("127.0.0.1", deadPort, TWO_WEEKS);
+  process.env.FAKE_COMFY_MODE = "validate";
+  process.env.FAKE_COMFY_VALIDATE_FILE = VALIDATE_SAMPLE;
+
+  const body = await ok(await connect(), "validate_workflow", {
+    workflow: "default_image_gen",
+    host: `127.0.0.1:${deadPort}`,
+  });
+
+  expect(body["valid"]).toBeDefined();
+  expect((body["object_info"] as Record<string, unknown>)["stale"]).toBe(true);
+});
+
+test("a fresh cache carries no staleness block at all", async () => {
+  // Absence is the signal. A `stale: false` would make every caller check a
+  // field that is almost always the same.
+  writeWorkflow("default_image_gen");
+  cacheAged("127.0.0.1", deadPort, 60_000);
+  serveSlots();
+
+  const body = await ok(await connect(), "describe_workflow", {
+    workflow: "default_image_gen",
+    host: `127.0.0.1:${deadPort}`,
+  });
+
+  expect(body["object_info"]).toBeUndefined();
+});
+
+test("no cache at all still fails, without a second fetch", async () => {
+  // Asserted by request COUNT, not by the error: the error is identical
+  // whether or not a pointless second full-timeout fetch happened first, so
+  // only the counter can tell the two apart.
+  //
+  // The instance must ANSWER (with a failure) rather than be a dead port — a
+  // dead port increments no counter, so asserting 0 against one would pass
+  // whether the code fetched once, twice, or never, and prove nothing.
+  writeWorkflow("default_image_gen");
+  const failing = serveObjectInfo({ status: 500 });
+  serveSlots();
+
+  const error = await failure(await connect(), "describe_workflow", {
+    workflow: "default_image_gen",
+    host: `127.0.0.1:${failing.port}`,
+  });
+
+  expect(error["kind"]).toBe("object_info_unavailable");
+  expect(objectInfoRequests).toBe(1); // one attempt, no stale retry behind it
+});
+
+test("launching still wins over the stale cache", async () => {
+  // The order must not invert. With auto-launch on and a local host, a
+  // reachable instance's FRESH definitions are the right answer; the floor is
+  // the last resort, not a shortcut past it.
+  writeWorkflow("default_image_gen");
+  const live = serveObjectInfo(); // an instance that answers, from this file's helpers
+  cacheAged("127.0.0.1", live.port, TWO_WEEKS);
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  process.env.FAKE_COMFY_MODE = "launch";
+  serveSlots();
+
+  const body = await ok(await connect(), "describe_workflow", {
+    workflow: "default_image_gen",
+    host: `127.0.0.1:${live.port}`,
+  });
+
+  // It answered from the live instance, so there is nothing stale to disclose.
+  expect(body["object_info"]).toBeUndefined();
 });
 
 test("the configured workspace reaches comfy launch as a root flag", async () => {

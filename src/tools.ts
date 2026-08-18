@@ -32,6 +32,8 @@ import {
   getObjectInfo,
   objectInfoCachePath,
   ObjectInfoFetchError,
+  readStaleCache,
+  type ObjectInfo,
 } from "./comfy/objectInfo.ts";
 import {
   ALLOW_LAUNCH_ENV,
@@ -669,6 +671,11 @@ function instanceBody(instance: RunningInstance): Record<string, unknown> {
   };
 }
 
+/** Absence means fresh. Hours because a caller reasons in hours, not milliseconds. */
+function staleBody(stale: { ageMs: number; path: string }): Record<string, unknown> {
+  return { stale: true, age_hours: Math.round(stale.ageMs / 36_000) / 100, path: stale.path };
+}
+
 /**
  * A run's artifacts, in the three ways a caller can reach them.
  *
@@ -908,35 +915,57 @@ function runBody(
 }
 
 /**
- * The node definitions, starting ComfyUI only if there is no other way to get
- * them.
+ * Node definitions for one host, with two fallbacks behind the plain fetch.
  *
- * The cache is tried first and is usually enough — that is the entire point of
- * landmine #7, and it is why describing a workflow normally touches nothing.
- * Only when the cache is missing or stale *and* the fetch that would refresh it
- * fails is a launch worth considering, and even then only if nothing is already
- * answering: a fetch that failed against a **running** instance failed for some
- * other reason, and re-fetching after confirming it is up would just produce the
- * same error a second time.
+ * The order is: fresh cache → live fetch → launch and refetch → stale cache.
+ * Auto-launch keeps its exact previous meaning; freshness still wins whenever a
+ * GPU is available. The only change is the last arrow, which used to be a
+ * throw — leaving both diagnostic tools unable to answer precisely when the
+ * caller most needs them, with a complete copy of the answer sitting on disk.
  */
 async function withObjectInfo(
   location: { host?: string; port?: number; cacheDir?: string },
   config: ToolConfig,
   resolved: ResolvedHost,
-) {
+): Promise<{ objectInfo: ObjectInfo; stale?: { ageMs: number; path: string } }> {
   try {
-    return await getObjectInfo(location);
+    return { objectInfo: await getObjectInfo(location) };
   } catch (err) {
+    if (!(err instanceof ObjectInfoFetchError)) throw err;
+
     // A remote host is skipped here rather than probed: `ensureRunning` would
     // refuse it, and that refusal would replace the fetch error — which is the
     // one that says what actually went wrong — with one about launching.
-    if (!(err instanceof ObjectInfoFetchError) || !config.autoLaunch || !resolved.local) throw err;
-    const ensured = await ensureRunning(config, resolved);
-    // It was up all along, so the address is not the problem; the original
-    // diagnosis is the better one and a retry would only obscure it.
-    if (ensured.outcome === "already_running") throw err;
-    return await getObjectInfo({ ...location, refresh: true });
+    if (config.autoLaunch && resolved.local) {
+      const ensured = await ensureRunning(config, resolved);
+      // It was up all along, so the address is not the problem; the original
+      // diagnosis is the better one and a retry would only obscure it.
+      if (ensured.outcome !== "already_running") {
+        try {
+          return { objectInfo: await getObjectInfo({ ...location, refresh: true }) };
+        } catch (afterLaunch) {
+          // The post-launch failure is the better diagnosis from here on: it
+          // reflects a confirmed-running instance. It becomes the error the
+          // stale fallback re-throws if the disk has nothing either.
+          return await orStale(location, afterLaunch);
+        }
+      }
+    }
+    return await orStale(location, err);
   }
+}
+
+/**
+ * The floor. `readStaleCache` never fetches, so a miss costs nothing and the
+ * surviving error is re-thrown exactly as it was.
+ */
+async function orStale(
+  location: { host?: string; port?: number; cacheDir?: string },
+  err: unknown,
+): Promise<{ objectInfo: ObjectInfo; stale: { ageMs: number; path: string } }> {
+  const hit = await readStaleCache(location);
+  if (hit === null) throw err;
+  return { objectInfo: hit.objectInfo, stale: { ageMs: hit.ageMs, path: hit.path } };
 }
 
 /**
@@ -1487,7 +1516,13 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           ? " If that cache is missing or stale and ComfyUI is not running, this will start " +
             "ComfyUI to rebuild it, which can take a minute or two — but only for a host on this " +
             "machine, since ComfyUI cannot be started remotely."
-          : ""),
+          : "") +
+        " If ComfyUI cannot be reached and the cached node definitions have aged out, this " +
+        "answers from that cache anyway rather than failing, and reports `object_info` with " +
+        "`stale: true` and its `age_hours`. Read that as a real limit: a model installed within " +
+        "the last `age_hours` will not appear, so a missing-model answer from a stale read is " +
+        "worth confirming by re-running once ComfyUI is reachable. No `object_info` key means " +
+        "the definitions were current.",
       inputSchema: { workflow: workflowArgument, host: hostArgument },
       // Honest rather than flattering: with auto-launch on, this tool may start
       // a GPU process, and `readOnlyHint: true` is a promise that it will not.
@@ -1502,7 +1537,8 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // Fetched and cached in one step, then the *path* is handed to the CLI:
         // the join below needs the parsed document, and `slots --input` needs
         // the file (landmine #7). Reading it twice would cost a second 1.7MB.
-        const objectInfo = await withObjectInfo(location, config, target);
+        const info = await withObjectInfo(location, config, target);
+        const objectInfo = info.objectInfo;
 
         // A workflow that lives on the host has to become a file before the CLI
         // can read it. A local one already is one, and is deliberately not
@@ -1545,6 +1581,9 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
             // `remote_unreadable` already follow.
             ...(notes.ok && notes.value.truncated ? { notes_truncated: true } : {}),
             ...(notes.ok ? {} : { notes_unreadable: notes.reason }),
+            // Absent means the definitions were current — the same structural-
+            // absence rule as the two keys above it.
+            ...(info.stale ? { object_info: staleBody(info.stale) } : {}),
           };
         } finally {
           staged?.dispose();
@@ -1570,7 +1609,13 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "semantic one**: it means every node exists, every required input is present, every " +
         "value is in range and every edge is wired, not that the result will look like what you " +
         "asked for. Pass `host` to check against a particular ComfyUI's installed models, which " +
-        "is what decides whether a checkpoint or LoRA name is valid at all.",
+        "is what decides whether a checkpoint or LoRA name is valid at all. " +
+        "If ComfyUI cannot be reached and the cached node definitions have aged out, this " +
+        "answers from that cache anyway rather than failing, and reports `object_info` with " +
+        "`stale: true` and its `age_hours`. Read that as a real limit: a model installed within " +
+        "the last `age_hours` will not appear, so a missing-model answer from a stale read is " +
+        "worth confirming by re-running once ComfyUI is reachable. No `object_info` key means " +
+        "the definitions were current.",
       inputSchema: { workflow: workflowArgument, host: hostArgument },
       // Same conditional as describe_workflow and for the same reason: with
       // auto-launch on, filling a cold object_info cache may start ComfyUI.
@@ -1586,8 +1631,12 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // or stale, so the ordinary warm case costs no request — and for a
         // remote host it is the only schema source the CLI will accept at all
         // (ground truth #24).
-        await withObjectInfo(location, config, target);
-        const objectInfoPath = await ensureObjectInfoCache(location);
+        const info = await withObjectInfo(location, config, target);
+        // The path the CLI reads as `--input`. When the definitions came off disk
+        // we already know which file they came from, and asking
+        // `ensureObjectInfoCache` again would re-run the freshness check that
+        // just sent us here — and fail exactly the same way.
+        const objectInfoPath = info.stale ? info.stale.path : await ensureObjectInfoCache(location);
 
         // Same staging rule as describe_workflow: the CLI reads a file, and a
         // workflow that lives on the host is not one yet.
@@ -1598,6 +1647,9 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
             target: targetBody(target),
             workflow: { name: resolved.name, path: resolved.path, source: resolved.source },
             ...report,
+            // Absent means the definitions were current — same rule as
+            // describe_workflow's `object_info` key.
+            ...(info.stale ? { object_info: staleBody(info.stale) } : {}),
           };
         } finally {
           staged?.dispose();
