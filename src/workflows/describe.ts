@@ -143,6 +143,11 @@ export interface InertSlot {
  * all — offering an address that does nothing is worse than not offering it,
  * matching the same reasoning that already puts `additionalProperties: false`
  * on the schema.
+ *
+ * `notes` is deliberately NOT here. It is a fourth audience — someone working
+ * out what the workflow is *for* — but it comes from a separate CLI call, not
+ * from joining slots against `/object_info`. Giving this pure function a field
+ * it cannot compute would mean threading a value through it untouched.
  */
 export interface WorkflowDescription {
   schema: WorkflowInputSchema;

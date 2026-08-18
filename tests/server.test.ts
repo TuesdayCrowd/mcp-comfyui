@@ -176,6 +176,8 @@ const MANAGED_ENV = [
   "FAKE_COMFY_JOBS_CANCEL_ERROR",
   "FAKE_COMFY_DISPATCH_LOG",
   "FAKE_COMFY_WORKFLOW_COPY",
+  "FAKE_COMFY_NOTES_FILE",
+  "FAKE_COMFY_NOTES_MODE",
   "MCP_COMFYUI_WORKFLOW_DIRS",
   "MCP_COMFYUI_CREATED_DIR",
   "MCP_COMFYUI_CACHE_DIR",
@@ -376,6 +378,13 @@ function serveData(value: unknown): void {
 function serveSlots(): void {
   process.env.FAKE_COMFY_MODE = "data_file";
   process.env.FAKE_COMFY_DATA_FILE = SLOTS_SAMPLE;
+}
+
+/** Arm the `workflow notes` call with a listing of this test's choosing. */
+function serveNotes(notes: unknown[]): void {
+  const path = join(workdir, "notes.json");
+  writeFileSync(path, JSON.stringify({ workflow: "/w/wf.json", notes }));
+  process.env.FAKE_COMFY_NOTES_FILE = path;
 }
 
 /** Serve exact bytes as `comfy run --json`'s stdout. */
@@ -616,6 +625,12 @@ test("describe_workflow's description names the address form its keys take", asy
   expect(description).toContain("3.seed");
 });
 
+test("describe_workflow's description points at validate_workflow and frames notes", async () => {
+  const description = toolNamed(await tools(await connect()), "describe_workflow").description ?? "";
+  expect(description).toContain("validate_workflow");
+  expect(description).toContain("notes");
+});
+
 test("search_templates' description names the video tag a caller cannot guess", async () => {
   // Ground truth #28/#29: `type: "video"` matches none of the 47 `Use Cases`
   // templates that produce video, and `--tag` has no substring matching — so a
@@ -813,12 +828,21 @@ test("describe_workflow works with the server down, from the cached node definit
   writeWorkflow("flow");
   const cachePath = seedObjectInfoCache();
   serveSlots();
+  // `argv()` alone is not enough here: describe_workflow now issues its
+  // `slots` and `notes` calls concurrently (Task 3), and each overwrites the
+  // same $FAKE_COMFY_ARGV_OUT, so whichever finishes last would decide what
+  // `argv()` sees. The append-only dispatch log lets this test pick out the
+  // `slots` invocation specifically, regardless of arrival order.
+  const log = join(workdir, "dispatch.log");
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
 
   const body = await ok(await connect(), "describe_workflow", { workflow: "flow" });
 
   expect(body["slot_count"]).toBe(13);
-  expect(argv()).toContain("--input");
-  expect(argv()).toContain(cachePath);
+  const lines = readFileSync(log, "utf8").trim().split("\n");
+  const slots = lines.find((line) => line.includes(" slots ")) as string;
+  expect(slots).toContain("--input");
+  expect(slots).toContain(cachePath);
 });
 
 test("describe_workflow resolves a workflow by the name list_workflows gave", async () => {
@@ -867,6 +891,58 @@ test("an absolute path outside the configured roots is still accepted", async ()
   const body = await ok(await connect(), "describe_workflow", { workflow: outside });
 
   expect((body["workflow"] as Record<string, unknown>)["path"]).toBe(outside);
+});
+
+test("describe_workflow returns the workflow's own notes", async () => {
+  // The whole point: validate says which model is missing, the note says
+  // where to get it.
+  writeWorkflow("default_image_gen");
+  seedObjectInfoCache();
+  serveSlots();
+  serveNotes([{
+    id: 66,
+    type: "MarkdownNote",
+    title: "Model Links",
+    text: "- [wan2.2_vae.safetensors](https://huggingface.co/x)",
+    subgraph: null,
+  }]);
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  const notes = body.notes as Array<Record<string, unknown>>;
+  expect(notes).toHaveLength(1);
+  expect(notes[0]!.title).toBe("Model Links");
+  expect(String(notes[0]!.text)).toContain("huggingface.co");
+  expect(body.notes_unreadable).toBeUndefined();
+});
+
+test("a workflow with no notes describes cleanly, with no unreadable marker", async () => {
+  // The default path for every test written before notes existed.
+  writeWorkflow("default_image_gen");
+  seedObjectInfoCache();
+  serveSlots();
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  expect(body.notes).toEqual([]);
+  expect(body.notes_unreadable).toBeUndefined();
+});
+
+test("a notes failure does not cost the description", async () => {
+  // describe.ts's philosophy: nothing here is fatal. A caller who wanted the
+  // schema must still get the schema.
+  writeWorkflow("default_image_gen");
+  seedObjectInfoCache();
+  serveSlots();
+  process.env.FAKE_COMFY_NOTES_MODE = "fail_code";
+  process.env.FAKE_COMFY_ERROR_CODE = "workflow_read_error";
+  process.env.FAKE_COMFY_ERROR_MESSAGE = "permission denied";
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  expect(body.schema).toBeDefined();
+  expect(body.notes).toEqual([]);
+  expect(typeof body.notes_unreadable).toBe("string");
 });
 
 // --- describe_workflow: decoy addresses (a link overrides the widget) ----
@@ -2632,6 +2708,22 @@ test("describe_workflow reads a host's own workflow without leaving a temp copy 
   // The staged copy is the caller's to delete, and describe_workflow is the
   // caller. `leakedTempDirs` is checked in afterEach for every test here.
   expect(leakedTempDirs()).toEqual([]);
+});
+
+test("notes are read from the staged copy of a host's own workflow", async () => {
+  // "Remote workflows come free" is a claim, so it gets a test: describe
+  // stages a host-held workflow to a temp file, and listNotes takes a path,
+  // so the notes must come back from that staged file with no extra code.
+  const graph = `{"nodes":[{"id":3,"type":"KSampler"}],"links":[]}`;
+  const port = serveLibraryInstance({ "workflows/portrait.json": graph });
+  writeHosts({ default: "box", hosts: { box: { host: "127.0.0.1", port } } });
+  serveSlots();
+  copyFileSync(OBJECT_INFO_SAMPLE, join(cacheDir, `object_info-127.0.0.1-${port}.json`));
+  serveNotes([{ id: 1, type: "MarkdownNote", title: "Remote", text: "staged", subgraph: null }]);
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "box/portrait" });
+
+  expect((body.notes as Array<Record<string, unknown>>)[0]!.title).toBe("Remote");
 });
 
 /**
