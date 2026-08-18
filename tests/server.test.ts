@@ -2378,15 +2378,17 @@ test("no cache at all still fails, without a second fetch", async () => {
   expect(objectInfoRequests).toBe(1); // one attempt, no stale retry behind it
 });
 
-test("launching still wins over the stale cache", async () => {
-  // The order must not invert. With auto-launch on and a local host, a
-  // reachable instance's FRESH definitions are the right answer; the floor is
-  // the last resort, not a shortcut past it.
+test("a live fetch wins over the stale cache, before any launch is needed", async () => {
+  // The first arrow of the order, on its own: a stale copy on disk must not
+  // short-circuit an instance that is answering. This one never reaches the
+  // launch branch and is not meant to — `withObjectInfo`'s first
+  // `getObjectInfo` succeeds, so the whole `catch` is skipped. It would catch
+  // a "check staleness before fetching" inversion; the test below covers the
+  // launch arrow.
   writeWorkflow("default_image_gen");
   const live = serveObjectInfo(); // an instance that answers, from this file's helpers
   cacheAged("127.0.0.1", live.port, TWO_WEEKS);
   process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
-  process.env.FAKE_COMFY_MODE = "launch";
   serveSlots();
 
   const body = await ok(await connect(), "describe_workflow", {
@@ -2395,6 +2397,60 @@ test("launching still wins over the stale cache", async () => {
   });
 
   // It answered from the live instance, so there is nothing stale to disclose.
+  expect(body["object_info"]).toBeUndefined();
+});
+
+test("launching still wins over the stale cache", async () => {
+  // The order must not invert. With auto-launch on and a launchable local
+  // host, the launch and its refetch are taken BEFORE the floor; the stale
+  // copy is the last resort, not a shortcut past it.
+  //
+  // Reaching that branch at all requires the FIRST /object_info to fail —
+  // otherwise `withObjectInfo` returns from its `try` and `config.autoLaunch`
+  // is never consulted. So this instance is one that is genuinely down and
+  // then comes up: /system_stats refuses until it has been probed twice (a
+  // cold start, as `launchable` models it) and /object_info refuses once,
+  // serving the real definitions from then on. A stale cache sits on disk
+  // throughout, and must lose.
+  writeWorkflow("default_image_gen");
+  let statsProbes = 0;
+  let objectInfoAttempts = 0;
+  const bound = denoServe((request) => {
+    const path = new URL(request.url).pathname;
+    if (path === "/system_stats") {
+      return statsProbes++ < 2
+        ? new Response("starting", { status: 503 })
+        : new Response(JSON.stringify(SYSTEM_STATS), {
+            headers: { "content-type": "application/json" },
+          });
+    }
+    if (path === "/object_info") {
+      objectInfoRequests += 1;
+      return objectInfoAttempts++ === 0
+        ? new Response("starting", { status: 503 })
+        : new Response(readFileSync(OBJECT_INFO_SAMPLE, "utf8"), {
+            headers: { "content-type": "application/json" },
+          });
+    }
+    return new Response("not found", { status: 404 });
+  });
+  servers.push(bound);
+  const port = portOf(bound);
+  process.env.MCP_COMFYUI_PORT = String(port);
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
+  cacheAged("127.0.0.1", port, TWO_WEEKS);
+  serveSlots();
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  // The launch branch really was entered — `comfy launch` was invoked — and
+  // the answer came from the refetch behind it: the two /object_info attempts
+  // are the failure that opened the branch and the fetch that closed it, and a
+  // stale answer would have disclosed its age.
+  expect(await settledInvocationsOf(log, "launch", 1)).toHaveLength(1);
+  expect(objectInfoAttempts).toBe(2);
+  expect(body["slot_count"]).toBe(13);
   expect(body["object_info"]).toBeUndefined();
 });
 
