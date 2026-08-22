@@ -4,7 +4,7 @@
 **Date:** 2026-08-22
 
 A run on the Windows box finishes, and the answer says the image is at
-`http://100.86.199.90:8189/view?filename=ComfyUI_00013_.png&type=output`. That
+`http://198.51.100.10:8189/view?filename=ComfyUI_00013_.png&type=output`. That
 is a true statement and a useless one: the caller is a model on this Mac, it
 cannot reach that tailnet address itself, and the file it just asked for is on
 a machine it will never touch. `outputs.local_paths` is `{}`, honestly, because
@@ -26,9 +26,9 @@ Behavioural claims below were executed on **2026-08-22** against the installed
 `comfy`; source claims were read at this repo's working tree at `e87ffd1`.
 
 ```
-installed : /Users/lawls/.local/bin/comfy
+installed : ~/.local/bin/comfy
 ffmpeg    : /opt/homebrew/bin/ffmpeg, /opt/homebrew/bin/ffprobe (both present)
-hosts     : default 127.0.0.1:8188 (down), xinde-win-64 100.86.199.90:8189 (down)
+hosts     : default 127.0.0.1:8188 (down), rtx-video 198.51.100.10:8189 (down)
 ```
 
 Neither ComfyUI answered during this design pass, so **nothing here is claimed
@@ -477,7 +477,7 @@ Still unmeasured, and needing a live host:
 
 ## 8. Success criteria
 
-- A run on `xinde-win-64` returns `outputs.fetched` with a path under
+- A run on `rtx-video` returns `outputs.fetched` with a path under
   `~/.cache/mcp-comfyui/fetched/<prompt_id>/`, with no argument passed.
 - A local run's `outputs` is unchanged.
 - An artifact past the ceiling appears in `not_fetched` with its size and the

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createdWorkflowDir, DEFAULT_WORKFLOW_DIR, workflowRoots } from "../src/config.ts";
 import {
@@ -547,7 +547,12 @@ test("the default root is the user's ComfyUI workflow directory", () => {
   // config.test.ts for that guarantee in isolation; here it is just accounted
   // for, never reordered away.
   expect(workflowRoots({})).toEqual([DEFAULT_WORKFLOW_DIR, createdWorkflowDir({})]);
-  expect(DEFAULT_WORKFLOW_DIR).toBe("/Users/lawls/ComfyUI-Shared/user/default/workflows");
+  // Under THIS user's home, whoever runs the suite — not a literal path with a
+  // developer's username baked into it, which is what this used to assert and
+  // what shipped that username to a public registry. Pinned as a suffix so the
+  // shape stays fixed while the prefix follows `homedir()`.
+  expect(DEFAULT_WORKFLOW_DIR.startsWith(homedir())).toBe(true);
+  expect(DEFAULT_WORKFLOW_DIR).toBe(join(homedir(), "ComfyUI-Shared", "user", "default", "workflows"));
 });
 
 test("MCP_COMFYUI_WORKFLOW_DIRS overrides the default", () => {

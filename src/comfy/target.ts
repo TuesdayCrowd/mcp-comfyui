@@ -73,7 +73,7 @@ export interface Address {
 }
 
 /**
- * An address a caller wrote by hand — `100.86.199.90:8189`, `[::1]:8189`,
+ * An address a caller wrote by hand — `198.51.100.10:8189`, `[::1]:8189`,
  * `localhost` — or `null` when the text is not one.
  *
  * ## Why a bare hostname is *not* an address
@@ -93,7 +93,7 @@ export interface Address {
  * (`[::1]:8189`), because `::1:8189` is itself a valid IPv6 address and nothing
  * can tell the two readings apart.
  *
- * A missing port means {@link DEFAULT_PORT}, so `100.86.199.90` reaches 8188 —
+ * A missing port means {@link DEFAULT_PORT}, so `198.51.100.10` reaches 8188 —
  * the same default every other entry point here applies.
  */
 export function parseAddress(text: string): Address | null {

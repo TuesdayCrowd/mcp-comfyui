@@ -13,7 +13,7 @@ Tailscale — chosen per call.
 
 ## Why now
 
-A session asked this server to list the workflows at `http://100.86.199.90:8189/`.
+A session asked this server to list the workflows at `http://198.51.100.10:8189/`.
 It could not. `comfy_status` reported `127.0.0.1:8188`, because `toolConfig(env)`
 runs once (`src/tools.ts:113`, called from `src/server.ts:50`) and every handler
 closes over that frozen `{host, port}` pair (`src/tools.ts:85-89`) for the life of
@@ -31,7 +31,7 @@ in `comfy run --help`, `comfy workflow slots --help`, `comfy workflow set-slot
 unlike `--json` and `--skip-prompt`, which precede it (non-negotiable #4). Both
 orderings now appear in one argv.
 
-`comfy --json jobs ls --host 100.86.199.90 --port 8189 --limit 3` returned three
+`comfy --json jobs ls --host 198.51.100.10 --port 8189 --limit 3` returned three
 jobs from the remote box. A control against a black-holed address,
 `--host 10.255.254.1`, hung until `timeout 15` killed it, proving the flag drives a
 real outbound call rather than being ignored.
@@ -44,17 +44,17 @@ and never will be from here.
 `[outputs, prompt_id, queue_position, status, updated_at, where, workflow_path,
 workflow_size]`. The `host` and `port` in the envelope's `data` echo the flag
 passed on the command line: with no flag, `jobs ls` reports `127.0.0.1:8188`; with
-`--host 100.86.199.90`, it reports that instead, over the same 39 records.
+`--host 198.51.100.10`, it reports that instead, over the same 39 records.
 
 **Asking the wrong host about a real job answers `prompt_not_found`.**
-`comfy --json jobs status 25e9540a-… --host 100.86.199.90 --port 8189` returned
+`comfy --json jobs status 25e9540a-… --host 198.51.100.10 --port 8189` returned
 that error confidently. The job is real; this server submitted it against local
 `8188`, and its `workflow_path` still points at a `mcp-comfyui-apply-<uuid>` temp
 directory. A wrong guess is indistinguishable from a missing job.
 
 **`jobs cancel` short-circuits on comfy-cli's own local records.** It returns
 `no local job with id '…'`, where `jobs status` returns `No prompt with id '…' on
-100.86.199.90:8189`. Two different failures, and a caller must not confuse them.
+198.51.100.10:8189`. Two different failures, and a caller must not confuse them.
 
 **ComfyUI's userdata API streams raw file bytes.** `GET /api/userdata/<file>` on
 the remote returned exactly the 126 bytes the listing declared, preserving four
@@ -62,7 +62,7 @@ Windows `\r\n` sequences and the original indentation. A JSON round-trip on the
 server could preserve neither. A remote workflow can therefore be fetched
 byte-exactly, and landmine #1's 2^64−1 seed survives the transfer.
 
-**The remote at `100.86.199.90:8189` holds no saved workflows.** Both
+**The remote at `198.51.100.10:8189` holds no saved workflows.** Both
 `/api/userdata?dir=workflows&recurse=true` and the v2 endpoint returned `[]`, while
 the same request against a running local instance returned a non-empty list. Its
 `comfy.settings.json` is 126 bytes. It is a fresh install.
@@ -78,7 +78,7 @@ RTX box's model lists could never have contaminated the Mac's.
 `detectInstance` against the target address (`:850`) — then spawns `comfy launch`
 locally and unconditionally (`:855`). Nothing asks whether `target.host` is this
 machine. Point the server at a sleeping remote and it probes the remote, starts a
-local ComfyUI on `8188`, polls `100.86.199.90:8189` until the budget expires,
+local ComfyUI on `8188`, polls `198.51.100.10:8189` until the budget expires,
 throws `LaunchTimeoutError`, and leaves the local process running — `--background`
 detached it already.
 
@@ -166,7 +166,7 @@ handler resolves its target when it runs.
       "note": "Desktop, MPS 48GB"
     },
     "rtx-video": {
-      "host": "100.86.199.90", "port": 8189,
+      "host": "198.51.100.10", "port": 8189,
       "auto_launch": false,
       "note": "Windows, RTX 4070 12GB, video"
     }
@@ -207,10 +207,10 @@ load, when nobody is watching.
 
 ## Running a workflow that exists only on a remote
 
-1. Resolve `"rtx-video"` to `Target{100.86.199.90, 8189}`.
+1. Resolve `"rtx-video"` to `Target{198.51.100.10, 8189}`.
 2. `GET /api/userdata/workflows%2Fx.json` — raw bytes.
 3. Write those bytes into the existing `mcp-comfyui-apply-<uuid>/` temp directory.
-4. `comfy --json workflow set-slot <file> --host 100.86.199.90 --port 8189 …`
+4. `comfy --json workflow set-slot <file> --host 198.51.100.10 --port 8189 …`
 5. `comfy --json run <file> --host … --port … --wait`, decoded line by line.
 6. Drop the `prompt_preview` graph before any `JSON.parse` (landmines #1 and #12).
 7. Record `prompt_id → rtx-video` in the ledger.
@@ -240,7 +240,7 @@ the repair call. When both fail, `registry_invalid` carries line, column, and th
 offending text.
 
 Malformed and invalid stay separate. A trailing comma is malformed: the intent is
-unambiguous and a machine can fix it. `auto_launch: true` on `100.86.199.90` is
+unambiguous and a machine can fix it. `auto_launch: true` on `198.51.100.10` is
 well-formed JSON that is invalid for this server, and fixing it means deciding what
 the operator meant. One repair path must never silently change routing.
 

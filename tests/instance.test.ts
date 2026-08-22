@@ -37,11 +37,11 @@ const SYSTEM_STATS = {
       "ComfyUI/main.py",
       "--enable-manager",
       "--extra-model-paths-config",
-      "/Users/lawls/Library/Application Support/ComfyUI/shared_model_paths.yaml",
+      "/Users/you/Library/Application Support/ComfyUI/shared_model_paths.yaml",
       "--input-directory",
-      "/Users/lawls/ComfyUI-Shared/input",
+      "/Users/you/ComfyUI-Shared/input",
       "--output-directory",
-      "/Users/lawls/ComfyUI-Shared/output",
+      "/Users/you/ComfyUI-Shared/output",
     ],
   },
   devices: [
@@ -404,8 +404,8 @@ test("the output and input directories are recovered from argv", async () => {
   const port = serve();
   const detection = running(await detectInstance({ port }));
 
-  expect(detection.outputDirectory).toBe("/Users/lawls/ComfyUI-Shared/output");
-  expect(detection.inputDirectory).toBe("/Users/lawls/ComfyUI-Shared/input");
+  expect(detection.outputDirectory).toBe("/Users/you/ComfyUI-Shared/output");
+  expect(detection.inputDirectory).toBe("/Users/you/ComfyUI-Shared/input");
 });
 
 test("the --flag=value spelling of a directory argument is recovered too", async () => {
@@ -933,11 +933,11 @@ test("a configured workspace is a root flag, before the subcommand", async () =>
   const port = serveReadyAfter(1);
   const argvOut = armCli("launch");
 
-  await launchInstance({ port, workspace: "/Users/lawls/ComfyUI-Installs/ComfyUI/ComfyUI", pollIntervalMs: 10 });
+  await launchInstance({ port, workspace: "/Users/you/ComfyUI-Installs/ComfyUI/ComfyUI", pollIntervalMs: 10 });
 
   const argv = await argvOf(argvOut);
   expect(argv).toContain("--workspace");
-  expect(argv[argv.indexOf("--workspace") + 1]).toBe("/Users/lawls/ComfyUI-Installs/ComfyUI/ComfyUI");
+  expect(argv[argv.indexOf("--workspace") + 1]).toBe("/Users/you/ComfyUI-Installs/ComfyUI/ComfyUI");
   expect(argv.indexOf("--workspace")).toBeLessThan(argv.indexOf("launch"));
   expect(argv[0]).toBe("--skip-prompt");
 });

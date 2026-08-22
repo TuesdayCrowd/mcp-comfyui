@@ -138,7 +138,7 @@ function jobRow(over: Record<string, unknown> = {}): Record<string, unknown> {
     workflow_size: 12,
     outputs: 0,
     where: "local",
-    workflow_path: "/Users/lawls/ComfyUI-Shared/user/default/workflows/flow.json",
+    workflow_path: "/Users/you/ComfyUI-Shared/user/default/workflows/flow.json",
     updated_at: "2026-08-02T12:00:00",
     ...over,
   };
@@ -356,7 +356,7 @@ test("a job this server submitted reports no workflow path, because its copy is 
   // returns. Reporting it would name a UUID directory that no longer exists and
   // invite a caller to open it; the run's own `source` is the real answer.
   const temp = join(tmpdir(), "mcp-comfyui-apply-5ae64eed-0000-4000-8000-000000000000", "flow.json");
-  const mine = "/Users/lawls/ComfyUI-Shared/user/default/workflows/flow.json";
+  const mine = "/Users/you/ComfyUI-Shared/user/default/workflows/flow.json";
   serve(
     "ls",
     listing([

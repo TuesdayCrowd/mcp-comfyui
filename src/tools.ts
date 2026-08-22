@@ -1269,7 +1269,7 @@ const hostArgument = z
   .optional()
   .describe(
     "Which ComfyUI to use: a `name` from list_hosts (e.g. \"rtx-video\"), or an address such as " +
-      "\"100.86.199.90:8189\". Omit it to use the default host. A name wins over an address " +
+      "\"198.51.100.10:8189\". Omit it to use the default host. A name wins over an address " +
       "spelled the same way. An address must carry an explicit port unless it is an IP literal " +
       "or localhost — a bare word with no port is reported as an unknown host name, with the " +
       "names that would have worked, rather than looked up as a hostname and reported " +
@@ -2130,7 +2130,7 @@ function registerManageHosts(server: McpServer, config: ToolConfig): void {
           .min(1)
           .optional()
           .describe(
-            "The address to connect to, e.g. \"127.0.0.1\" or \"100.86.199.90\". Required for " +
+            "The address to connect to, e.g. \"127.0.0.1\" or \"198.51.100.10\". Required for " +
               "`add`. A wildcard bind address such as 0.0.0.0 is rewritten to loopback, because " +
               "it is where a server listens and not somewhere anything can connect.",
           ),

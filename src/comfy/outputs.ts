@@ -105,7 +105,7 @@ export interface ArtifactLocation {
  * comfy-cli already tries (`execution.py:352-371`) and cannot succeed here. It
  * resolves against the **workspace's** output directory, and this machine's
  * running ComfyUI is Desktop-managed: it writes to
- * `/Users/lawls/ComfyUI-Shared/output` while any workspace's own output
+ * `~/ComfyUI-Shared/output` while any workspace's own output
  * directory is `<install>/output`. Two genuinely different directories, so
  * `comfy --workspace <install> run … --json` returns a URL no matter what the
  * workspace is set to. This resolves against the directory the instance that
@@ -121,7 +121,7 @@ export interface ArtifactLocation {
  *   sharing a layout — `/home/me/ComfyUI/output` on both — would therefore hand
  *   back a local path naming a completely different image, or one that does not
  *   exist as far as the caller is concerned. Measured against the live remote,
- *   the accident that hides this is Windows: `F:\Dev\ComfyUI\output` is not
+ *   the accident that hides this is Windows: a path like `D:\ComfyUI\output` is not
  *   `isAbsolute` under POSIX, so the containment check below declines it for
  *   the wrong reason. `isLocalAddress` is the right one, and it is checked
  *   first. See `comfy/target.ts` for why it fails closed.

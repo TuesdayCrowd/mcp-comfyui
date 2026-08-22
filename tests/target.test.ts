@@ -115,9 +115,9 @@ test("isLocalAddress(100.86.199.77) — this machine's own Tailscale address is 
   expect(isLocalAddress("100.86.199.77", INTERFACES)).toBe(true);
 });
 
-test("isLocalAddress(100.86.199.90) — another box on the same tailnet is NOT this machine", () => {
+test("isLocalAddress(198.51.100.10) — another box on the same tailnet is NOT this machine", () => {
   // The measured RTX host. Launching for this address is the defect being closed.
-  expect(isLocalAddress("100.86.199.90", INTERFACES)).toBe(false);
+  expect(isLocalAddress("198.51.100.10", INTERFACES)).toBe(false);
 });
 
 test("isLocalAddress(fe80::1c3f:5aff:fe22:1%en0) — a zone suffix names an interface, not a host", () => {

@@ -150,7 +150,7 @@ const SYSTEM_STATS = {
   system: {
     comfyui_version: "0.29.0",
     deploy_environment: "local-desktop2-standalone",
-    argv: ["ComfyUI/main.py", "--output-directory", "/Users/lawls/ComfyUI-Shared/output"],
+    argv: ["ComfyUI/main.py", "--output-directory", "/Users/you/ComfyUI-Shared/output"],
   },
   devices: [{ name: "mps", type: "mps", vram_total: 51539607552, vram_free: 11458723840 }],
 };
@@ -523,7 +523,7 @@ function completedPayload(over: Record<string, unknown> = {}): Record<string, un
     status: "completed",
     prompt_id: PROMPT_ID,
     outputs: [
-      "/Users/lawls/ComfyUI/output/banana_00001_.png",
+      "/Users/you/ComfyUI/output/banana_00001_.png",
       "http://127.0.0.1:8188/view?filename=b.png",
     ],
     elapsed_seconds: 4.25,
@@ -828,7 +828,7 @@ test("comfy_status reports a running instance", async () => {
   expect(body["running"]).toBe(true);
   expect(body["version"]).toBe("0.29.0");
   expect(body["desktop_managed"]).toBe(true);
-  expect(body["output_directory"]).toBe("/Users/lawls/ComfyUI-Shared/output");
+  expect(body["output_directory"]).toBe("/Users/you/ComfyUI-Shared/output");
   expect(body["devices"]).toEqual([
     { name: "mps", type: "mps", vram_total: 51539607552, vram_free: 11458723840 },
   ]);
@@ -1272,7 +1272,7 @@ test("run_workflow blocks and reports classified outputs when asked to wait", as
   expect(body["terminal"]).toBe(true);
   expect(body["elapsed_seconds"]).toBe(4.25);
   expect(body["outputs"]).toEqual({
-    files: ["/Users/lawls/ComfyUI/output/banana_00001_.png"],
+    files: ["/Users/you/ComfyUI/output/banana_00001_.png"],
     urls: ["http://127.0.0.1:8188/view?filename=b.png"],
     // Port 8188 is not the instance these tests talk to, so nothing resolves.
     local_paths: {},
@@ -2769,7 +2769,7 @@ test("the configured workspace reaches comfy launch as a root flag", async () =>
   writeWorkflow("flow");
   launchable(2);
   const log = cliLog();
-  process.env.MCP_COMFYUI_WORKSPACE = "/Users/lawls/ComfyUI-Installs/ComfyUI/ComfyUI";
+  process.env.MCP_COMFYUI_WORKSPACE = "/Users/you/ComfyUI-Installs/ComfyUI/ComfyUI";
   serveStream(`${envelopeLine(queuedPayload())}\n`);
 
   await ok(await connect(), "run_workflow", { workflow: "flow" });

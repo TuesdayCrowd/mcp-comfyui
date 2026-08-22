@@ -123,7 +123,7 @@ To name several, write `~/.config/mcp-comfyui/hosts.json`:
   "hosts": {
     "mac-local": { "host": "127.0.0.1", "port": 8188, "auto_launch": true,
                    "note": "Desktop, MPS 48GB" },
-    "rtx-video": { "host": "100.86.199.90", "port": 8189, "auto_launch": false,
+    "rtx-video": { "host": "198.51.100.10", "port": 8189, "auto_launch": false,
                    "note": "Windows, RTX 4070 12GB, video" }
   }
 }
@@ -131,7 +131,7 @@ To name several, write `~/.config/mcp-comfyui/hosts.json`:
 
 Then `describe_workflow {workflow: "portrait", host: "rtx-video"}` describes that workflow against *that* box's installed models, and `run_workflow` runs it there. `list_hosts` reports the registry; `manage_hosts` edits it, backing the old file up to `hosts.json.bak-<timestamp>` first. Keys the server doesn't recognise survive every rewrite.
 
-A `host` may also be a raw address — `100.86.199.90:8189` — which needs no registry entry. It has to carry an explicit port unless it's an IP literal or `localhost`: a bare word with no port is reported as an unknown *host name*, with the names that would have worked, because otherwise a mistyped `rtx-video` becomes a DNS lookup and comes back as "unreachable".
+A `host` may also be a raw address — `198.51.100.10:8189` — which needs no registry entry. It has to carry an explicit port unless it's an IP literal or `localhost`: a bare word with no port is reported as an unknown *host name*, with the names that would have worked, because otherwise a mistyped `rtx-video` becomes a DNS lookup and comes back as "unreachable".
 
 **Workflows come from two places.** Your local library (the directories `MCP_COMFYUI_WORKFLOW_DIRS` names) can be run on any host — that is the ordinary case, and what `{workflow: "portrait", host: "rtx-video"}` means. A host's *own* saved workflows are listed too when you pass `host` to `list_workflows`, tagged `remote:<name>` and named `rtx-video/portrait`; running one fetches its exact bytes over ComfyUI's userdata API and hands them to `comfy` unparsed, so a 2^64−1 seed survives the trip.
 
