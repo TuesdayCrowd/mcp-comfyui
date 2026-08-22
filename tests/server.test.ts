@@ -2981,7 +2981,13 @@ test("a remote host's artifacts are never reported as files on this machine", as
 
   const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
 
-  expect(body["outputs"]).toEqual({ files: [], urls: [url], local_paths: {} });
+  // `toMatchObject`, not `toEqual`: auto-fetch now adds sibling keys for a
+  // remote host (here it skips, because REMOTE_ADDRESS answers nothing). The
+  // assertion that matters is untouched — `local_paths` stays EMPTY, because a
+  // copy in this server's cache is not the instance's own file, and that is
+  // what kills the `isLocalAddress` mutant this test exists for. Do not
+  // "tidy" this back to an exact match by deleting local_paths.
+  expect(body["outputs"]).toMatchObject({ files: [], urls: [url], local_paths: {} });
   expect(body["host_source"]).toBe("only");
 });
 
@@ -3334,6 +3340,185 @@ test("an artifact that will not come across is reported without denying the othe
   const outputs = body["outputs"] as Record<string, unknown>;
   expect(Object.keys(outputs["fetched"] as Record<string, string>)).toEqual([good]);
   expect((outputs["fetch_problems"] as Record<string, unknown>[])[0]).toMatchObject({ url: gone });
+});
+
+/**
+ * A completed job on `host`, whose outputs are exactly `urls`. The CLI is
+ * faked, so no ComfyUI is contacted to learn this.
+ */
+function completedJobWith(urls: string[]): void {
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: PROMPT_ID, status: "completed", outputs: urls }));
+  process.env.FAKE_COMFY_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+}
+
+/** The registry pointed at a host that is not this machine. */
+function remoteHost(): void {
+  writeHosts({ default: "far", hosts: { far: { host: REMOTE_ADDRESS, port: 8189 } } });
+}
+
+test("a REMOTE run's artifacts are copied here without being asked for", async () => {
+  // The whole feature. A run on another box reports a /view URL this caller
+  // cannot reach, and `local_paths` is empty because there is honestly nothing
+  // here to name. Now there is a copy, and a path to it.
+  //
+  // The registered host is REMOTE_ADDRESS so `resolved.local` is false, while
+  // the artifact URL points at a loopback fixture. That split is forced: the
+  // suite can serve only loopback, and every address it can serve on is local,
+  // so a host that is both remote and reachable cannot be built here. It is
+  // also why the probe keys on the URL's own authority — the address the fetch
+  // will actually use — rather than on the registry entry.
+  //
+  // Mutant: gate auto-fetch on `instance === null` instead of `host.local`.
+  // Passes here; dies in the LOCAL sibling below.
+  const outputDir = makeDir("comfy-output");
+  const port = serveArtifactInstance(outputDir, { "made_00001_.png": "png bytes" });
+  const url = viewUrl(port, { filename: "made_00001_.png", subfolder: "", type: "output" });
+  remoteHost();
+  completedJobWith([url]);
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, host: "far" });
+
+  const outputs = body["outputs"] as Record<string, Record<string, string>>;
+  const landed = outputs["fetched"]?.[url] as string;
+  expect(landed).toContain(PROMPT_ID);
+  expect(readFileSync(landed, "utf8")).toBe("png bytes");
+  // Still no local path: what is here is a COPY, while `local_paths` means the
+  // instance's own file, which remains on the other machine.
+  expect(outputs["local_paths"]).toEqual({});
+});
+
+test("a LOCAL run is untouched by automatic fetching", async () => {
+  // Auto-fetch is for artifacts that are not already here. A local instance
+  // this server merely could not probe still has its files on this disk, and
+  // asking a ComfyUI that is not answering to send them back would be both
+  // pointless and a new way to fail.
+  //
+  // Mutant: gate on `instance === null` rather than `host.local`. This test
+  // dies — `instance` is null here (nothing is listening on `deadPort`) while
+  // the host IS local, so the mutant starts fetching and the keys appear.
+  const url = viewUrl(deadPort, { filename: "made_00001_.png", subfolder: "", type: "output" });
+  completedJobWith([url]);
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID });
+
+  const outputs = body["outputs"] as Record<string, unknown>;
+  // Absent, not empty: nothing was attempted.
+  expect(outputs["fetched"]).toBeUndefined();
+  expect(outputs["fetch_problems"]).toBeUndefined();
+  expect(outputs["not_fetched"]).toBeUndefined();
+});
+
+test("an artifact past the auto ceiling is disclosed, not silently missing", async () => {
+  // `not_fetched` answers "why is there no path for this one", and names the
+  // override. Without it a caller sees an artifact in `urls`, no entry in
+  // `fetched`, and no way to tell a policy from a bug.
+  //
+  // 17 MiB is past AUTO_FETCH_MAX_BYTES and is never transferred: the
+  // content-length pre-check declines it before a byte moves.
+  //
+  // Mutant: drop the `not_fetched` spread from `outputsBody`. Dies here.
+  const outputDir = makeDir("comfy-output");
+  const huge = "x".repeat(17 * 1024 * 1024);
+  const port = serveArtifactInstance(outputDir, { "big.mp4": huge });
+  const url = viewUrl(port, { filename: "big.mp4", subfolder: "", type: "output" });
+  remoteHost();
+  completedJobWith([url]);
+
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, host: "far" });
+
+  const outputs = body["outputs"] as Record<string, unknown>;
+  const skipped = outputs["not_fetched"] as Array<Record<string, string>>;
+  expect(skipped).toHaveLength(1);
+  expect(skipped[0]?.url).toBe(url);
+  expect(skipped[0]?.reason).toContain("fetch_outputs");
+  // A skip is not a failure, and the location is still reported either way.
+  expect(outputs["fetch_problems"]).toEqual([]);
+  expect(outputs["urls"]).toEqual([url]);
+});
+
+test("fetch_outputs true ignores the auto ceiling", async () => {
+  // The explicit ask is what gets you the video. Same fixture as above, one
+  // argument different.
+  //
+  // Mutant: apply AUTO_FETCH_MAX_BYTES to the explicit path too. Dies here.
+  const outputDir = makeDir("comfy-output");
+  const huge = "x".repeat(17 * 1024 * 1024);
+  const port = serveArtifactInstance(outputDir, { "big.mp4": huge });
+  const url = viewUrl(port, { filename: "big.mp4", subfolder: "", type: "output" });
+  remoteHost();
+  completedJobWith([url]);
+
+  const body = await ok(await connect(), "get_job", {
+    prompt_id: PROMPT_ID,
+    host: "far",
+    fetch_outputs: true,
+  });
+
+  const outputs = body["outputs"] as Record<string, Record<string, string>>;
+  expect(outputs["fetched"]?.[url]).toBeDefined();
+  expect(outputs["not_fetched"]).toBeUndefined();
+});
+
+test("a remote that does not answer is skipped in seconds, not minutes", async () => {
+  // The defect this feature nearly shipped with. Measured 2026-08-22: a fetch
+  // to an unroutable address NEVER fails on its own — it ran a full 30s and
+  // stopped only because the probe aborted it — so at `fetchOutputs.ts`'s 300s
+  // default this would have stalled `get_job` for five minutes on a copy
+  // nobody asked for. NOTES_TIMEOUT_MS' lesson, one module over.
+  //
+  // Mutant: delete the probe from `fetchIfAsked`. The reason text changes from
+  // the probe's verdict to a transport error, and the call slows to
+  // AUTO_FETCH_TIMEOUT_MS.
+  const url = viewUrl(deadPort, { filename: "made_00001_.png", subfolder: "", type: "output" });
+  remoteHost();
+  completedJobWith([url]);
+
+  const started = Date.now();
+  const body = await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, host: "far" });
+  const elapsed = Date.now() - started;
+
+  const outputs = body["outputs"] as Record<string, unknown>;
+  const skipped = outputs["not_fetched"] as Array<Record<string, string>>;
+  expect(skipped?.[0]?.reason).toContain("did not answer");
+  expect(Object.keys(outputs["fetched"] as Record<string, string>)).toEqual([]);
+  // Deliberately generous: a tight budget assertion is a flake, and the claim
+  // being pinned is minutes-versus-seconds, not a precise figure.
+  expect(elapsed).toBeLessThan(20_000);
+});
+
+test("polling a completed job twice downloads its artifacts once", async () => {
+  // The idempotence criterion at the layer that motivates it. `get_job` on a
+  // completed job is callable any number of times, and auto-fetch is what
+  // would otherwise make each poll a fresh download.
+  //
+  // Mutant: remove the `stat` reuse from `fetchOne`. Dies on views === 2.
+  const outputDir = makeDir("comfy-output");
+  let views = 0;
+  const bound = denoServe((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/system_stats") {
+      const argv = ["ComfyUI/main.py", "--output-directory", outputDir];
+      return new Response(JSON.stringify({ ...SYSTEM_STATS, system: { ...SYSTEM_STATS.system, argv } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname === "/view") {
+      views += 1;
+      return new Response("png bytes", { headers: { "content-type": "image/png" } });
+    }
+    return new Response("nf", { status: 404 });
+  });
+  servers.push(bound);
+  const url = viewUrl(portOf(bound), { filename: "made_00001_.png", subfolder: "", type: "output" });
+  remoteHost();
+  completedJobWith([url]);
+
+  await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, host: "far" });
+  await ok(await connect(), "get_job", { prompt_id: PROMPT_ID, host: "far" });
+
+  expect(views).toBe(1);
 });
 
 test("manage_hosts adds a host, backs the file up, and reports what the next call will see", async () => {

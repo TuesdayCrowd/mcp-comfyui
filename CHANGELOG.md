@@ -8,6 +8,38 @@ All notable changes to this project are recorded here. The format follows
 
 ### Added
 
+- **A run on another host now has its images copied here automatically**, so every
+  artifact a caller is told about has a location on this disk. A remote run's
+  `/view` URLs resolve to no local path — correctly, since the file is on the other
+  machine — which left the caller holding an address it usually cannot reach.
+  Artifacts up to **16 MiB** each are now copied to
+  `~/.cache/mcp-comfyui/fetched/<prompt_id>/` and reported as absolute paths under
+  `outputs.fetched`, with no argument passed. The ceiling is measured, not chosen
+  for comfort: a 2048×2048 PNG of random noise — the worst case for PNG, so an
+  upper bound on a real render — is 11.8 MB, so 16 MiB takes any still image and
+  never a video. Anything past it is listed in `outputs.not_fetched` with its size
+  and the argument that overrides it, because a deliberate skip is not a failure
+  and does not belong in `fetch_problems`. A local run is unaffected: its `outputs`
+  is byte-identical to before.
+
+  Two bounds keep this from ever holding an answer hostage. A remote is **probed
+  first**, once per call, and skipped with `the host did not answer` if it is not
+  there; and the transfer itself is capped at 60 s rather than the 300 s an
+  explicit fetch gets. Both exist because of a measurement: a fetch to an
+  unroutable address *never fails on its own* — it ran a full 30 s and stopped only
+  when the caller aborted it — so without them a sleeping remote would have stalled
+  `get_job` for five minutes over a copy nobody asked for.
+
+### Changed
+
+- **`fetch_outputs: true` now means "ignore the ceiling"** rather than "fetch at
+  all". Every existing call keeps working and keeps getting everything, including
+  the 200 MB video; what changed is that callers who pass nothing now get their
+  images too.
+- **Fetching the same artifact twice downloads it once.** `get_job` on a completed
+  job is callable any number of times, and with copying automatic that would
+  otherwise make each poll a fresh download.
+
 - **`describe_workflow` reports `notes_count`, the workflow's true note total.**
   `notes_truncated: true` said something had been left out and gave no way to
   learn how much; the pre-cap total was computed and then dropped on the floor.

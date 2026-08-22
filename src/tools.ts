@@ -22,6 +22,7 @@ import {
   type TemplateFilters,
 } from "./comfy/templates.ts";
 import {
+  artifactOrigin,
   resolveArtifactPaths,
   type ArtifactLocation,
   type ClassifiedOutputs,
@@ -131,6 +132,41 @@ const MAX_TIMEOUT_SECONDS = 1_800;
  * `notes_unreadable` instead of stalling the tool.
  */
 const NOTES_TIMEOUT_MS = 15_000;
+
+/**
+ * The largest artifact copied here WITHOUT the caller asking.
+ *
+ * Sized against what artifacts are, measured 2026-08-22: a 2048x2048 PNG of
+ * random noise — the worst case for PNG compression, and so an upper bound on
+ * a real render of that size — is 11.8 MB, and a 1024x1024 one is 3.0 MB. So
+ * 16 MiB copies any still image, including an oversized one, and never a
+ * video, whose files run to hundreds of megabytes.
+ *
+ * That split is the point. Seeing the picture you just generated should be
+ * free; moving a video across a tailnet should require saying so, which is
+ * what `fetch_outputs` is for. `fetchOutputs.ts`'s own 1 GiB cap stays
+ * underneath as the absolute bound on any fetch.
+ */
+const AUTO_FETCH_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Budget for one automatic artifact copy, and deliberately far shorter than
+ * `fetchOutputs.ts`'s 300s default.
+ *
+ * The probe in {@link fetchIfAsked} catches a host that is not there at all;
+ * this catches one that answers and then stalls mid-body, which would
+ * otherwise reinstate the same hang one layer down. Measured 2026-08-22: a
+ * fetch to an unroutable address never fails on its own — it ran a full 30s
+ * and stopped only because the caller aborted it — so at the 300s default a
+ * sleeping remote would have held `get_job` for five minutes over a copy
+ * nobody asked for.
+ *
+ * Same reasoning as {@link NOTES_TIMEOUT_MS}: a convenience issued beside a
+ * load-bearing answer must not be able to hold it for the default budget. 60s
+ * is ample for a 16 MiB ceiling over a tailnet and caps the pathological case
+ * at a minute.
+ */
+const AUTO_FETCH_TIMEOUT_MS = 60_000;
 
 const MIN_PORT = 1;
 const MAX_PORT = 65535;
@@ -747,6 +783,20 @@ function outputsBody(
           fetch_problems: fetched.flatMap((one) =>
             one.outcome === "failed" ? [{ url: one.url, problem: one.problem }] : []
           ),
+          // Absent when nothing was skipped, on the structural-absence rule
+          // `local_paths` and `notes_count` already follow. A skip is not a
+          // failure and does not belong in `fetch_problems`: the caller's next
+          // move is `fetch_outputs: true`, not a bug report — so the reason
+          // says so rather than leaving them to infer it.
+          ...(fetched.some((one) => one.outcome === "skipped")
+            ? {
+              not_fetched: fetched.flatMap((one) =>
+                one.outcome === "skipped"
+                  ? [{ url: one.url, reason: `${one.reason}; pass fetch_outputs: true to copy it anyway` }]
+                  : []
+              ),
+            }
+            : {}),
         }),
   };
 }
@@ -763,12 +813,41 @@ async function fetchIfAsked(
   urls: readonly string[],
   promptId: string | null,
   config: ToolConfig,
-  wanted: boolean,
+  host: ResolvedHost,
+  explicit: boolean,
 ): Promise<FetchedArtifact[] | null> {
-  if (!wanted) return null;
-  if (urls.length === 0 || promptId === null) return [];
+  // Nothing to bring: the files are already on this machine. Gated on the
+  // HOST's locality rather than on whether a local path resolved, because
+  // those differ — `resolvingInstance` returns null both for a remote host and
+  // for a local one this server could not probe, and in the second case the
+  // files really are on this disk. Fetching them would mean asking a ComfyUI
+  // that is not answering for bytes that are already here.
+  if (!explicit && host.local) return null;
+  // `[]` for an explicit ask means "attempted, none came across"; `null` for
+  // the automatic path means "never attempted", which is what keeps a local
+  // run's `outputs` byte-identical to what it was before this existed.
+  if (urls.length === 0 || promptId === null) return explicit ? [] : null;
+
+  if (!explicit) {
+    // Ask the cheap question first. Measured: a fetch to an unroutable address
+    // never fails on its own, so without this a sleeping remote holds the
+    // answer for the full budget. Bounded, and issued once per call rather
+    // than once per artifact.
+    //
+    // The URL's own authority, not `host`: `fetchArtifacts` requests the URL
+    // exactly as reported, so that is the address whose reachability decides
+    // the outcome. The same machine in every real configuration, and the
+    // consistent choice when it is not.
+    const origin = urls[0] === undefined ? null : artifactOrigin(urls[0]);
+    const reachable = origin !== null && (await detectInstance(origin)).running;
+    if (!reachable) {
+      return urls.map((url) => ({ url, outcome: "skipped" as const, reason: "the host did not answer" }));
+    }
+  }
+
   return await fetchArtifacts(urls, {
     destination: join(cacheRoot(config.cacheDir), "fetched", promptId),
+    ...(explicit ? {} : { maxBytes: AUTO_FETCH_MAX_BYTES, timeoutMs: AUTO_FETCH_TIMEOUT_MS }),
   });
 }
 
@@ -777,11 +856,12 @@ const fetchOutputsArgument = z
   .boolean()
   .default(false)
   .describe(
-    "Download the run's artifacts to this machine and report where they landed, under " +
-      "`outputs.fetched`. Off by default, and deliberately: a run on this machine already has " +
-      "its files here (`outputs.local_paths`), and a video workflow's outputs can be hundreds of " +
-      "megabytes to copy across a network. Turn it on for a run on another host whose images you " +
-      "actually want to open.",
+    "Copy this run's artifacts here even when they are large. A run on ANOTHER host already " +
+      "has its artifacts copied here automatically, up to 16 MiB each, reported as absolute " +
+      "paths under `outputs.fetched`; anything past that ceiling is listed in " +
+      "`outputs.not_fetched` with its size. This turns the ceiling off, which is what a video " +
+      "needs — its outputs can be hundreds of megabytes across a network. A run on this machine " +
+      "already has its files here (`outputs.local_paths`) and is unaffected unless you set this.",
   );
 
 /**
@@ -1759,7 +1839,9 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "To open a finished artifact: `outputs.files` are already paths on this machine, and " +
         "`outputs.local_paths` maps each URL in `outputs.urls` to the file it names here, where " +
         "that file exists. A URL missing from `local_paths` has no local path and must be " +
-        "fetched. " +
+        "fetched. A run on ANOTHER host has its artifacts copied here automatically when they " +
+        "are small enough, as absolute paths under `outputs.fetched`; anything skipped is listed " +
+        "in `outputs.not_fetched` with the reason and how to override it. " +
         "Pass `host` to run on a particular ComfyUI; the run is remembered against it, so a later " +
         "get_job or cancel_job for the returned `prompt_id` finds it without being told again. A " +
         "run on another machine writes its artifacts on that machine, so `local_paths` is empty " +
@@ -1918,7 +2000,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // exists to prevent.
         if (run.promptId !== null) recordJobHost(run.promptId, target);
 
-        const fetched = await fetchIfAsked(run.outputs.urls, run.promptId, config, fetch_outputs);
+        const fetched = await fetchIfAsked(run.outputs.urls, run.promptId, config, target, fetch_outputs);
         return {
           target: targetBody(target),
           ...runBody(resolved, prepared.applied, prepared.warnings, run, instance, fetched),
@@ -1938,7 +2020,10 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         "machine and can be opened directly; `outputs.urls` have to be fetched — but first look " +
         "each URL up in `outputs.local_paths`, which maps a URL to the file it names on this " +
         "machine when that file is really there. A URL missing from `local_paths` has no local " +
-        "path and must be fetched. A job started in the ComfyUI web interface can be polled here " +
+        "path and must be fetched. A run on ANOTHER host has its artifacts copied here " +
+        "automatically when they are small enough, as absolute paths under `outputs.fetched`; " +
+        "anything skipped is listed in `outputs.not_fetched` with the reason and how to override " +
+        "it. A job started in the ComfyUI web interface can be polled here " +
         "too — but only on the host that ran it, so name that host. " +
         "For a run this server submitted, the host is remembered and `host` can be omitted. " +
         "Asking the WRONG ComfyUI about a real job answers `prompt_not_found`, exactly as an id " +
@@ -1955,7 +2040,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
       toolAnswer(async () => {
         const decided = await decideJobTarget(config, prompt_id, host);
         const job = await getJobStatus(prompt_id, address(decided.target));
-        const fetched = await fetchIfAsked(job.outputs.urls, job.promptId, config, fetch_outputs);
+        const fetched = await fetchIfAsked(job.outputs.urls, job.promptId, config, decided.target, fetch_outputs);
         return {
           ...jobTargetBody(decided),
           ...jobBody(job, await resolvingInstance(job.outputs.urls, decided.target), fetched),
