@@ -149,6 +149,33 @@ test("something that is not an http URL is refused without a request", async () 
   expect(readdirSync(workdir)).toEqual([]);
 });
 
+test("an artifact already on disk is not downloaded again", async () => {
+  // `get_job` on a COMPLETED job is callable any number of times, and once
+  // fetching is automatic that makes ten polls ten downloads of bytes already
+  // here. Reuse is safe on two invariants this module already maintains: the
+  // destination is keyed by prompt_id AND filename, so an existing file is
+  // this artifact rather than a namesake; and a partial file never survives,
+  // because every failure path removes what it wrote — so anything on disk is
+  // a complete previous fetch.
+  //
+  // Mutant: delete the `stat` reuse. This test dies on requests === 2.
+  let requests = 0;
+  const port = serve(() => {
+    requests += 1;
+    return new Response("png bytes", { headers: { "content-type": "image/png" } });
+  });
+  const url = viewUrl(port, "made_00001_.png");
+
+  const first = await fetchArtifacts([url], { destination: workdir });
+  const second = await fetchArtifacts([url], { destination: workdir });
+
+  expect(requests).toBe(1);
+  expect(first[0]?.outcome).toBe("fetched");
+  expect(second[0]?.outcome).toBe("fetched");
+  expect((second[0] as { path: string }).path).toBe(join(workdir, "made_00001_.png"));
+  expect(readFileSync(join(workdir, "made_00001_.png"), "utf8")).toBe("png bytes");
+});
+
 test("an artifact larger than this call's ceiling is skipped before a byte is written", async () => {
   // The ceiling exists so an automatic fetch never drags a video across a
   // tailnet. Discovering the size by DOWNLOADING it would defeat that: the

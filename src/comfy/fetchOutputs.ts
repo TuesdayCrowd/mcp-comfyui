@@ -1,4 +1,4 @@
-import { mkdir, open, rm } from "node:fs/promises";
+import { mkdir, open, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { isArtifactUrl } from "./outputs.ts";
 
@@ -104,6 +104,15 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
   const name = artifactFilename(url);
   if (name === null) return failed("the URL names no filename this server would write");
   const path = join(opts.destination, name);
+
+  // Already here: hand it back without a request. Safe on two invariants this
+  // module maintains rather than assumes — a partial file never survives,
+  // because every failure path below removes what it wrote, so anything on
+  // disk is a COMPLETE previous fetch; and the destination is keyed by
+  // `prompt_id` as well as filename, so it is a previous fetch of THIS
+  // artifact and not of a namesake from another run.
+  const existing = await stat(path).catch(() => null);
+  if (existing !== null && existing.isFile()) return { url, outcome: "fetched", path };
 
   let response: Response;
   try {
