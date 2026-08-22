@@ -10,6 +10,14 @@
 
 **Spec:** `docs/plans/2026-08-22-artifact-local-paths-design.md` — read it first; this plan argues from it.
 
+## Status — 2026-08-22
+
+**Tasks 1-4 are COMPLETE.** `deno task test` → 156 passed (676 steps), 0 failed. `deno task typecheck` → 0 errors. `node scripts/build.mjs` → clean. Every mutant named below was constructed, confirmed to kill its test, and restored by checksum: four in `fetchOutputs.ts` (no-precheck, skip-as-failure, no-streaming-cap, no-reuse) and four in `tools.ts` (no-locality-gate, no-not-fetched, ceiling-on-explicit, no-probe).
+
+The `no-probe` run is worth keeping: the suite took **1m8s instead of 10s**, stopped by `AUTO_FETCH_TIMEOUT_MS` rather than by anything the remote did — the stall the probe exists to prevent, demonstrated rather than argued.
+
+**Task 5 (live verification) remains BLOCKED** on a host being up, and is the only thing outstanding. Do not delete this file until it is done and the work has merged.
+
 ## Global Constraints
 
 - **Never `git commit`.** GitButler only: `but commit -b <branch> -m "..." <ids>`. Never `but land`. PRs required.
