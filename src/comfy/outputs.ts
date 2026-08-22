@@ -176,6 +176,30 @@ export function resolveArtifactPath(
  * Safe to hand any artifact string: one already classified as a file is not a
  * URL, does not resolve, and is returned to nobody.
  */
+/**
+ * The address a `/view` URL names, or `null` if it names none.
+ *
+ * Here rather than at the call site for the reason this whole module exists:
+ * more than one place now has to agree about what an artifact URL points at,
+ * and a second copy of that rule is a bug nobody sees. `fetchOutputs.ts`
+ * requests the URL exactly as the CLI reported it, so **this** is the address
+ * whose reachability decides whether that request can succeed — not the host a
+ * caller happened to name, which is the same machine in every real
+ * configuration and is not the one being talked to when it is not.
+ *
+ * The port is resolved rather than left blank because a caller passing this to
+ * a prober needs one: an `http` URL with no port means 80, which
+ * {@link defaultPort} already encodes for `isSameInstance`.
+ */
+export function artifactOrigin(url: string): { host: string; port: number } | null {
+  const parsed = parseArtifactUrl(url);
+  if (parsed === null) return null;
+  return {
+    host: parsed.hostname,
+    port: parsed.port === "" ? defaultPort(parsed.protocol) : Number(parsed.port),
+  };
+}
+
 export function resolveArtifactPaths(
   artifacts: readonly string[],
   location: ArtifactLocation,

@@ -60,7 +60,7 @@ test("an artifact is written under the destination and reported by URL", async (
 
   const fetched = await fetchArtifacts([url], { destination: workdir });
 
-  expect(fetched).toEqual([{ url, path: join(workdir, "made_00001_.png"), problem: null }]);
+  expect(fetched).toEqual([{ url, outcome: "fetched", path: join(workdir, "made_00001_.png") }]);
   expect(readFileSync(join(workdir, "made_00001_.png"), "utf8")).toBe("png bytes");
 });
 
@@ -78,9 +78,9 @@ test("one artifact that will not come across does not deny the others", async ()
 
   const fetched = await fetchArtifacts([good, gone], { destination: workdir });
 
-  expect(fetched[0]).toMatchObject({ url: good, problem: null });
-  expect(fetched[1]).toMatchObject({ url: gone, path: null });
-  expect(String(fetched[1]?.problem)).toContain("404");
+  expect(fetched[0]).toMatchObject({ url: good, outcome: "fetched" });
+  expect(fetched[1]).toMatchObject({ url: gone, outcome: "failed" });
+  expect(String((fetched[1] as { problem?: string }).problem)).toContain("404");
 });
 
 test("an oversized artifact is stopped mid-stream and leaves no partial file", async () => {
@@ -103,8 +103,10 @@ test("an oversized artifact is stopped mid-stream and leaves no partial file", a
 
   const fetched = await fetchArtifacts([viewUrl(port, "endless.png")], { destination: workdir });
 
-  expect(fetched[0]?.path).toBeNull();
-  expect(String(fetched[0]?.problem)).toContain("limit");
+  // A ceiling is a limit, not a fault: exceeding one is something this server
+  // DECLINED to do, and the caller's next move differs from a fetch that broke.
+  expect(fetched[0]?.outcome).toBe("skipped");
+  expect(String((fetched[0] as { reason?: string }).reason)).toContain("limit");
   // A partial file that looks finished is the one outcome worse than none.
   expect(existsSync(join(workdir, "endless.png"))).toBe(false);
   expect(readdirSync(workdir)).toEqual([]);
@@ -133,7 +135,7 @@ test("a traversing filename writes nothing at all", async () => {
 
   const fetched = await fetchArtifacts([url], { destination: join(workdir, "inner") });
 
-  expect(fetched[0]?.path).toBeNull();
+  expect(fetched[0]?.outcome).toBe("failed");
   // Not even the destination directory: the refusal happens before anything is
   // created.
   expect(existsSync(join(workdir, "inner"))).toBe(false);
@@ -143,6 +145,110 @@ test("a traversing filename writes nothing at all", async () => {
 test("something that is not an http URL is refused without a request", async () => {
   const fetched = await fetchArtifacts(["/Users/me/output/a.png"], { destination: workdir });
 
-  expect(fetched[0]).toMatchObject({ path: null });
+  expect(fetched[0]).toMatchObject({ outcome: "failed" });
+  expect(readdirSync(workdir)).toEqual([]);
+});
+
+test("an artifact already on disk is not downloaded again", async () => {
+  // `get_job` on a COMPLETED job is callable any number of times, and once
+  // fetching is automatic that makes ten polls ten downloads of bytes already
+  // here. Reuse is safe on two invariants this module already maintains: the
+  // destination is keyed by prompt_id AND filename, so an existing file is
+  // this artifact rather than a namesake; and a partial file never survives,
+  // because every failure path removes what it wrote — so anything on disk is
+  // a complete previous fetch.
+  //
+  // Mutant: delete the `stat` reuse. This test dies on requests === 2.
+  let requests = 0;
+  const port = serve(() => {
+    requests += 1;
+    return new Response("png bytes", { headers: { "content-type": "image/png" } });
+  });
+  const url = viewUrl(port, "made_00001_.png");
+
+  const first = await fetchArtifacts([url], { destination: workdir });
+  const second = await fetchArtifacts([url], { destination: workdir });
+
+  expect(requests).toBe(1);
+  expect(first[0]?.outcome).toBe("fetched");
+  expect(second[0]?.outcome).toBe("fetched");
+  expect((second[0] as { path: string }).path).toBe(join(workdir, "made_00001_.png"));
+  expect(readFileSync(join(workdir, "made_00001_.png"), "utf8")).toBe("png bytes");
+});
+
+test("an artifact larger than this call's ceiling is skipped before a byte is written", async () => {
+  // The ceiling exists so an automatic fetch never drags a video across a
+  // tailnet. Discovering the size by DOWNLOADING it would defeat that: the
+  // point is to not move the bytes. `content-length` is checked first and the
+  // body abandoned unread. (Measured: `Deno.serve` does set `content-length`
+  // for a fixed-string body, so the pre-check really is what fires here.)
+  //
+  // Mutant: drop the content-length pre-check and rely on the streaming cap.
+  //
+  // What kills that mutant is the REASON STRING, not the empty directory.
+  // Measured: both the correct code and that mutant leave `workdir` empty,
+  // because the streaming-cap path also removes its partial file. Only the
+  // pre-check's message carries the declared size. Do not "simplify" the 5000
+  // assertion away — it is the entire discriminator.
+  const port = serve(() => new Response("x".repeat(5_000), { headers: { "content-type": "image/png" } }));
+
+  const fetched = await fetchArtifacts([viewUrl(port, "big.png")], { destination: workdir, maxBytes: 100 });
+
+  expect(fetched[0]?.outcome).toBe("skipped");
+  expect(String((fetched[0] as { reason?: string }).reason)).toContain("5000");
+  expect(readdirSync(workdir)).toEqual([]);
+});
+
+test("a ceiling is a limit, not a failure: a skip is not reported as a problem", async () => {
+  // A deliberate skip and a fetch that broke are different facts, and this
+  // codebase does not report them alike — the caller's next move differs.
+  //
+  // Mutant: return a `failed` outcome for the oversize case. Dies here.
+  const port = serve(() => new Response("x".repeat(5_000)));
+
+  const fetched = await fetchArtifacts([viewUrl(port, "big.png")], { destination: workdir, maxBytes: 100 });
+
+  expect(fetched[0]?.outcome).not.toBe("failed");
+});
+
+test("the streaming cap enforces the ceiling when no content-length is declared", async () => {
+  // A streamed response declares no length, so the header cannot be the
+  // guarantee — the in-loop check is.
+  //
+  // Deliberately NOT named "a lying content-length": measured, that case
+  // cannot be built here at all. A `Deno.serve` response understating the
+  // length makes the client throw and receive nothing; a raw-socket one makes
+  // `fetch` silently truncate to the declared count. `written` can therefore
+  // never exceed a declared header, and only an OVERSTATED header is
+  // reachable — whose failure mode is a false skip, disclosed, never a corrupt
+  // file.
+  //
+  // The body is FINITE and larger than the ceiling, on purpose. An endless
+  // always-ready stream starves the event loop: measured, with the cap removed
+  // the read/write loop ran 6-8s and 935MB without ever observing an
+  // `AbortSignal.timeout`, so the mutant would HANG the suite rather than fail
+  // it. A finite body ends, the file lands, and the assertion fails cleanly.
+  //
+  // Mutant: delete the `written > maxBytes` check. Dies on the file existing.
+  const chunk = new Uint8Array(1024);
+  const port = serve(
+    () =>
+      new Response(
+        new ReadableStream({
+          start(controller) {
+            for (let i = 0; i < 16; i++) controller.enqueue(chunk); // 16 KiB total
+            controller.close();
+          },
+        }),
+        { headers: { "content-type": "image/png" } },
+      ),
+  );
+
+  const fetched = await fetchArtifacts([viewUrl(port, "streamed.png")], {
+    destination: workdir,
+    maxBytes: 4096,
+  });
+
+  expect(fetched[0]?.outcome).toBe("skipped");
   expect(readdirSync(workdir)).toEqual([]);
 });
