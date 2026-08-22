@@ -2,7 +2,7 @@ import { afterEach, beforeEach, expect, test } from "./support/testing.ts";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { artifactFilename, fetchArtifacts } from "../src/comfy/fetchOutputs.ts";
+import { artifactFilename, fetchArtifacts, type FetchBudget } from "../src/comfy/fetchOutputs.ts";
 
 /**
  * Copying a run's artifacts from the machine that made them.
@@ -251,4 +251,185 @@ test("the streaming cap enforces the ceiling when no content-length is declared"
 
   expect(fetched[0]?.outcome).toBe("skipped");
   expect(readdirSync(workdir)).toEqual([]);
+});
+
+// --- the shared copy budget ----------------------------------------------
+
+/**
+ * A server whose `/view` returns exactly `size` bytes, declaring the length
+ * honestly — which is what the pre-check reads to decline a copy without
+ * moving it. Measured: 75 MiB over loopback costs about 50ms, so exercising a
+ * real 64 MiB allowance with real bytes is cheap.
+ */
+function serveSized(sizes: Record<string, number>): number {
+  const chunk = new Uint8Array(64 * 1024);
+  return serve((request) => {
+    const size = sizes[new URL(request.url).searchParams.get("filename") ?? ""];
+    if (size === undefined) return new Response("", { status: 404 });
+    let sent = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        if (sent >= size) return void controller.close();
+        const take = Math.min(chunk.byteLength, size - sent);
+        sent += take;
+        controller.enqueue(chunk.subarray(0, take));
+      },
+    });
+    return new Response(body, {
+      headers: { "content-length": String(size), "content-type": "image/png" },
+    });
+  });
+}
+
+/** A server that sends `size` bytes and declares no length at all. */
+function serveUndeclared(size: number): number {
+  const chunk = new Uint8Array(64 * 1024);
+  return serve(() => {
+    let sent = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        if (sent >= size) return void controller.close();
+        const take = Math.min(chunk.byteLength, size - sent);
+        sent += take;
+        controller.enqueue(chunk.subarray(0, take));
+      },
+    });
+    return new Response(body, { headers: { "content-type": "image/png" } });
+  });
+}
+
+const MiB = 1024 * 1024;
+
+function budgetOf(total: number): FetchBudget {
+  return { remaining: total, total };
+}
+
+test("a shared budget is spent across calls, not reset by each one", async () => {
+  // The whole point of the type. `run_sweep` calls `fetchArtifacts` once per
+  // variant, and the ceiling that matters is the one across all of them —
+  // sixteen variants of 3 MB each is nearly 50 MB from a call that asked for
+  // none of it, and every single artifact is inside the per-artifact ceiling.
+  //
+  // Mutant: make the budget per call rather than shared. Dies because the
+  // fourth artifact comes across.
+  const port = serveSized({ "a.png": 4 * MiB, "b.png": 4 * MiB, "c.png": 4 * MiB, "d.png": 4 * MiB });
+  const budget = budgetOf(10 * MiB);
+
+  const outcomes = [];
+  for (const name of ["a.png", "b.png", "c.png", "d.png"]) {
+    const [one] = await fetchArtifacts([viewUrl(port, name)], { destination: workdir, budget });
+    outcomes.push(one?.outcome);
+  }
+
+  // Two fit, the third would not, and everything after it is refused outright.
+  expect(outcomes).toEqual(["fetched", "fetched", "skipped", "skipped"]);
+  expect(readdirSync(workdir).sort()).toEqual(["a.png", "b.png"]);
+});
+
+test("artifacts are spent in the order they are asked for", async () => {
+  // Which artifacts came across has to be deterministic — a caller comparing
+  // sixteen variants needs to know it was the first four, not four of them.
+  const port = serveSized({ "a.png": 6 * MiB, "b.png": 6 * MiB, "c.png": 6 * MiB });
+  const budget = budgetOf(13 * MiB);
+
+  const fetched = await fetchArtifacts(
+    ["a.png", "b.png", "c.png"].map((name) => viewUrl(port, name)),
+    { destination: workdir, budget },
+  );
+
+  expect(fetched.map((one) => one.outcome)).toEqual(["fetched", "fetched", "skipped"]);
+});
+
+test("an artifact that will not fit is declined without moving a byte", async () => {
+  // The budget is enforced where the per-artifact ceiling already is: against
+  // the remote's declared content-length, before the body is read. A 15 MiB
+  // file against 4 MiB of remaining allowance must cost nothing at all.
+  //
+  // Mutant: check the budget only after streaming. Dies on the partial file,
+  // which would exist and then be removed — but the bytes would have moved.
+  const port = serveSized({ "big.png": 15 * MiB });
+  const budget = budgetOf(4 * MiB);
+
+  const [one] = await fetchArtifacts([viewUrl(port, "big.png")], { destination: workdir, budget });
+
+  expect(one?.outcome).toBe("skipped");
+  expect(existsSync(join(workdir, "big.png"))).toBe(false);
+  // Nothing was spent, so a smaller artifact after it still comes across.
+  expect(budget.remaining).toBe(4 * MiB);
+});
+
+test("the two limits are told apart in the reason they give", async () => {
+  // A single artifact past the ceiling is a big file; a run of them past the
+  // budget is a lot of ordinary ones, and the earlier ones already arrived.
+  // The next move differs, so the message has to.
+  const port = serveSized({ "big.png": 15 * MiB, "small.png": 1 * MiB });
+
+  const [ceiling] = await fetchArtifacts([viewUrl(port, "big.png")], {
+    destination: workdir,
+    maxBytes: 2 * MiB,
+    budget: budgetOf(64 * MiB),
+  });
+  const [spent] = await fetchArtifacts([viewUrl(port, "small.png")], {
+    destination: workdir,
+    budget: { remaining: 0, total: 64 * MiB },
+  });
+
+  expect(ceiling?.outcome === "skipped" && ceiling.reason).toContain("limit");
+  expect(spent?.outcome === "skipped" && spent.reason).toContain("budget");
+  expect(spent?.outcome === "skipped" && spent.reason).toContain(String(64 * MiB));
+});
+
+test("the budget is charged what landed, not what was declared", async () => {
+  // A remote may overstate its length, and the budget's job is to bound the
+  // bytes this call actually brings here.
+  //
+  // Mutant: subtract the declared length. Dies on the remaining count.
+  const port = serveSized({ "a.png": 3 * MiB });
+  const budget = budgetOf(10 * MiB);
+
+  await fetchArtifacts([viewUrl(port, "a.png")], { destination: workdir, budget });
+
+  expect(budget.remaining).toBe(7 * MiB);
+});
+
+test("an artifact with no declared length is charged after the fact", async () => {
+  // `content-length` is optional. With none there is nothing to check in
+  // advance, so the artifact is fetched under the per-artifact ceiling and the
+  // budget is charged what landed — which can overshoot, by at most one
+  // ceiling's worth, and is then read as spent.
+  const port = serveUndeclared(3 * MiB);
+  const budget = budgetOf(1 * MiB);
+
+  const [one] = await fetchArtifacts([viewUrl(port, "a.png")], { destination: workdir, budget });
+
+  expect(one?.outcome).toBe("fetched");
+  expect(budget.remaining).toBeLessThan(0);
+  // ...and the overshoot stops the next one rather than compounding.
+  const [next] = await fetchArtifacts([viewUrl(port, "b.png")], { destination: workdir, budget });
+  expect(next?.outcome).toBe("skipped");
+});
+
+test("no budget at all leaves every existing call behaving exactly as it did", async () => {
+  // `budget` is optional, and a single run passes none: the per-artifact
+  // ceiling is the only bound there, and adding a second one silently would
+  // change what `run_workflow` and `get_job` have always done.
+  const port = serveSized({ "a.png": 20 * MiB });
+
+  const [one] = await fetchArtifacts([viewUrl(port, "a.png")], { destination: workdir });
+
+  expect(one?.outcome).toBe("fetched");
+});
+
+test("an artifact already on disk is handed back without spending the budget", async () => {
+  // A reuse moves no bytes. Charging for it would let a sweep polled twice
+  // exhaust an allowance it never actually used.
+  const port = serveSized({ "a.png": 3 * MiB });
+  const budget = budgetOf(10 * MiB);
+
+  await fetchArtifacts([viewUrl(port, "a.png")], { destination: workdir, budget });
+  const spentOnce = budget.remaining;
+  const [again] = await fetchArtifacts([viewUrl(port, "a.png")], { destination: workdir, budget });
+
+  expect(again?.outcome).toBe("fetched");
+  expect(budget.remaining).toBe(spentOnce);
 });

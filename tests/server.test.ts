@@ -214,6 +214,13 @@ const MANAGED_ENV = [
   "FAKE_COMFY_JOBS_STATUS_ERROR",
   "FAKE_COMFY_JOBS_CANCEL_FILE",
   "FAKE_COMFY_JOBS_CANCEL_ERROR",
+  "FAKE_COMFY_JOBS_WAIT_FILE",
+  "FAKE_COMFY_JOBS_WAIT_ERROR",
+  "FAKE_COMFY_JOBS_WAIT_MESSAGE",
+  "FAKE_COMFY_VARY_MODE",
+  "FAKE_COMFY_VARY_WARNINGS",
+  "FAKE_COMFY_VARY_STALE",
+  "FAKE_COMFY_RUN_SEQ_DIR",
   "FAKE_COMFY_DISPATCH_LOG",
   "FAKE_COMFY_WORKFLOW_COPY",
   "FAKE_COMFY_NOTES_FILE",
@@ -640,7 +647,7 @@ async function failure(
 
 // --- registration --------------------------------------------------------
 
-test("registers exactly the eleven default tools", async () => {
+test("registers exactly the twelve default tools", async () => {
   expect(await toolNames(await connect())).toEqual([
     "cancel_job",
     "comfy_status",
@@ -650,6 +657,7 @@ test("registers exactly the eleven default tools", async () => {
     "list_hosts",
     "list_workflows",
     "manage_hosts",
+    "run_sweep",
     "run_workflow",
     "search_templates",
     "validate_workflow",
@@ -3940,4 +3948,425 @@ test("a fetched template is describable by the existing pipeline, unchanged", as
   );
   expect(entry?.["origin"]).toBe("template");
   expect(entry?.["format"]).toBe("frontend");
+});
+
+// --- run_sweep -----------------------------------------------------------
+
+/**
+ * Arm the N `comfy run` calls one sweep makes, with a different answer each.
+ *
+ * Every existing run mode serves one fixed stream, so N submits would come
+ * back with N identical prompt_ids — the one thing a sweep must not do. Each
+ * entry is either a `prompt_id` to report queued, or a failure envelope for a
+ * variant the server refuses.
+ *
+ * The directory is returned so a test can read `<n>.workflow`, the copy the
+ * fixture took of the file `--workflow` named at the moment of that submit.
+ */
+function serveRunSequence(entries: Array<string | { code: string; message: string }>): string {
+  const dir = makeDir("run-seq");
+  entries.forEach((entry, index) => {
+    if (typeof entry === "string") {
+      writeFileSync(join(dir, `${index}.ndjson`), `${envelopeLine(queuedPayload({ prompt_id: entry }))}\n`);
+      return;
+    }
+    writeFileSync(join(dir, `${index}.ndjson`), `${failureLine(entry)}\n`);
+    writeFileSync(join(dir, `${index}.exit`), "1");
+  });
+  process.env.FAKE_COMFY_RUN_MODE = "run_seq";
+  process.env.FAKE_COMFY_RUN_SEQ_DIR = dir;
+  return dir;
+}
+
+/** Arm `comfy jobs wait` with a summary naming each id and what it produced. */
+function serveJobsWait(rows: Array<{ prompt_id: string; status?: string; outputs?: string[] }>): void {
+  const jobs = rows.map((row) => ({
+    prompt_id: row.prompt_id,
+    status: row.status ?? "completed",
+    ok: (row.status ?? "completed") === "completed",
+    ...(row.outputs === undefined ? {} : { outputs: row.outputs }),
+  }));
+  const path = join(workdir, "wait.json");
+  writeFileSync(
+    path,
+    JSON.stringify({
+      total: jobs.length,
+      completed: jobs.filter((job) => job.status === "completed").length,
+      failed: 0,
+      cancelled: 0,
+      timed_out: 0,
+      elapsed_seconds: 2.5,
+      jobs,
+    }),
+  );
+  process.env.FAKE_COMFY_JOBS_WAIT_FILE = path;
+}
+
+/** The runs a sweep's answer reports, in variant order. */
+function runsOf(body: Record<string, unknown>): Array<Record<string, unknown>> {
+  return body["runs"] as Array<Record<string, unknown>>;
+}
+
+test("run_sweep is registered, and does not claim to be read-only", async () => {
+  // It launches nothing itself but it does submit N runs, so `readOnlyHint`
+  // would be a lie — the same rule the launch non-negotiable states.
+  const registered = toolNamed(await tools(await connect()), "run_sweep");
+
+  expect(registered.annotations?.readOnlyHint).toBe(false);
+  expect(registered.annotations?.openWorldHint).toBe(true);
+  // The zip rule is the error a caller is most likely to make, so it is in the
+  // first sentence rather than buried in a parameter description.
+  expect(registered.description?.split(".")[0]?.toLowerCase()).toContain("zipped");
+});
+
+test("a sweep submits one run per variant and returns every prompt_id", async () => {
+  // Mutant: submit only the first variant. Dies on the count.
+  writeWorkflow("default_image_gen");
+  serveRunSequence(["p-0", "p-1", "p-2"]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3] },
+  });
+
+  expect(body["variant_count"]).toBe(3);
+  expect(runsOf(body).map((run) => run["prompt_id"])).toEqual(["p-0", "p-1", "p-2"]);
+  expect(body["failed"]).toEqual([]);
+});
+
+test("each variant is submitted from its own file, not three times from one", async () => {
+  // The files `vary` wrote are the whole answer, and each carries a different
+  // value. Submitting one of them three times would return three prompt_ids
+  // and produce three identical images — a benchmark that measures nothing.
+  //
+  // The fixture copies the file `--workflow` named at the moment of each
+  // submit, so the three copies are the evidence.
+  //
+  // Mutant: pass `written[0]` to every submit. Dies on the identical names.
+  writeWorkflow("default_image_gen");
+  const dir = serveRunSequence(["p-0", "p-1", "p-2"]);
+
+  await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3] },
+  });
+
+  const submitted = [0, 1, 2].map((n) => readFileSync(join(dir, `${n}.workflow`), "utf8"));
+  expect(submitted).toHaveLength(3);
+  // Every submit found its file on disk — which is what a dispose moved inside
+  // the loop would break for variants 2 and 3.
+  for (const bytes of submitted) expect(bytes.length).toBeGreaterThan(0);
+});
+
+test("every variant's prompt_id is attributed to the host that ran it", async () => {
+  // A sweep of three is three ledger entries, so `get_job` on any of them
+  // works with no `host` argument — the whole point of jobLedger.ts, at N.
+  //
+  // Mutant: record only the last prompt_id. Dies on the middle one.
+  writeWorkflow("default_image_gen");
+  serveRunSequence(["p-0", "p-1", "p-2"]);
+  const client = await connect();
+
+  await ok(client, "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3] },
+  });
+
+  const statusFile = join(workdir, "status.json");
+  writeFileSync(statusFile, JSON.stringify({ prompt_id: "p-1", status: "completed", outputs: [] }));
+  process.env.FAKE_COMFY_JOBS_MODE = "jobs";
+  process.env.FAKE_COMFY_JOBS_STATUS_FILE = statusFile;
+
+  const body = await ok(client, "get_job", { prompt_id: "p-1" });
+
+  expect(body["prompt_id"]).toBe("p-1");
+  expect(body["host_source"]).toBe("ledger");
+});
+
+test("one variant that will not submit does not deny the others", async () => {
+  // The rule `fetchArtifacts` already follows. Two good runs are the answer;
+  // the third's failure is reported beside them.
+  //
+  // Mutant: let a submit failure throw out of the sweep. Dies on the missing
+  // prompt_ids.
+  writeWorkflow("default_image_gen");
+  serveRunSequence(["p-0", { code: "prompt_rejected", message: "node 3 rejected the prompt" }, "p-2"]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3] },
+  });
+
+  expect(body["variant_count"]).toBe(3);
+  expect(runsOf(body).map((run) => run["prompt_id"])).toEqual(["p-0", "p-2"]);
+  const failed = body["failed"] as Array<Record<string, unknown>>;
+  expect(failed).toHaveLength(1);
+  expect(failed[0]?.["code"]).toBe("prompt_rejected");
+  // Which variant it was, so a caller can tell WHICH value did not run.
+  expect(failed[0]?.["variant"]).toBe(1);
+});
+
+test("mismatched list lengths are refused with both lengths named", async () => {
+  // Zipped, not crossed — the error a caller is most likely to need.
+  //
+  // Mutant: pass the lists through unchecked. Dies because the call succeeds.
+  writeWorkflow("default_image_gen");
+
+  const error = await failure(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3], "6.text": ["a", "b"] },
+  });
+
+  expect(error["kind"]).toBe("invalid_input");
+  expect(String(error["message"])).toContain("3.seed (3)");
+  expect(String(error["message"])).toContain("6.text (2)");
+});
+
+test("an address the workflow feeds from a link is refused before anything is spawned", async () => {
+  // `run_workflow`'s rule, at N: a decoy address writes its value nowhere
+  // ComfyUI reads it, so a sweep over one would produce N identical images
+  // while reporting N different values as applied.
+  //
+  // Mutant: skip refuseInertInputs in the sweep. Dies on the kind.
+  writeWorkflow("decoy", decoyWorkflowBody());
+
+  const error = await failure(await connect(), "run_sweep", {
+    workflow: "decoy",
+    inputs: { "3.seed": [1, 2] },
+  });
+
+  expect(error["kind"]).toBe("inert_slot");
+});
+
+test("`fixed` is applied once to the base and inherited by every variant", async () => {
+  // The two arguments are different jobs: `inputs` is what VARIES and `fixed`
+  // is what does not. Applying `fixed` to the base before varying means one
+  // `set-slot` call rather than one per variant, and it is what keeps "vary
+  // this" visually distinct from "set this" in the call itself.
+  //
+  // Mutant: drop `fixed` on the floor. Dies on the missing pair.
+  writeWorkflow("default_image_gen");
+  const log = join(workdir, "dispatch.log");
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
+  serveRunSequence(["p-0", "p-1"]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2] },
+    fixed: { "6.text": "a cat" },
+  });
+
+  expect(body["fixed"]).toEqual(["6.text"]);
+  // One set-slot, not two: the base carries it and every variant is copied
+  // from the base.
+  expect(invocationsOf(log, "set-slot")).toHaveLength(1);
+  expect(invocationsOf(log, "vary")).toHaveLength(1);
+});
+
+test("the temp directory the variants were written to does not outlive the call", async () => {
+  // `setSlots.ts`'s rule: this server's own scratch is disposed on every path.
+  // Disposal happens after ALL submissions, because a submitted file must
+  // outlive its own submit.
+  //
+  // Mutant: drop the `finally`. Dies on the leaked directory.
+  writeWorkflow("default_image_gen");
+  serveRunSequence(["p-0", "p-1", "p-2"]);
+
+  await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3] },
+  });
+
+  expect(leakedTempDirs()).toEqual([]);
+});
+
+test("a sweep that fails partway still leaves nothing behind", async () => {
+  // The other half of the same rule, and the one a `finally` exists for.
+  writeWorkflow("default_image_gen");
+  serveRunSequence([
+    { code: "prompt_rejected", message: "no" },
+    { code: "prompt_rejected", message: "no" },
+  ]);
+
+  await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2] },
+  });
+
+  expect(leakedTempDirs()).toEqual([]);
+});
+
+test("wait: true blocks on every variant in one call and reports each one's outputs", async () => {
+  // The reason `waitForJobs` exists. Three variants, one `jobs wait`, and each
+  // run's row carries what it produced.
+  //
+  // Mutant: poll each id separately. Dies on the invocation count.
+  writeWorkflow("default_image_gen");
+  const log = join(workdir, "dispatch.log");
+  process.env.FAKE_COMFY_DISPATCH_LOG = log;
+  serveRunSequence(["p-0", "p-1", "p-2"]);
+  serveJobsWait([
+    { prompt_id: "p-0", outputs: ["/out/a.png"] },
+    { prompt_id: "p-1", outputs: ["/out/b.png"] },
+    { prompt_id: "p-2", outputs: ["/out/c.png"] },
+  ]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3] },
+    wait: true,
+  });
+
+  expect(invocationsOf(log, "wait")).toHaveLength(1);
+  const runs = runsOf(body);
+  expect(runs.map((run) => run["status"])).toEqual(["completed", "completed", "completed"]);
+  expect(runs.map((run) => (run["outputs"] as Record<string, string[]>)["files"])).toEqual([
+    ["/out/a.png"],
+    ["/out/b.png"],
+    ["/out/c.png"],
+  ]);
+});
+
+test("a variant that could not be submitted is not waited on", async () => {
+  // `jobs wait` refuses an id it has no record of, and a sweep that sent it
+  // one would turn a partial success into a total failure.
+  //
+  // Mutant: wait on every variant rather than on the ids that came back.
+  // Dies because the CLI is asked about a job that does not exist.
+  writeWorkflow("default_image_gen");
+  serveRunSequence(["p-0", { code: "prompt_rejected", message: "no" }]);
+  serveJobsWait([{ prompt_id: "p-0", outputs: ["/out/a.png"] }]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2] },
+    wait: true,
+  });
+
+  expect(runsOf(body)).toHaveLength(1);
+  expect(argv()).not.toContain("p-1");
+});
+
+test("a sweep where every variant failed does not wait at all", async () => {
+  // There is nothing to wait on, and `waitForJobs` refuses an empty list
+  // rather than reporting a wait that finished. The sweep must not turn that
+  // refusal into the answer.
+  writeWorkflow("default_image_gen");
+  serveRunSequence([{ code: "prompt_rejected", message: "no" }]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1] },
+    wait: true,
+  });
+
+  expect(runsOf(body)).toEqual([]);
+  expect((body["failed"] as unknown[])).toHaveLength(1);
+});
+
+/**
+ * An instance serving `size`-byte artifacts, so a copy budget can be spent for
+ * real rather than asserted about. Measured: 75 MiB over loopback costs about
+ * 50ms, so the honest test is also the cheap one.
+ */
+function serveSizedArtifactInstance(outputDir: string, sizes: Record<string, number>): number {
+  const chunk = new Uint8Array(64 * 1024);
+  const bound = denoServe((request) => {
+    const url = new URL(request.url);
+    if (url.pathname === "/system_stats") {
+      const argv = ["ComfyUI/main.py", "--output-directory", outputDir];
+      return new Response(JSON.stringify({ ...SYSTEM_STATS, system: { ...SYSTEM_STATS.system, argv } }), {
+        headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.pathname === "/view") {
+      const size = sizes[url.searchParams.get("filename") ?? ""];
+      if (size === undefined) return new Response("", { status: 404 });
+      let sent = 0;
+      const body = new ReadableStream({
+        pull(controller) {
+          if (sent >= size) return void controller.close();
+          const take = Math.min(chunk.byteLength, size - sent);
+          sent += take;
+          controller.enqueue(chunk.subarray(0, take));
+        },
+      });
+      // Declared, and honestly: it is what the pre-check in `fetchOutputs.ts`
+      // reads to decline a copy without moving it.
+      return new Response(body, {
+        headers: { "content-length": String(size), "content-type": "image/png" },
+      });
+    }
+    return new Response("nf", { status: 404 });
+  });
+  servers.push(bound);
+  return portOf(bound);
+}
+
+test("each variant's artifacts are fetched separately, under one shared allowance", async () => {
+  // The per-variant half of the sweep budget, which is all this harness can
+  // reach. A sweep-wide allowance only ever BITES on a host that is both
+  // remote (so the copy is automatic) and reachable (so the runs can be
+  // submitted at all) — and this suite can serve only loopback, where every
+  // address it can bind is local. The existing remote-artifact tests document
+  // the same limit and get around it with `get_job`, which never probes; a
+  // sweep must, because it submits.
+  //
+  // So the allowance's own arithmetic — the ordering, the skip, the message —
+  // is pinned in `tests/fetchOutputs.test.ts` against a real `FetchBudget`,
+  // and what is pinned here is that a sweep fetches per variant, into a
+  // directory keyed by that variant's own prompt_id.
+  //
+  // Mutant: fetch only the first variant's outputs. Dies on the second.
+  const MiB = 1024 * 1024;
+  const outputDir = makeDir("comfy-output");
+  const port = serveSizedArtifactInstance(outputDir, { "v0.png": 8 * MiB, "v1.png": 8 * MiB });
+  process.env.MCP_COMFYUI_PORT = String(port);
+  const urls = ["v0.png", "v1.png"].map((name) => viewUrl(port, { filename: name, subfolder: "", type: "output" }));
+  writeWorkflow("default_image_gen");
+  serveRunSequence(["p-0", "p-1"]);
+  serveJobsWait([
+    { prompt_id: "p-0", outputs: [urls[0] as string] },
+    { prompt_id: "p-1", outputs: [urls[1] as string] },
+  ]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2] },
+    wait: true,
+    fetch_outputs: true,
+  });
+
+  const fetched = runsOf(body).map(
+    (run) => (run["outputs"] as Record<string, Record<string, string>>)["fetched"] as Record<string, string>,
+  );
+  expect(Object.keys(fetched[0] ?? {})).toEqual([urls[0]]);
+  expect(Object.keys(fetched[1] ?? {})).toEqual([urls[1]]);
+  // Keyed by prompt_id, so two variants that produced a same-named file — which
+  // ComfyUI does, because its counter restarts per output-node prefix — do not
+  // overwrite each other.
+  expect(fetched[0]?.[urls[0] as string]).toContain("p-0");
+  expect(fetched[1]?.[urls[1] as string]).toContain("p-1");
+});
+
+test("a stale object_info cache is reported rather than failing the sweep", async () => {
+  // `vary` consults /object_info and warns when it could not refresh it —
+  // measured, it still writes the variants. A sweep built against a stale
+  // cache can name a value the host no longer has, which surfaces as a
+  // per-variant submit failure rather than as a sweep failure. Visible, not
+  // fatal.
+  writeWorkflow("default_image_gen");
+  process.env.FAKE_COMFY_VARY_STALE = "true";
+  process.env.FAKE_COMFY_VARY_WARNINGS =
+    '[{"code":"object_info_stale","message":"served from cache: Connection refused"}]';
+  serveRunSequence(["p-0"]);
+
+  const body = await ok(await connect(), "run_sweep", {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1] },
+  });
+
+  expect(body["variant_count"]).toBe(1);
+  const warnings = body["warnings"] as Array<Record<string, unknown>>;
+  expect(warnings[0]).toMatchObject({ source: "vary", code: "object_info_stale" });
 });

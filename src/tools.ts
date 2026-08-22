@@ -1,9 +1,11 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, sep } from "node:path";
 import { z } from "zod";
-import { fetchArtifacts, type FetchedArtifact } from "./comfy/fetchOutputs.ts";
+import { fetchArtifacts, type FetchBudget, type FetchedArtifact } from "./comfy/fetchOutputs.ts";
 import { fetchRemoteWorkflow, listRemoteWorkflows } from "./comfy/userdata.ts";
 import {
   detectInstance,
@@ -12,7 +14,13 @@ import {
   type LaunchArgs,
   type RunningInstance,
 } from "./comfy/instance.ts";
-import { cancelJob, getJobStatus, type CancelResult, type JobStatus } from "./comfy/jobs.ts";
+import {
+  cancelJob,
+  getJobStatus,
+  waitForJobs,
+  type CancelResult,
+  type JobStatus,
+} from "./comfy/jobs.ts";
 import { validateWorkflow } from "./comfy/validate.ts";
 import {
   DEFAULT_TEMPLATE_LIMIT,
@@ -23,6 +31,7 @@ import {
 } from "./comfy/templates.ts";
 import {
   artifactOrigin,
+  PREPARED_COPY_PREFIX,
   resolveArtifactPaths,
   type ArtifactLocation,
   type ClassifiedOutputs,
@@ -61,6 +70,7 @@ import {
 } from "./hosts.ts";
 import { recordJobHost, resolveJobTarget, type JobTarget } from "./jobLedger.ts";
 import {
+  describeError,
   InertSlotError,
   toolAnswer,
   ToolArgumentError,
@@ -76,7 +86,8 @@ import {
 import { listNotes } from "./workflows/notes.ts";
 import { listSlots } from "./workflows/slots.ts";
 import { runWorkflow, type EffectiveParameter, type WorkflowRun } from "./workflows/run.ts";
-import { applySlots, type SlotInputs } from "./workflows/setSlots.ts";
+import { applySlots, type SlotInputs, type SlotValue } from "./workflows/setSlots.ts";
+import { varyWorkflow } from "./workflows/vary.ts";
 
 /**
  * The tools themselves: what a model sees, and what it gets back.
@@ -148,6 +159,38 @@ const NOTES_TIMEOUT_MS = 15_000;
  * underneath as the absolute bound on any fetch.
  */
 const AUTO_FETCH_MAX_BYTES = 16 * 1024 * 1024;
+
+/**
+ * The most one `run_sweep` copies here WITHOUT the caller asking, across every
+ * variant.
+ *
+ * {@link AUTO_FETCH_MAX_BYTES} bounds one artifact, and nothing above it bounds
+ * a run of them. A sixteen-variant sweep of 1024x1024 images is sixteen files
+ * of about 3.0 MB each (measured, same capture as the ceiling above) — every
+ * one comfortably inside the ceiling, and together nearly 50 MB copied from a
+ * call that asked for none of it. At the ceiling itself sixteen variants would
+ * be 256 MB.
+ *
+ * 64 MiB is four artifacts at the full per-artifact ceiling, or around twenty
+ * at a realistic size — enough that an ordinary image sweep is copied whole and
+ * a video sweep is not. Artifacts are spent in variant order, so which ones
+ * came across is deterministic rather than whichever finished first, and the
+ * rest are disclosed in `outputs.not_fetched` with the reason.
+ *
+ * `fetch_outputs: true` lifts this exactly as it lifts the per-artifact
+ * ceiling: one flag, both bounds.
+ */
+const SWEEP_FETCH_BUDGET_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Budget for the `comfy workflow vary` call.
+ *
+ * Same reasoning as {@link NOTES_TIMEOUT_MS}: `vary` reads a workflow file,
+ * consults `/object_info`, and writes N files — no GPU, no render. It is one
+ * step of a tool call that may go on to submit sixteen runs, so a hang here
+ * must not eat the whole budget before anything has been submitted.
+ */
+const VARY_TIMEOUT_MS = 120_000;
 
 /**
  * Budget for one automatic artifact copy, and deliberately far shorter than
@@ -815,6 +858,13 @@ async function fetchIfAsked(
   config: ToolConfig,
   host: ResolvedHost,
   explicit: boolean,
+  /**
+   * A `run_sweep`'s allowance across all its variants — see
+   * {@link SWEEP_FETCH_BUDGET_BYTES}. Absent for a single run, which the
+   * per-artifact ceiling already bounds, and ignored under `explicit` for the
+   * same reason the ceiling is.
+   */
+  budget?: FetchBudget,
 ): Promise<FetchedArtifact[] | null> {
   // Nothing to bring: the files are already on this machine. Gated on the
   // HOST's locality rather than on whether a local path resolved, because
@@ -847,7 +897,13 @@ async function fetchIfAsked(
 
   return await fetchArtifacts(urls, {
     destination: join(cacheRoot(config.cacheDir), "fetched", promptId),
-    ...(explicit ? {} : { maxBytes: AUTO_FETCH_MAX_BYTES, timeoutMs: AUTO_FETCH_TIMEOUT_MS }),
+    ...(explicit
+      ? {}
+      : {
+        maxBytes: AUTO_FETCH_MAX_BYTES,
+        timeoutMs: AUTO_FETCH_TIMEOUT_MS,
+        ...(budget === undefined ? {} : { budget }),
+      }),
   });
 }
 
@@ -863,6 +919,67 @@ const fetchOutputsArgument = z
       "needs — its outputs can be hundreds of megabytes across a network. A run on this machine " +
       "already has its files here (`outputs.local_paths`) and is unaffected unless you set this.",
   );
+
+/**
+ * A private directory for one sweep's variants, and a way to remove it.
+ *
+ * Deliberately under the same `mcp-comfyui-apply-` prefix `setSlots.ts` uses:
+ * `comfy/outputs.ts` recognises that prefix when a path comes back from
+ * `comfy jobs` after the directory is gone, and a variant is a prepared copy in
+ * every sense that matters to it. One prefix, one rule.
+ *
+ * **The caller owns `dispose`**, and must call it after ALL submissions rather
+ * than per variant: `comfy run` reads the file when it submits, so variant 2's
+ * file has to outlive variant 1's submit.
+ */
+function makeSweepDir(): { dir: string; dispose: () => void } {
+  const dir = join(tmpdir(), `${PREPARED_COPY_PREFIX}${randomUUID()}`);
+  mkdirSync(dir);
+  return {
+    dir,
+    dispose: () => {
+      try {
+        rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Swallowed, exactly as `setSlots.ts` swallows its own: this runs in a
+        // `finally`, and a temp directory this server failed to remove is the
+        // OS's problem at next boot, where throwing here would replace whatever
+        // error sent us into that `finally`.
+      }
+    },
+  };
+}
+
+/**
+ * The first value of each list, as an ordinary slot map.
+ *
+ * Only ever fed to {@link refuseInertInputs}, which reads the **addresses** and
+ * never the values — so any one value would do, and the first is the one a
+ * caller reading an error message will recognise.
+ */
+function firstValues(lists: Record<string, SlotValue[]>): SlotInputs {
+  return Object.fromEntries(
+    Object.entries(lists).flatMap(([address, values]) =>
+      values.length === 0 ? [] : [[address, values[0] as SlotValue]]
+    ),
+  );
+}
+
+/**
+ * What variant N was varied to, as a slot map.
+ *
+ * Echoed on every entry of `runs` and `failed` because a sweep's answer is
+ * otherwise sixteen prompt_ids in a row with nothing to tell them apart — and
+ * the value is exactly what a caller comparing the results is comparing.
+ */
+function valuesAt(lists: Record<string, SlotValue[]>, variant: number): Record<string, SlotValue> {
+  return Object.fromEntries(
+    Object.entries(lists).flatMap(([address, values]) => {
+      const value = values[variant];
+      return value === undefined ? [] : [[address, value]];
+    }),
+  );
+}
 
 /**
  * The instance whose directories can turn a job's `/view` URLs into paths, or
@@ -1254,6 +1371,42 @@ const inputsArgument = z
       "(2^53-1) MUST be passed as a string of digits, e.g. \"18446744073709551615\" — JSON numbers " +
       "lose whole digits above that, so a seed sent as a number would silently become a different " +
       "seed. Omit an address to keep the value the workflow file already holds.",
+  );
+
+/**
+ * `run_sweep`'s value lists.
+ *
+ * The same value union as {@link inputsArgument}, wrapped one level: the string
+ * arm is still the exact way to spell an integer above 2^53, and it matters
+ * more here than anywhere else in this server, because a seed sweep is the one
+ * call whose whole subject is large seeds.
+ *
+ * `.min(1)` on each list rather than only in `vary.ts`: an empty list zips to
+ * zero variants, and the CLI would report that as a cheerful success with no
+ * files written. The **cross-list** length agreement cannot be expressed here
+ * — it is a relationship between keys a record schema has no way to state — so
+ * `varyWorkflow` carries that check, where the message can name both lists.
+ */
+const sweepInputsArgument = z
+  .record(z.string(), z.array(z.union([z.string(), z.number(), z.boolean()])).min(1))
+  // Finding 2, at a third call site: each key becomes part of one
+  // `--slot ADDR=[…]` argument, and a token beginning with `-` is read by the
+  // CLI's argument parser as another flag. `vary.ts`'s `encodePair` is the
+  // guarantee; this is here so a model gets a schema error first.
+  .refine((record) => Object.keys(record).every((address) => !address.startsWith("-")), {
+    message: "a slot address cannot start with `-`; a real address is `<instance_id>.<name>`, e.g. \"3.seed\"",
+  })
+  .refine((record) => Object.keys(record).length > 0, {
+    message: "a sweep needs at least one slot to vary, e.g. {\"3.seed\": [1, 2, 3]}",
+  })
+  .describe(
+    "What VARIES, keyed by slot address, each an ARRAY of values — e.g. " +
+      "{\"3.seed\": [1, 2, 3]}. The lists are ZIPPED, so every one must be the same length and " +
+      "two lists of three give three variants, not nine. Get the addresses from " +
+      "describe_workflow. An integer larger than 9007199254740991 (2^53-1) MUST be passed as a " +
+      "string of digits, e.g. \"18446744073709551615\" — JSON numbers lose whole digits above " +
+      "that, so a seed sent as a number would silently become a different seed. Anything that " +
+      "should be the same on every variant belongs in `fixed`, not in a list of repeats.",
   );
 
 /**
@@ -2005,6 +2158,219 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           target: targetBody(target),
           ...runBody(resolved, prepared.applied, prepared.warnings, run, instance, fetched),
         };
+      }),
+  );
+
+  server.registerTool(
+    "run_sweep",
+    {
+      title: "Run a sweep of workflow variants",
+      description:
+        "Run N variants of one workflow in one call, from per-slot value lists that are ZIPPED " +
+        "rather than crossed — every list must be the same length, and two lists of three " +
+        "produce three runs, not nine. Each `inputs` value is an ARRAY, e.g. " +
+        "{\"3.seed\": [1, 2, 3]}; anything that should be the same on every variant goes in " +
+        "`fixed` instead, as an ordinary value. Call describe_workflow first for the addresses; " +
+        "they are the same ones run_workflow takes, and an address it lists under `inert` is " +
+        "refused here too. The workflow file is never modified. " +
+        "By DEFAULT this submits every variant and returns immediately: `runs` carries one entry " +
+        "per variant with its `prompt_id`, and a variant that could not be submitted at all is " +
+        "reported in `failed` beside the ones that were — one bad value does not deny you the " +
+        "rest. Poll get_job with any of the ids, with no `host` argument needed. Pass " +
+        "`wait: true` to block until every variant has finished and get their outputs back " +
+        "directly, which is one blocking call rather than N polls — but a sweep is N GPU runs, " +
+        "so sixteen video variants is hours and `timeout_seconds` is the guard. " +
+        "Artifacts from a sweep on ANOTHER host are copied here automatically in variant order " +
+        `up to ${SWEEP_FETCH_BUDGET_BYTES / (1024 * 1024)} MiB across the whole call; the rest ` +
+        "are listed in `outputs.not_fetched`, and `fetch_outputs: true` lifts that.",
+      inputSchema: {
+        workflow: workflowArgument,
+        host: hostArgument,
+        fetch_outputs: fetchOutputsArgument,
+        inputs: sweepInputsArgument,
+        fixed: inputsArgument
+          .optional()
+          .describe(
+            "Values applied to EVERY variant, keyed by slot address — the same shape " +
+              "run_workflow's `inputs` takes. Use it for what stays constant across the sweep " +
+              "(a prompt, a resolution) while `inputs` carries what varies. Applied once to a " +
+              "private copy of the workflow, which every variant is then derived from.",
+          ),
+        wait: z
+          .boolean()
+          .default(false)
+          .describe(
+            "Block until every variant has finished and return their outputs. False (the " +
+              "default) submits them all and returns their prompt_ids to poll with get_job.",
+          ),
+        timeout_seconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(MAX_TIMEOUT_SECONDS)
+          .optional()
+          .describe(
+            `How long to allow for ALL the variants together when wait is true, defaulting to ` +
+              `${WAIT_TIMEOUT_MS / 1000} seconds. Giving up does not stop the runs; the ` +
+              `prompt_ids are still returned and get_job still finds them.`,
+          ),
+      },
+      annotations: {
+        // It launches nothing itself, but it submits N runs — so it may not
+        // claim to be read-only, on the same rule the launch non-negotiable
+        // states for a tool that can start a process.
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ workflow, inputs, fixed, wait, timeout_seconds, host, fetch_outputs }) =>
+      toolAnswer(async () => {
+        const lists = inputs as Record<string, SlotValue[]>;
+        const constants = (fixed ?? {}) as SlotInputs;
+        const { target, named } = await resolveCallTarget(config, host, workflow);
+        const resolved = await resolveWorkflow(workflow, config, target, named);
+        // Before anything else, exactly as `run_workflow` does it, and over
+        // BOTH argument maps: a decoy address is a decoy whether its value
+        // varies or not, and a sweep over one would produce N identical images
+        // while reporting N different values as applied.
+        await refuseInertInputs(resolved, { ...constants, ...firstValues(lists) });
+
+        const timeoutMs = timeout_seconds === undefined ? WAIT_TIMEOUT_MS : timeout_seconds * 1_000;
+        // `vary` reads `/object_info` and every submit posts to the server, so
+        // this is needed before any of it — and doing it first keeps a cold
+        // start off the CLI budgets below, as `run_workflow` does.
+        const { instance } = await ensureRunning(config, target);
+        const schemaSource = !target.local
+          ? { objectInfoPath: await ensureObjectInfoCache({ ...address(target), cacheDir: config.cacheDir }) }
+          : {};
+
+        // The base copy: the caller's workflow with `fixed` applied, in this
+        // server's own scratch. `applySlots` is the right primitive for it —
+        // it byte-copies rather than parsing (non-negotiable #1), it writes
+        // remote bytes just as happily as it copies a local file, and with no
+        // `fixed` at all it spawns nothing and is simply the copy. Varying the
+        // base rather than the caller's file is also what keeps `fixed` one
+        // `set-slot` call instead of one per variant.
+        const slotTypes =
+          resolved.source === "remote"
+            ? {}
+            : await resolveSlotTypes(resolved.path, constants, { ...address(target), ...schemaSource });
+        const base = await applySlots(resolved.path, constants, {
+          ...address(target),
+          ...schemaSource,
+          slotTypes,
+          contents: resolved.contents,
+        });
+
+        const variants = makeSweepDir();
+        const submitted: Array<{ variant: number; run: WorkflowRun }> = [];
+        const failed: Array<Record<string, unknown>> = [];
+        let variantSet: Awaited<ReturnType<typeof varyWorkflow>>;
+        try {
+          variantSet = await varyWorkflow(base.path, lists, {
+            outDir: variants.dir,
+            ...address(target),
+            ...schemaSource,
+            timeoutMs: VARY_TIMEOUT_MS,
+          });
+
+          // Sequential, in variant order. ComfyUI executes one prompt at a
+          // time regardless, so concurrency buys nothing at the GPU and costs
+          // determinism in the ledger and in this response's ordering.
+          for (const [variant, path] of variantSet.written.entries()) {
+            try {
+              // A no-op `dispose`: `runWorkflow` takes ownership of what it is
+              // handed and removes it in a `finally`, which is right for one
+              // prepared copy and wrong here — variant 2's file must outlive
+              // variant 1's submit. The whole directory is disposed below,
+              // after every submit, which is the only point at which no file
+              // in it is still needed.
+              const run = await runWorkflow(
+                { path, source: resolved.path, applied: [], warnings: [], dispose: () => {} },
+                { ...address(target), wait: false, timeoutMs: SUBMIT_TIMEOUT_MS },
+              );
+              // Recorded before the next variant is even attempted, so a sweep
+              // that fails partway still leaves every id it did submit
+              // attributed — see `jobLedger.ts`.
+              if (run.promptId !== null) recordJobHost(run.promptId, target);
+              submitted.push({ variant, run });
+            } catch (err) {
+              // The rule `fetchArtifacts` already follows, at the level of a
+              // whole run: one variant that will not submit must not deny the
+              // caller the other fifteen. The variant index travels with it,
+              // because "a value was rejected" is not actionable when there
+              // were sixteen of them.
+              failed.push({ variant, values: valuesAt(lists, variant), ...describeError(err) });
+            }
+          }
+        } finally {
+          // After ALL submissions, on every path. `comfy run` reads the file
+          // when it submits and never again, so this is the first moment none
+          // of them is needed — and the last moment anything could remove
+          // them, since no handle leaves this function.
+          variants.dispose();
+          base.dispose();
+        }
+
+        const promptIds = submitted.flatMap(({ run }) => (run.promptId === null ? [] : [run.promptId]));
+        // Only the ids that really were submitted. `jobs wait` refuses an id it
+        // has no record of, so waiting on a variant that never ran would turn
+        // a partial success into a total failure — and an empty list is
+        // refused outright rather than reported as a wait that finished.
+        const waited =
+          wait && promptIds.length > 0 ? await waitForJobs(promptIds, { ...address(target), timeoutMs }) : null;
+        const byPromptId = new Map((waited ?? []).map((status) => [status.promptId, status]));
+
+        // One allowance for the whole call, spent in variant order — see
+        // SWEEP_FETCH_BUDGET_BYTES. Created even when nothing will be fetched:
+        // it costs an object, and the alternative is a conditional that has to
+        // agree with `fetchIfAsked`'s own.
+        const budget: FetchBudget = { remaining: SWEEP_FETCH_BUDGET_BYTES, total: SWEEP_FETCH_BUDGET_BYTES };
+        const runs: Array<Record<string, unknown>> = [];
+        for (const { variant, run } of submitted) {
+          const status = run.promptId === null ? undefined : byPromptId.get(run.promptId);
+          const outputs = status?.outputs ?? run.outputs;
+          const fetched = await fetchIfAsked(
+            outputs.urls,
+            run.promptId,
+            config,
+            target,
+            fetch_outputs,
+            budget,
+          );
+          runs.push({
+            variant,
+            values: valuesAt(lists, variant),
+            prompt_id: run.promptId,
+            status: status?.status ?? run.status,
+            terminal: status?.terminal ?? run.terminal,
+            outputs: outputsBody(outputs, instance, fetched),
+            ...(status?.error === null || status?.error === undefined ? {} : { error: status.error }),
+          });
+        }
+
+        const body: Record<string, unknown> = {
+          target: targetBody(target),
+          workflow: { name: resolved.name, path: resolved.path, source: resolved.source },
+          variant_count: variantSet.count,
+          varied: Object.keys(lists),
+          fixed: Object.keys(constants),
+          runs,
+          failed,
+          warnings: [
+            ...base.warnings.map((warning) => ({ source: "set_slot", ...warning })),
+            ...variantSet.warnings.map((warning) => ({ source: "vary", ...warning })),
+          ],
+        };
+        if (!wait && promptIds.length > 0) {
+          body["next_step"] =
+            `${promptIds.length} run${promptIds.length === 1 ? " was" : "s were"} submitted and ` +
+            `${promptIds.length === 1 ? "is" : "are"} not finished. Call get_job with each ` +
+            `prompt_id until \`terminal\` is true; its \`outputs\` are the files that variant produced.`;
+        }
+        return body;
       }),
   );
 
