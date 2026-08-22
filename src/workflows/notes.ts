@@ -95,7 +95,7 @@ export interface NoteListing {
 export interface ListNotesOptions {
   /**
    * Budget for the CLI call. Defaults to `runComfy`'s 120 seconds, which is
-   * four hundred times this command's measured cost — so the server's own
+   * over 350x this command's measured cost (0.32-0.34s) — so the server's own
    * caller passes a short one rather than taking it (`NOTES_TIMEOUT_MS` in
    * `tools.ts`, with the reasoning).
    */

@@ -197,6 +197,7 @@ const MANAGED_ENV = [
   "COMFY_BIN",
   "FAKE_COMFY_MODE",
   "FAKE_COMFY_ARGV_OUT",
+  "FAKE_COMFY_ARGV_LOG",
   "FAKE_COMFY_DATA_FILE",
   "FAKE_COMFY_ERROR_CODE",
   "FAKE_COMFY_ERROR_MESSAGE",
@@ -1116,6 +1117,44 @@ test("a note that fits carries no truncation marker at all", async () => {
   const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
 
   expect(body.notes_truncated).toBeUndefined();
+  // Present even with nothing cut: a total that only appears when it disagrees
+  // with the array would make its absence ambiguous.
+  expect(body.notes_count).toBe(1);
+});
+
+test("when notes are DROPPED, the count still reports how many the workflow really has", async () => {
+  // The reason `NoteListing.count` disagrees with its own array on purpose.
+  // `notes_truncated: true` says something was left out; without a true total
+  // the caller cannot learn how much, and the difference is the whole answer —
+  // here, six notes it is not looking at.
+  //
+  // Mutant A: drop the `notes_count` spread from describe_workflow's body.
+  // This test dies on the undefined.
+  //
+  // Mutant B: wire it to `notes.length` rather than `count` — the redundant
+  // shape `event_count` already has, where the count merely restates the array
+  // beside it. This test dies on 24 !== 30. Note that the text-trimming case
+  // above CANNOT kill mutant B: it caps one note's body, so the true total and
+  // the array length are both 1 and the two implementations agree. Dropping
+  // notes is the only case that separates them.
+  writeWorkflow("default_image_gen");
+  seedObjectInfoCache();
+  serveSlots();
+  serveNotes(
+    Array.from({ length: 30 }, (_unused, index) => ({
+      id: index,
+      type: "MarkdownNote",
+      title: `Note ${index}`,
+      text: "fits",
+      subgraph: null,
+    })),
+  );
+
+  const body = await ok(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  expect(body.notes_count).toBe(30); // MAX_NOTES is 24
+  expect(body.notes as unknown[]).toHaveLength(24);
+  expect(body.notes_truncated).toBe(true);
 });
 
 test("a notes failure does not cost the description", async () => {
@@ -1133,6 +1172,10 @@ test("a notes failure does not cost the description", async () => {
   expect(body.schema).toBeDefined();
   expect(body.notes).toEqual([]);
   expect(typeof body.notes_unreadable).toBe("string");
+  // No count either: `notes: []` here means "could not look", and a
+  // `notes_count: 0` beside it would assert something about the workflow that
+  // this call never established.
+  expect(body.notes_count).toBeUndefined();
 });
 
 // --- describe_workflow: decoy addresses (a link overrides the widget) ----
@@ -2657,12 +2700,20 @@ test("validate_workflow survives a failed launch the same way", async () => {
   const port = nothingRunning();
   cacheAged("127.0.0.1", port, TWO_WEEKS);
   process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  const log = cliLog();
   launchFails("port_in_use", "port 8188 is already bound");
   process.env.FAKE_COMFY_MODE = "validate";
   process.env.FAKE_COMFY_VALIDATE_FILE = VALIDATE_SAMPLE;
 
   const body = await ok(await connect(), "validate_workflow", { workflow: "default_image_gen" });
 
+  // Asserting the launch was ATTEMPTED, not just that an answer arrived: every
+  // assertion below is equally satisfied by falling straight through to the
+  // floor without ever launching, which is a different (and weaker) behaviour
+  // than the one this test is named for. Its sibling above already pins the
+  // pair; without it this test cannot tell "the floor is behind the launch"
+  // from "the floor replaced the launch".
+  expect(await settledInvocationsOf(log, "launch", 1)).toHaveLength(1);
   expect(body["valid"]).toBeDefined();
   expect((body["object_info"] as Record<string, unknown>)["stale"]).toBe(true);
 });
@@ -2685,6 +2736,33 @@ test("with nothing on disk either, the LAUNCH failure is what the caller is told
 
   expect(error["code"]).toBe("not_in_workspace");
   expect(error["kind"]).not.toBe("object_info_unavailable");
+});
+
+test("a missing binary is still reported even when the stale floor absorbs the launch failure", async () => {
+  // `withObjectInfo`'s `catch (launchFailed)` is deliberately unqualified, so
+  // it swallows a MISSING BINARY too whenever a stale cache exists — the one
+  // case where that catch is doing something other than what it was written
+  // for. This pins what the caller is actually told, so the decision to leave
+  // it unqualified stays checkable rather than assumed.
+  //
+  // Measured answer: the floor absorbs the launch failure, and then the very
+  // next thing describe_workflow does is shell out to `comfy workflow slots`,
+  // which cannot start either. The missing binary reaches the caller from
+  // there, named, with the path it looked at — one call later than a narrowed
+  // catch would have produced, and with the same verdict. That is why the
+  // catch stays unqualified: narrowing it would buy a marginally earlier
+  // report of an error that arrives anyway, at the cost of the floor's own
+  // rule that EVERY route out of the launch arrow reaches it.
+  writeWorkflow("default_image_gen");
+  const port = nothingRunning();
+  cacheAged("127.0.0.1", port, TWO_WEEKS);
+  process.env.MCP_COMFYUI_AUTO_LAUNCH = "1";
+  process.env.COMFY_BIN = join(workdir, "definitely-not-installed");
+
+  const error = await failure(await connect(), "describe_workflow", { workflow: "default_image_gen" });
+
+  expect(error["kind"]).toBe("comfy_unavailable");
+  expect(error["binary"]).toBe(join(workdir, "definitely-not-installed"));
 });
 
 test("the configured workspace reaches comfy launch as a root flag", async () => {
