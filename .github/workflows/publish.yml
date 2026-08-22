@@ -1,8 +1,24 @@
-name: Publish
+name: Test and publish
 
+# The test and typecheck steps below are the ONLY automated gate this repo has,
+# and until 2026-08-22 they ran exclusively on a push to `main` — the same run
+# that publishes. So a test that failed only on `ubuntu-latest` was invisible
+# until the moment it blocked a release, and one did exactly that: an
+# intermittent failure on PR #22's merge (run 32149609864) published nothing,
+# and 0.6.11 reached JSR only because PR #23 came along behind it and happened
+# to pass.
+#
+# `pull_request` closes that hole. It deliberately runs THIS job rather than a
+# separate `ci.yml`: a PR then exercises the identical steps, on the identical
+# pinned Deno and Node, that will gate the release — a second workflow would
+# duplicate those pins, and this project has twice paid for a number that lived
+# in two places (`SERVER_VERSION` vs the manifest, and the deleted
+# `package.json`'s duplicate `version`). Only the publish step is conditional,
+# so the release path on a push to `main` is unchanged.
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -61,5 +77,11 @@ jobs:
       #
       # `jsr publish` is a no-op when deno.json's version is already published,
       # so pushing to main without bumping the version is safe and silent.
+      #
+      # The one step a pull request must NOT reach: a PR is here to run the
+      # gates, not to release. Guarded on the event rather than on the branch
+      # because `workflow_dispatch` has to keep working, and a dispatch is a
+      # deliberate act by someone who already has push access.
       - name: Publish to JSR
+        if: github.event_name != 'pull_request'
         run: npx jsr publish --no-check
