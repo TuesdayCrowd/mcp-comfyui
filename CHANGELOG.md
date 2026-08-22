@@ -4,7 +4,39 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.11] — 2026-08-18
+## [Unreleased]
+
+### Added
+
+- **`describe_workflow` reports `notes_count`, the workflow's true note total.**
+  `notes_truncated: true` said something had been left out and gave no way to
+  learn how much; the pre-cap total was computed and then dropped on the floor.
+  `notes_count - notes.length` is now the number of notes not shown, and the two
+  being equal means the cut was a trimmed note body rather than a dropped note.
+  Absent — not `0` — when the notes could not be read at all, since `notes: []`
+  there means "could not look" and a count beside it would assert something
+  about the workflow the call never established.
+
+### Fixed
+
+- **A merge to `main` could silently publish nothing.** `publish.yml` gates
+  publishing on the test step, and one test failed intermittently on
+  `ubuntu-latest` — so a green-looking merge published no release. It already
+  cost one: PR #22's merge failed on it (run `32149609864`) and 0.6.11 reached
+  JSR only because PR #23 came along behind it and happened to pass.
+
+  The cause was not the timeout it looked like. The test's teardown called
+  `child.kill()` on a child whose *termination is the thing under test* — it
+  asserts an oversized payload kills the transport loudly. Deno reaps an exited
+  child on a background task, and `kill()` on a reaped child throws
+  `TypeError: Child process has already terminated`; measured, that reap lands
+  ~2ms after exit, so the test passed only while its remaining steps all
+  completed inside that window. Measured by injecting a delay and changing
+  nothing else: 0ms passes, **5ms fails** with CI's exact error. Teardown now
+  treats "already terminated" as the success it is — there is no race-free
+  `if (running) kill()` to write instead — and is shared by all five raw-stdio
+  tests, so a child that dies unexpectedly elsewhere reports its own assertion
+  failure rather than a confusing teardown error at the same line.
 
 ### Added
 

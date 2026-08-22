@@ -126,7 +126,7 @@ const MAX_TIMEOUT_SECONDS = 1_800;
  * inheriting the default would let a hung notes call hold an otherwise-complete
  * description for two minutes. The command is a local JSON parse with no server
  * in it at all and measures 0.32-0.34s against an 84KB workflow, so 15 seconds
- * is roughly forty times the observed cost: long enough that a slow disk or a
+ * is 44-47x the observed cost: long enough that a slow disk or a
  * cold Python start never trips it, short enough that a hang degrades to
  * `notes_unreadable` instead of stalling the tool.
  */
@@ -979,6 +979,27 @@ async function withObjectInfo(
         // CLI's verdict names a fix, `InstanceUnavailableError` names the
         // setting that changes it, and "could not read node definitions:
         // fetch failed" is implied by all of them anyway.
+        //
+        // **Unqualified on purpose, and so is `afterLaunch` below** — reviewed
+        // and left as a pair, since narrowing one and not the other would give
+        // two routes to the same floor two different rules. Narrowing means
+        // picking a set of error types the floor is allowed to stand behind,
+        // and the failure mode of getting that set wrong is the exact hard
+        // failure this floor exists to remove, in the exact scenario it was
+        // built for. The cost is that a missing `comfy` binary, or a
+        // programming error inside `ensureInstance`, is absorbed here whenever
+        // a stale cache exists — measured, and it costs nothing: both call
+        // sites shell out to `comfy` immediately afterwards, so the binary's
+        // absence reaches the caller from that next call instead, named and
+        // with the path it tried. Pinned by "a missing binary is still
+        // reported even when the stale floor absorbs the launch failure".
+        //
+        // Measured, not assumed: adding `if (name === "ComfyUnavailableError")
+        // throw launchFailed` here — the narrowed variant, in full — leaves the
+        // entire suite green and that test reporting the identical
+        // `comfy_unavailable` verdict with the identical binary path. Narrowing
+        // buys nothing a caller can observe, which is the case for leaving the
+        // floor's reach whole.
         return await orStale(location, launchFailed);
       }
       // It was up all along, so the address is not the problem; the original
@@ -1622,6 +1643,19 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
             unresolved: described.unresolved,
             inert: described.inert,
             notes: notes.ok ? notes.value.notes : [],
+            // The TRUE pre-cap total, which is the whole reason `NoteListing`
+            // carries a `count` that disagrees with its own array: without it
+            // `notes_truncated: true` tells a caller something was left out and
+            // gives it no way to learn how much. `notes_count - notes.length` is
+            // the number of notes dropped; the two being equal means the cut was
+            // a trimmed note BODY rather than a dropped note, which is the other
+            // thing `truncated` covers.
+            //
+            // Absent when the notes could not be read at all: `notes: []` there
+            // is paired with `notes_unreadable` and reads as "none available",
+            // but a `notes_count: 0` beside it would be a claim about the
+            // workflow that this call never established.
+            ...(notes.ok ? { notes_count: notes.value.count } : {}),
             // Absent, not false/empty, when there is nothing to say — the same
             // structural-absence rule `outputs.local_paths` and
             // `remote_unreadable` already follow.

@@ -15,13 +15,16 @@ released it as `d2c54f4`. **`@tuesdaycrowd/mcp-comfyui@0.6.11` is live on JSR.**
 `deno.json` and `src/server.ts`'s `SERVER_VERSION` both read `0.6.11`, and the
 CHANGELOG's `[Unreleased]` section became `[0.6.11] — 2026-08-18`.
 
-Release note for next time: `deno bump-version` rewrites `deno.json` **only**.
-`SERVER_VERSION` is a deliberate literal, not an import of the manifest, so it
-must be updated by hand in the same commit — `tests/server.test.ts` pins the two
-together precisely because they drifted apart for four releases once. Use an
-explicit increment (`deno bump-version patch`); a bare invocation runs in
-conventional-commits mode and prepends to a `Releases.md` this repo does not
-use.
+Release note for next time — **superseded by PR #25, do not hand-edit versions
+any more.** `deno task release patch` (or `minor`/`major`) now rewrites all
+three places the number lives: `deno.json`, `SERVER_VERSION` in `src/server.ts`,
+and the CHANGELOG's `[Unreleased]` heading. It edits and stops — no commit, no
+push, no publish — because JSR will not republish a spent version number.
+
+The advice this replaces said to update `SERVER_VERSION` by hand and to avoid a
+bare `deno bump-version` (which runs in conventional-commits mode and prepends
+to a `Releases.md` this repo does not use). Both still describe `bump-version`
+correctly; they are simply no longer the route to take.
 
 It shipped two things:
 
@@ -41,6 +44,30 @@ Design doc, which is the binding authority for anything that touches this:
 
 Verified at the branch head: `deno task test` → 156 passed (663 steps), 0
 failed. `deno task typecheck` → 0 errors. Ground truth gained entries #32-#34.
+
+### A flaky test gated publishing — FIXED 2026-08-22, and the recorded hypothesis was wrong
+
+**Resolved.** Cause and fix are in the CHANGELOG's `[Unreleased]` entry. Two
+things worth carrying forward:
+
+- **The hypothesis recorded below (a too-short `readFor` window) was wrong**, and
+  the evidence that falsified it was already in the CI log: the test failed in
+  **723ms**, far short of the 5s+4s+1s a timeout theory needs. A flake that fails
+  *fast* is not a timeout. The actual error named the line —
+  `TypeError: Child process has already terminated` at `child.kill("SIGKILL")` —
+  and the real cause was teardown killing a child whose death is the thing the
+  test asserts. Reading `gh run view <id> --log-failed` first would have cost one
+  turn and saved the whole hypothesis.
+- **A Mac cannot reproduce this one.** Measured: the unguarded teardown passes
+  15/15 even under 32 CPU burners on 16 cores, so a contention run here has no
+  detection power and green proves nothing. The regression test therefore does
+  not try to reproduce the race — it forces the reaped state with
+  `await child.status`, so it fails 100% against the unguarded teardown on any
+  platform. When a flake will not reproduce locally, pin the *state* the race
+  produces rather than chasing the race.
+
+The original note is kept below, since the publish-gating hazard it describes is
+still real for the next flake.
 
 ### A flaky test gates publishing — read this before the next release
 
@@ -104,10 +131,41 @@ current code, or explicitly closed with a recorded reason. For item 6
 specifically: the cause identified by measurement, and the test green across a
 run of repeats under contention — not one green CI run.
 **Tests**: named per item below.
-**Status**: Not Started
+**Status**: **Complete — 2026-08-22.** `deno task test` → 156 passed (666
+steps), 0 failed. `deno task typecheck` → 0 errors.
 
-All five confirmed still present as of this writing. None blocks a merge; they
-are the kind of thing worth doing while the context is warm, or never.
+How each item was closed:
+
+1. **`notes_count` is emitted** — the true pre-cap total, absent when the notes
+   were unreadable. Two tests: dropped notes (30 in, 24 out) and the
+   already-present untruncated case. The dropped-notes case is the one that
+   matters — the existing text-trimming test caps one note's *body*, so total
+   and array length are both 1 there and it cannot tell a correct
+   implementation from one wired to `notes.length`. Both mutants verified dead.
+   Worth noting for the `events` precedent this cites: `event_count` is
+   `run.events.length` *after* the cap, so it restates its own array and the
+   real total is discarded there too. `notes_count` is the better-designed of
+   the two, not merely the consistent one.
+2. **Both catches stay unqualified** — reviewed as a pair, decision recorded in
+   `withObjectInfo`. Measured, not argued: adding
+   `if (name === "ComfyUnavailableError") throw launchFailed` leaves the whole
+   suite green and the caller getting the identical `comfy_unavailable` verdict
+   with the identical path, because both call sites shell out to `comfy`
+   immediately afterwards. Narrowing buys nothing observable and costs the
+   floor's rule that every route out of the launch arrow reaches it. Pinned by
+   a new test.
+3. **Done** — `cliLog()` + `settledInvocationsOf(log, "launch", 1)` added, so
+   the test can now tell "the floor is behind the launch" from "the floor
+   replaced the launch".
+4. **Both figures corrected to what the 0.32-0.34s measurement supports** —
+   "four hundred times" → "over 350x", "roughly forty times" → "44-47x".
+5. **Done, and the class swept rather than the instance.** `FAKE_COMFY_ARGV_LOG`
+   added to `MANAGED_ENV`; an audit of every `process.env.X =` assignment in the
+   file against `MANAGED_ENV` now shows 32 assigned, 0 uncleaned. (The first
+   version of that audit was itself wrong — its pattern required the value on
+   the same line and missed the two-line assignment at 1296. A grep-based audit
+   needs its own negative control.)
+6. **Fixed** — see the section above.
 
 1. **`NoteListing.count` is computed and then discarded** (`src/tools.ts:1628`).
    `src/workflows/notes.ts` computes the true pre-cap total and its docstring
