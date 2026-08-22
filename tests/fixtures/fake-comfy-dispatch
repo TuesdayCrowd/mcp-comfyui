@@ -14,6 +14,7 @@
 #                              defaulted, to keep every test written before
 #                              `run_workflow` could make this call unchanged)
 #   $FAKE_COMFY_NOTES_MODE     mode for a `workflow notes` call (default: notes_file)
+#   $FAKE_COMFY_VARY_MODE      mode for a `workflow vary` call (default: vary)
 #   $FAKE_COMFY_LAUNCH_MODE    mode for a `launch` call (default: none — opt-in,
 #                              exactly like $FAKE_COMFY_SLOTS_MODE and for the
 #                              same compatibility reason)
@@ -46,6 +47,12 @@ for arg in "$@"; do
     # workflow that carries no notes, not a fixture error, so that every test
     # written before notes existed keeps getting a clean description.
     notes)    FAKE_COMFY_MODE="${FAKE_COMFY_NOTES_MODE:-notes_file}"; break ;;
+    # `run_sweep` makes a `workflow vary` call and then one `run` per variant,
+    # so a sweep needs both this and $FAKE_COMFY_RUN_MODE armed at once — the
+    # same reason this wrapper exists at all. Defaulted like `notes` rather
+    # than opt-in like `slots`: nothing written before `vary` existed can make
+    # this call, so there is no earlier behaviour for a default to disturb.
+    vary)     FAKE_COMFY_MODE="${FAKE_COMFY_VARY_MODE:-vary}"; break ;;
     # Auto-launch fires from inside a tool handler, so `describe_workflow` and
     # `validate_workflow` can each make a `launch` call alongside their own —
     # and a test about a launch that FAILS needs the other call still
