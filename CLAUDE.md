@@ -117,7 +117,7 @@ Ground truth #28–#29; do not try to "fix" the field by deriving it — see the
 
 That gate is now enforced twice, at two different distances. `launchInstance` refuses a non-local target outright (`RemoteLaunchRefusedError`, reported as `host_not_local`); and `tools.ts`'s `ensureRunning` never reaches it for a remote host at all — it probes, and reports `host_unreachable` if nothing answers. The second exists because the first's message would be the wrong one: `InstanceUnavailableError` offers `MCP_COMFYUI_AUTO_LAUNCH=1` as the fix, and for a box on another network that setting cannot help.
 
-The same locality question decides artifact paths. `comfy/outputs.ts` resolves a `/view` URL against the output directory the running instance reported and then checks the file exists — **on this machine**. A remote Linux box with `/home/x/ComfyUI/output` would pass that check against a completely different image; the live Windows remote hid this by accident, since `F:\Dev\ComfyUI\output` is not `isAbsolute` under POSIX. `resolveArtifactPath` now refuses a non-local instance first, before any of the other checks.
+The same locality question decides artifact paths. `comfy/outputs.ts` resolves a `/view` URL against the output directory the running instance reported and then checks the file exists — **on this machine**. A remote Linux box with `/home/x/ComfyUI/output` would pass that check against a completely different image; the live Windows remote hid this by accident, since `D:\ComfyUI\output` is not `isAbsolute` under POSIX. `resolveArtifactPath` now refuses a non-local instance first, before any of the other checks.
 
 **7. A job belongs to the host that ran it, and a guess is not detectable.** comfy-cli does not attribute jobs to hosts: the `host`/`port` in a job payload echo the flag the caller passed. Measured, asking the wrong host about a real job answers `prompt_not_found` — byte-identical to the answer for an id that never existed. So `src/jobLedger.ts` records where each run was sent, and `get_job`/`cancel_job` refuse rather than guess: a miss falls through to the only host when the registry holds exactly one (there is nothing to get wrong), and otherwise names the candidates. The ledger is in memory and bounded; attribution deliberately does not survive a restart, because persisting it means a second file format for a case whose workaround is one argument.
 
@@ -165,13 +165,21 @@ GitButler. Use the `gitbutler` skill and `but commit`, never `git commit`.
 
 ## Verified end to end
 
+> **Addresses, hostnames and home paths below are redacted placeholders.**
+> This file is public. A remote host appears as `198.51.100.10` (RFC 5737
+> TEST-NET-2, reserved for documentation and routable nowhere) and as
+> `rtx-video`; home directories appear as `~/`. Only the identifying values
+> were substituted — every measured behaviour, byte count, error code and
+> path *shape* is exactly as observed.
+
+
 Against a live ComfyUI 0.29.0 through the compiled binary over stdio: `describe_workflow` returned bounds for all five slots of `workflow.smoke` with zero unresolved, and `run_workflow {1.width:128, 1.height:96} wait:true` produced a 128×96 PNG. `get_job` reported an earlier submit `completed` with its output. `applySlots` was separately verified to keep a 2^64−1 seed byte-exact.
 
-**Multi-host, verified on 2026-08-07** through `dist/index.js` under `node` over real stdio, against a live ComfyUI **0.30.2** on a Windows RTX 4070 at `100.86.199.90:8189` while this machine's own ComfyUI was stopped:
+**Multi-host, verified on 2026-08-07** through `dist/index.js` under `node` over real stdio, against a live ComfyUI **0.30.2** on a Windows RTX 4070 at `198.51.100.10:8189` while this machine's own ComfyUI was stopped:
 
-- `comfy_status {host: "rtx-video"}` and the same call with the raw address `100.86.199.90:8189` both returned that instance, reporting `local: false`, `output_directory: "F:\\Dev\\ComfyUI\\output"` and `--listen 100.86.199.90,127.0.0.1`.
+- `comfy_status {host: "rtx-video"}` and the same call with the raw address `198.51.100.10:8189` both returned that instance, reporting `local: false`, `output_directory: "D:\\ComfyUI\\output"` and `--listen 198.51.100.10,127.0.0.1`.
 - `comfy_status` with no `host` reported the default as down, in the same session — two hosts, two answers, one process.
-- `describe_workflow {workflow: "default_image_gen", host: "rtx-video"}` returned all 13 slots with zero unresolved, and `4.ckpt_name`'s enum was `["ltx-2.3-22b-dev-fp8.safetensors"]` — **the checkpoints installed on the Windows box, not on this Mac**. That is the whole value of per-host node definitions, and the cache landed at `object_info-100.86.199.90-8189.json`.
+- `describe_workflow {workflow: "default_image_gen", host: "rtx-video"}` returned all 13 slots with zero unresolved, and `4.ckpt_name`'s enum was `["ltx-2.3-22b-dev-fp8.safetensors"]` — **the checkpoints installed on the Windows box, not on this Mac**. That is the whole value of per-host node definitions, and the cache landed at `object_info-198.51.100.10-8189.json`.
 - `list_workflows {host: "rtx-video"}` returned this machine's 27 local workflows tagged `local` and no remote ones, the remote being a fresh install with an empty `workflows` directory — which its userdata API reports as a 404, read here as an empty library rather than a fault.
 - Two defects were found by this run and fixed: `UserdataError` reached the tool layer unclassified and was reported as `internal_error`; and a *mistyped workflow name* fell through to the default host's library, failed to reach it, and came back as `fetch failed` about `/api/userdata` instead of `workflow_not_found` with the 27 names that would have worked. A host consulted only as a fallback must not become the story; one the caller named still is.
 
@@ -183,22 +191,22 @@ A real run also confirmed three things previously known only from source: `conve
 - `create_workflow_from_template {template: "video_wan2_2_14B_i2v"}` fetched the real workflow and wrote 84289 bytes — a genuine frontend graph (`nodes`, `last_node_id: 164`, `last_link_id: 292`), matching the design doc's own capture of this same template.
 - `describe_workflow` on the result was not exercised in that run: no instance was reachable on this machine, and `MCP_COMFYUI_AUTO_LAUNCH=0` meant the call never tried to start one. It failed with `object_info_unavailable` and the script exited 1 — the graceful-degradation path this script exists to prove, working as designed.
 
-**The remaining step, closed on 2026-08-08** against the live Windows box at `100.86.199.90:8189` (ComfyUI **0.30.2**, registered as `xinde-win-64`), through `dist/index.js` under `node` over real stdio, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout and the **real** created-workflows directory rather than a temp one:
+**The remaining step, closed on 2026-08-08** against the live Windows box at `198.51.100.10:8189` (ComfyUI **0.30.2**, registered as `rtx-video`), through `dist/index.js` under `node` over real stdio, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout and the **real** created-workflows directory rather than a temp one:
 
 - `search_templates {type: "video", tag: "Image to Video", limit: 5}` matched 53 of 574 and returned 5, `truncated: true`.
 - `create_workflow_from_template {template: "video_wan2_2_14B_i2v"}` wrote 84289 bytes to `~/.local/share/mcp-comfyui/workflows/`, and `list_workflows` then reported it `origin: "template"`, `format: "frontend"` — the created root is discovered, classified and tagged with no further argument.
-- `describe_workflow {workflow: "video_wan2_2_14B_i2v", host: "xinde-win-64"}` returned **44 settable, 14 inert, 0 unresolved** — matching the design-phase measurement exactly, at a nesting depth where 55 of 58 addresses are inside a subgraph. The inert set is the same fourteen: `129/98.length` (fed by `ComfyMathExpression`), `129/94.fps` (`PrimitiveFloat`), and the twelve sampler/switch addresses.
+- `describe_workflow {workflow: "video_wan2_2_14B_i2v", host: "rtx-video"}` returned **44 settable, 14 inert, 0 unresolved** — matching the design-phase measurement exactly, at a nesting depth where 55 of 58 addresses are inside a subgraph. The inert set is the same fourteen: `129/98.length` (fed by `ComfyMathExpression`), `129/94.fps` (`PrimitiveFloat`), and the twelve sampler/switch addresses.
 - **The enums came from the Windows box, not this Mac.** `129/90.vae_name` offered `wan2.2_vae.safetensors`, `129/102.lora_name` offered `wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors`, and `97.image` listed that machine's own input directory. Zero unresolved means every node in a gallery template resolved against a host this server had never described before — which is the whole point of joining slots to per-host `/object_info`.
 
-**Automatic artifact copying, verified on 2026-08-22** through `dist/index.js` under `node` over real stdio (`scripts/smoke-remote-artifacts.mjs`), against a live ComfyUI **0.33.3** on the Windows RTX 4070, reached over Tailscale at `100.86.199.90:8188`, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout:
+**Automatic artifact copying, verified on 2026-08-22** through `dist/index.js` under `node` over real stdio (`scripts/smoke-remote-artifacts.mjs`), against a live ComfyUI **0.33.3** on the Windows RTX 4070, reached over Tailscale at `198.51.100.10:8188`, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout:
 
-- `run_workflow {workflow: "image_chroma1_radiance_text_to_image", host: "100.86.199.90:8188", wait: true}` — **passing no `fetch_outputs`** — completed in 31.3s and returned `outputs.fetched` naming `~/.cache/mcp-comfyui/fetched/<prompt_id>/Chroma-Radiance_00005_.png`, which really existed at 1,559,836 bytes and is a genuine 1024×1024 8-bit RGB PNG.
-- **`local_paths` stayed `{}`**, correctly: the copy here is not the instance's own file, which is still on `F:\Dev\ComfyUI\output`.
+- `run_workflow {workflow: "image_chroma1_radiance_text_to_image", host: "198.51.100.10:8188", wait: true}` — **passing no `fetch_outputs`** — completed in 31.3s and returned `outputs.fetched` naming `~/.cache/mcp-comfyui/fetched/<prompt_id>/Chroma-Radiance_00005_.png`, which really existed at 1,559,836 bytes and is a genuine 1024×1024 8-bit RGB PNG.
+- **`local_paths` stayed `{}`**, correctly: the copy here is not the instance's own file, which is still on `D:\ComfyUI\output`.
 - A second `get_job` on the same `prompt_id` left the file's mtime unchanged — the copy was reused, not refetched.
 - **The per-`prompt_id` directory earned itself.** Two separate runs both produced `Chroma-Radiance_00005_.png`, byte-identical in size, because ComfyUI's counter restarts per output-node prefix. They sit in different directories rather than one overwriting the other.
 - **The ceiling and its disclosure**, with `AUTO_FETCH_MAX_BYTES` temporarily lowered to 1 MiB and an isolated `MCP_COMFYUI_CACHE_DIR`: that same image came back in `outputs.not_fetched` as `1559836 bytes exceeds this call's 1048576-byte limit; pass fetch_outputs: true to copy it anyway`, with `fetch_problems: []` — and `fetch_outputs: true` then brought it across. The byte count is the remote's own `Content-Length` (ground truth #41), so the pre-check declines a large artifact without moving it.
 
-Two things this run corrected. The registry's `xinde-win-64` entry pointed at port **8189**; the box now serves **8188**, and `comfy_status` reports `target.local` — on `target`, beside the address it describes, not at the top level. And `run_workflow {wait: true}` against a real render outlasts the **MCP client's own 60s default request timeout**, which is a property of the client rather than of this server: the run is not lost, it carries on and its artifacts are still fetched. A harness waiting on a real generation must raise that timeout.
+Two things this run corrected. The registry's `rtx-video` entry pointed at port **8189**; the box now serves **8188**, and `comfy_status` reports `target.local` — on `target`, beside the address it describes, not at the top level. And `run_workflow {wait: true}` against a real render outlasts the **MCP client's own 60s default request timeout**, which is a property of the client rather than of this server: the run is not lost, it carries on and its artifacts are still fetched. A harness waiting on a real generation must raise that timeout.
 
 ## Known gaps
 

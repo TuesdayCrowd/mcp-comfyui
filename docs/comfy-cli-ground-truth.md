@@ -6,12 +6,19 @@
 > caused. **Read this before changing anything that touches the CLI.**
 
 
+> **Addresses, hostnames and home paths below are redacted placeholders.**
+> This file is public. A remote host appears as `198.51.100.10` (RFC 5737
+> TEST-NET-2, reserved for documentation and routable nowhere) and as
+> `rtx-video`; home directories appear as `~/`. Only the identifying values
+> were substituted — every measured behaviour, byte count, error code and
+> path *shape* is exactly as observed.
+
 Everything below was executed against a live ComfyUI Desktop (v0.29.0, `127.0.0.1:8188`) on 2026-08-02. Do not re-derive; do not assume anything not listed here.
 
 **Environment**
 - `comfy` installed via `uv tool install --python 3.13 --from <local comfy-cli tree> comfy-cli` → `~/.local/bin/comfy` (already on fish PATH via `config.fish:78`).
 - Local comfy-cli tree is `v1.13.0-59-g95d7897`, newer than PyPI 1.13.0. It reports `"version": "0.0.0"` in envelopes because the tree leaves version stamping to CI. **Do not version-gate on this field.**
-- Workflow files: `/Users/lawls/ComfyUI-Shared/user/default/workflows` (22 files, all UI/frontend format).
+- Workflow files: `~/ComfyUI-Shared/user/default/workflows` (22 files, all UI/frontend format).
 - ComfyUI Desktop owns the running process. It is **not** a comfy-cli workspace.
 
 **The envelope contract** — every `comfy` command in JSON mode emits:
@@ -47,7 +54,7 @@ On failure `ok:false` and `error:{code,message,hint,details}`.
    $ comfy --skip-prompt --json launch --background -- --port 8189
    exit 1 | stdout: 0 bytes
    stderr: Traceback … FileNotFoundError: [Errno 2] No such file or directory:
-           '/Users/lawls/Documents/comfy/ComfyUI'
+           '~/Documents/comfy/ComfyUI'
    ```
    So a failed launch arrives as "no usable envelope", not a classified verdict. **Anything waiting for readiness must treat a non-zero exit with no envelope as terminal**, or it waits out the whole budget for a child that died in under a second.
 11. **comfy-cli's own `server_already_running` is global, not per-port.** It fires from `ConfigManager().background` — comfy-cli's single-slot record of a background process *it* started — checked before the target port is even parsed (`launch.py:270`). `port_in_use` (`launch.py:321`) *is* per-port, probing `/history` on the resolved port. Consequence: an instance started by ComfyUI Desktop is invisible to `server_already_running`, but once *this server* has launched one via comfy-cli, a second launch on any other port is refused until `comfy stop` clears the slot.
@@ -70,15 +77,15 @@ On failure `ok:false` and `error:{code,message,hint,details}`.
 17. **Pass `env` explicitly to every spawned child — do not rely on a runtime's default env-forwarding behaviour.** Historical origin: `Bun.spawn`, this project's spawn API before the Deno migration, did not give the child runtime mutations of `process.env`; it captured the environment as it stood at process start unless `env` was passed explicitly. Verified directly at the time: with `process.env.PROBE` set at runtime, the child saw `default=[]` but `explicit=[hello]` when spawned with `env: process.env`. This was not cosmetic — during Task 1.3 it caused a test fixture to be bypassed and the **real `comfy` binary to be invoked** by the suite. `node:child_process.spawn`, this project's spawn API now, already forwards live `process.env` by default (also verified directly), so that particular failure mode no longer reproduces — but every spawn in this project still passes `env: process.env` explicitly, on principle, so behaviour cannot regress if a runtime's default ever changes upstream.
 18. **`--host`/`--port` follow the subcommand, where `--json` and `--workspace` precede it.** Verified against the installed CLI: `comfy workflow slots --help`, `comfy workflow set-slot --help`, `comfy run --help` and `comfy jobs ls|status|cancel --help` all list `--host`/`--port` as *subcommand* options, while `--json`, `--skip-prompt` and `--workspace` are Typer **root** options (landmine #3). So both orderings now appear in one argv, and a test that asserts a flag is merely *present* is not asserting the thing that breaks: `comfy --json jobs ls --host H --port P` works, `comfy jobs ls --json` does not.
 
-    Measured live: `comfy --json jobs ls --host 100.86.199.90 --port 8189 --limit 3` returned three jobs from a remote box, and the same command against a black-holed address hung until `timeout 15` killed it — proving the flag drives a real outbound call rather than being ignored.
+    Measured live: `comfy --json jobs ls --host 198.51.100.10 --port 8189 --limit 3` returned three jobs from a remote box, and the same command against a black-holed address hung until `timeout 15` killed it — proving the flag drives a real outbound call rather than being ignored.
 
 19. **`comfy launch` accepts no `--host` and no `--port`.** It starts a process on whichever machine runs `comfy`. Launching a remote ComfyUI is not a comfy-cli capability, so any code that "handles" a remote launch is handling something that cannot happen — see landmine #21 for what attempting it actually costs.
 
-20. **comfy-cli does not attribute a job to a host.** A job record carries `[outputs, prompt_id, queue_position, status, updated_at, where, workflow_path, workflow_size]`. The `host` and `port` in the envelope's `data` echo the flag passed on the command line: with no flag `jobs ls` reports `127.0.0.1:8188`; with `--host 100.86.199.90` it reports that instead, over the **same 39 records**.
+20. **comfy-cli does not attribute a job to a host.** A job record carries `[outputs, prompt_id, queue_position, status, updated_at, where, workflow_path, workflow_size]`. The `host` and `port` in the envelope's `data` echo the flag passed on the command line: with no flag `jobs ls` reports `127.0.0.1:8188`; with `--host 198.51.100.10` it reports that instead, over the **same 39 records**.
 
-    Worse, asking the wrong host about a real job is not a recognisable error. Measured: `comfy --json jobs status 25e9540a-… --host 100.86.199.90 --port 8189` returned `prompt_not_found`, confidently — for a job that exists, that this server submitted to local `8188`. That is byte-identical to the answer for an id that never existed, so **a guess about which host a job is on produces a confidently wrong answer, not a detectable one.** Hence `src/jobLedger.ts`.
+    Worse, asking the wrong host about a real job is not a recognisable error. Measured: `comfy --json jobs status 25e9540a-… --host 198.51.100.10 --port 8189` returned `prompt_not_found`, confidently — for a job that exists, that this server submitted to local `8188`. That is byte-identical to the answer for an id that never existed, so **a guess about which host a job is on produces a confidently wrong answer, not a detectable one.** Hence `src/jobLedger.ts`.
 
-    `jobs cancel` fails differently again: it short-circuits on comfy-cli's own *local* records and returns `no local job with id '…'`, where `jobs status` returns `No prompt with id '…' on 100.86.199.90:8189`. Two different failures; a caller must not merge them.
+    `jobs cancel` fails differently again: it short-circuits on comfy-cli's own *local* records and returns `no local job with id '…'`, where `jobs status` returns `No prompt with id '…' on 198.51.100.10:8189`. Two different failures; a caller must not merge them.
 
 21. **Pointing this server at a sleeping remote used to start a ComfyUI here.** Not a comfy-cli fact but the consequence of #19, recorded because the cost is not obvious: the launch path probed the remote, spawned `comfy launch` **locally and unconditionally**, polled the remote address for the full five-minute readiness budget, threw a timeout — and left the local process running, because `--background` had already detached it. Nothing owned the question *is this address mine to launch?* It is now asked twice: `launchInstance` refuses a non-local target, and `tools.ts` never reaches it for a remote host at all.
 
@@ -90,17 +97,17 @@ On failure `ok:false` and `error:{code,message,hint,details}`.
     - A missing file is a bare 404 with an empty body.
     - The v2 listing is `/api/v2/userdata?path=…`, **not** `/api/userdata/v2`, which 404s. This project uses v1 with `full_info=true`: it carries size and mtime in one call and is present in every build seen.
 
-23. **A remote instance's `outputDirectory` is a path in *its* filesystem.** Measured: the live remote reports `F:\Dev\ComfyUI\output` and `--listen 100.86.199.90,127.0.0.1` (a comma-separated list — a shape `--listen` really does carry). Resolving a `/view` URL against that directory and then asking whether the file exists **here** is a category error that a Windows path only hides by accident, since it is not `isAbsolute` under POSIX. Two Unix machines sharing a layout would produce a local path naming a different image entirely. Locality must be decided on the address, not on whether the path happens to resolve.
+23. **A remote instance's `outputDirectory` is a path in *its* filesystem.** Measured: the live remote reports `D:\ComfyUI\output` and `--listen 198.51.100.10,127.0.0.1` (a comma-separated list — a shape `--listen` really does carry). Resolving a `/view` URL against that directory and then asking whether the file exists **here** is a category error that a Windows path only hides by accident, since it is not `isAbsolute` under POSIX. Two Unix machines sharing a layout would produce a local path naming a different image entirely. Locality must be decided on the address, not on whether the path happens to resolve.
 
 ---
 
-*Measured 2026-08-08, against comfy-cli `v1.13.0-59-g95d7897` and a live ComfyUI **0.30.2** at `100.86.199.90:8189`.*
+*Measured 2026-08-08, against comfy-cli `v1.13.0-59-g95d7897` and a live ComfyUI **0.30.2** at `198.51.100.10:8189`.*
 
 24. **The CLI refuses to fetch `/object_info` from a non-loopback address in local mode.** Measured, running a workflow with inputs against a remote host:
 
     ```
     cql_no_graph: Refusing to fetch object_info from non-loopback host
-    '100.86.199.90' in local mode (potential SSRF). Use --where cloud for remote targets.
+    '198.51.100.10' in local mode (potential SSRF). Use --where cloud for remote targets.
     ```
 
     So any command that needs node definitions for a remote — `workflow slots`, `set-slot` — must be given `--input <cached object_info>`; there is no address it will fetch from. `describe_workflow` was unaffected only because it already passed `--input`. The run path did not, and `run_workflow` with `inputs` was broken against every remote host until this was found. **The cache is the only schema source that works off-box.**

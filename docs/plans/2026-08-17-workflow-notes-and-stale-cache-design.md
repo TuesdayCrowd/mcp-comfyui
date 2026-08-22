@@ -26,12 +26,12 @@ Behavioural claims below were executed on **2026-08-17** against the installed
 `comfy`; source claims were read at this repo's working tree.
 
 ```
-installed : /Users/lawls/.local/bin/comfy
-          → /Users/lawls/.local/share/uv/tools/comfy-cli/bin/comfy
+installed : ~/.local/bin/comfy
+          → ~/.local/share/uv/tools/comfy-cli/bin/comfy
 version   : 0.0.0   (upstream's own placeholder; substituted only by
             comfy-cli's release pipeline, so every non-pipeline build ships
             it verbatim — not evidence of a broken install)
-built from: /Users/lawls/Development/TuesdayCrowd/Projects/ComfyUI/comfy-cli
+built from: ~/Development/TuesdayCrowd/Projects/ComfyUI/comfy-cli
             git describe → v1.15.0-1-g220f99a
 installed : 2026-08-02; checkout has moved since (pyproject mtime 2026-08-09),
             so subcommands added upstream after 2026-08-02 are not in this build

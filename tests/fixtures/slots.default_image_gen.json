@@ -1,5 +1,5 @@
 {
- "workflow": "/Users/lawls/ComfyUI-Shared/user/default/workflows/default_image_gen.json",
+ "workflow": "/Users/you/ComfyUI-Shared/user/default/workflows/default_image_gen.json",
  "id": "default_image_gen",
  "count": 13,
  "slots": [

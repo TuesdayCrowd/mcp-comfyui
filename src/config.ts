@@ -20,10 +20,21 @@ import { join, resolve } from "node:path";
 export type Environment = Record<string, string | undefined>;
 
 /**
- * Where ComfyUI Desktop keeps this user's saved workflows. The 22 files there
- * are what every measurement in the implementation plan was taken against.
+ * Where ComfyUI Desktop keeps the current user's saved workflows.
+ *
+ * Derived from `homedir()` rather than written out. It used to be an absolute
+ * path with the developer's own username in it, which was two bugs wearing one
+ * coat: it published that username to a public registry, and it made the
+ * default point at a directory that exists on exactly one machine — so every
+ * other install of this package silently scanned nothing. The README has
+ * always documented the default as `~/ComfyUI-Shared/…`; this is the code
+ * finally agreeing with it.
+ *
+ * `homedir()` is read once at module load, which is the same lifetime the
+ * literal had. Nothing here consults `$HOME` directly, so a test that wants a
+ * different root sets {@link WORKFLOW_DIRS_ENV} instead.
  */
-export const DEFAULT_WORKFLOW_DIR = "/Users/lawls/ComfyUI-Shared/user/default/workflows";
+export const DEFAULT_WORKFLOW_DIR = join(homedir(), "ComfyUI-Shared", "user", "default", "workflows");
 
 /** Colon-separated, ordered, like `PATH`. */
 export const WORKFLOW_DIRS_ENV = "MCP_COMFYUI_WORKFLOW_DIRS";

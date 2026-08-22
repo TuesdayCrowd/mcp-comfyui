@@ -37,9 +37,9 @@ the three upstream blocks were run once.
 This has to come first, because it decides what everything else is evidence for.
 
 ```
-installed : /Users/lawls/.local/bin/comfy  (uv tool install, 2026-08-02)
-            /Users/lawls/.local/share/uv/tools/comfy-cli/lib/python3.13/site-packages/comfy_cli
-checkout  : /Users/lawls/Development/TuesdayCrowd/Projects/ComfyUI/comfy-cli
+installed : ~/.local/bin/comfy  (uv tool install, 2026-08-02)
+            ~/.local/share/uv/tools/comfy-cli/lib/python3.13/site-packages/comfy_cli
+checkout  : ~/Development/TuesdayCrowd/Projects/ComfyUI/comfy-cli
             remote git@github.com:Comfy-Org/comfy-cli.git — upstream, not a fork
             HEAD 220f99a = v1.15.0-1-g220f99a
 ```

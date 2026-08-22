@@ -11,10 +11,10 @@ import type { HostRegistry, ResolvedHost } from "./hosts.ts";
  * workflow_path, workflow_size]`, and the `host`/`port` in the envelope's
  * `data` are an echo of the flag the *caller* passed, not a property of the
  * job: with no flag, `jobs ls` reports `127.0.0.1:8188`; with
- * `--host 100.86.199.90`, it reports that instead, over the same 39 records.
+ * `--host 198.51.100.10`, it reports that instead, over the same 39 records.
  *
  * Worse, asking the wrong host is not an error a caller can recognise.
- * Measured: `comfy --json jobs status <a real local id> --host 100.86.199.90
+ * Measured: `comfy --json jobs status <a real local id> --host 198.51.100.10
  * --port 8189` answers `prompt_not_found`, confidently — byte-identical to the
  * answer for an id that never existed. So a `get_job` that guessed at the host
  * would report a running job as missing, and there would be nothing in the

@@ -32,7 +32,7 @@ const ROUNDED_SEED = "18446744073709552000";
  * emits absolute paths; anything else emits `/view?...` URLs
  * (`run/execution.py`, and `docs/json-output.md:253`).
  */
-const OUTPUT_PATH = "/Users/lawls/ComfyUI/output/banana_00001_.png";
+const OUTPUT_PATH = "/Users/you/ComfyUI/output/banana_00001_.png";
 const OUTPUT_URL =
   "http://127.0.0.1:8188/view?filename=banana_00002_.png&subfolder=&type=output";
 

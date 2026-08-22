@@ -178,7 +178,7 @@ export class UnknownHostError extends Error {
           ? `The registry at ${registry.path} has no entries.`
           : `Known hosts: ${registry.hosts.map((entry) => entry.name).join(", ")}.`) +
         `\nCall list_hosts for the registry, or give an address directly — an address needs an ` +
-        `explicit port unless it is an IP literal or localhost, e.g. "100.86.199.90:8189".`,
+        `explicit port unless it is an IP literal or localhost, e.g. "198.51.100.10:8189".`,
     );
     this.requested = requested;
     this.known = registry.hosts.map((entry) => entry.name);

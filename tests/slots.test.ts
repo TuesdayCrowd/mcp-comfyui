@@ -84,7 +84,7 @@ test("parses the real captured payload into typed slots", async () => {
   const listing = await listSlots("/workflows/default_image_gen.json");
 
   expect(listing.id).toBe("default_image_gen");
-  expect(listing.workflow).toBe("/Users/lawls/ComfyUI-Shared/user/default/workflows/default_image_gen.json");
+  expect(listing.workflow).toBe("/Users/you/ComfyUI-Shared/user/default/workflows/default_image_gen.json");
   expect(listing.count).toBe(13);
   expect(listing.slots).toHaveLength(13);
 

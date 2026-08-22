@@ -30,6 +30,15 @@ All notable changes to this project are recorded here. The format follows
   when the caller aborted it — so without them a sleeping remote would have stalled
   `get_job` for five minutes over a copy nobody asked for.
 
+- **`describe_workflow` reports `notes_count`, the workflow's true note total.**
+  `notes_truncated: true` said something had been left out and gave no way to
+  learn how much; the pre-cap total was computed and then dropped on the floor.
+  `notes_count - notes.length` is now the number of notes not shown, and the two
+  being equal means the cut was a trimmed note body rather than a dropped note.
+  Absent — not `0` — when the notes could not be read at all, since `notes: []`
+  there means "could not look" and a count beside it would assert something
+  about the workflow the call never established.
+
 ### Changed
 
 - **`fetch_outputs: true` now means "ignore the ceiling"** rather than "fetch at
@@ -40,16 +49,17 @@ All notable changes to this project are recorded here. The format follows
   job is callable any number of times, and with copying automatic that would
   otherwise make each poll a fresh download.
 
-- **`describe_workflow` reports `notes_count`, the workflow's true note total.**
-  `notes_truncated: true` said something had been left out and gave no way to
-  learn how much; the pre-cap total was computed and then dropped on the floor.
-  `notes_count - notes.length` is now the number of notes not shown, and the two
-  being equal means the cut was a trimmed note body rather than a dropped note.
-  Absent — not `0` — when the notes could not be read at all, since `notes: []`
-  there means "could not look" and a count beside it would assert something
-  about the workflow the call never established.
-
 ### Fixed
+
+- **The default workflow directory pointed at one specific machine.**
+  `DEFAULT_WORKFLOW_DIR` was the literal string
+  `/Users/<a-developer>/ComfyUI-Shared/user/default/workflows`, so on every
+  install except that one the default root did not exist and `list_workflows`
+  silently scanned nothing unless `MCP_COMFYUI_WORKFLOW_DIRS` was set. It is now
+  derived from `homedir()`, which is what the README has always documented
+  (`~/ComfyUI-Shared/…`) — the code simply disagreed with it. This also stops a
+  username being published to a public registry, `src/` being the package JSR
+  ships.
 
 - **A merge to `main` could silently publish nothing.** `publish.yml` gates
   publishing on the test step, and one test failed intermittently on
@@ -69,6 +79,8 @@ All notable changes to this project are recorded here. The format follows
   `if (running) kill()` to write instead — and is shared by all five raw-stdio
   tests, so a child that dies unexpectedly elsewhere reports its own assertion
   failure rather than a confusing teardown error at the same line.
+
+## [0.6.11] — 2026-08-18
 
 ### Added
 
@@ -339,7 +351,7 @@ All notable changes to this project are recorded here. The format follows
 - **Several ComfyUI instances, chosen per call.** The server used to talk to one
   address, fixed when the process started; retargeting meant editing an MCP
   client's config block and restarting. Every tool now takes an optional `host`
-  — a name from a registry, or a raw address such as `100.86.199.90:8189` —
+  — a name from a registry, or a raw address such as `198.51.100.10:8189` —
   and omitting it uses the default, so every existing configuration and every
   existing call behaves exactly as it did. Two new tools: `list_hosts` reads
   the registry, `manage_hosts` writes it.
@@ -379,7 +391,7 @@ All notable changes to this project are recorded here. The format follows
   *here*. Two Unix machines sharing a layout (`/home/me/ComfyUI/output` on both)
   would therefore have handed back a local path naming a completely different
   image. The live remote this was found against hid it by accident, being
-  Windows: `F:\Dev\ComfyUI\output` is not an absolute path under POSIX, so the
+  Windows: `D:\ComfyUI\output` is not an absolute path under POSIX, so the
   containment check declined it for the wrong reason. Resolution now requires
   the instance to be on this machine.
 - **A host on another machine is never launched for.** Auto-launch aimed at a
