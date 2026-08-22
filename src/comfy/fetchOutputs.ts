@@ -46,19 +46,34 @@ const MAX_ARTIFACT_BYTES = 1024 * 1024 * 1024;
 /** Per artifact. A large video over a tailnet is slow, and giving up early is worse. */
 const DEFAULT_TIMEOUT_MS = 300_000;
 
-/** What a fetch attempt did, per artifact. */
-export interface FetchedArtifact {
-  url: string;
-  /** The file written, or `null` when this one could not be fetched. */
-  path: string | null;
-  /** Why it could not be, in the operator's terms. `null` on success. */
-  problem: string | null;
-}
+/**
+ * What a fetch attempt did, per artifact.
+ *
+ * Three outcomes, discriminated rather than inferred from which fields happen
+ * to be null. A **skip** is not a failure: it is something this server decided
+ * not to do, and the caller's next move — ask explicitly — is different from
+ * the next move for a fetch that broke. Encoding it as a `problem` whose text
+ * mentions a ceiling would leave the tool layer one string-match away from
+ * reporting a deliberate policy as a fault.
+ */
+export type FetchedArtifact =
+  | { readonly url: string; readonly outcome: "fetched"; readonly path: string }
+  | { readonly url: string; readonly outcome: "failed"; readonly problem: string }
+  | { readonly url: string; readonly outcome: "skipped"; readonly reason: string };
 
 export interface FetchOutputsOptions {
   /** The directory to write into. Created if need be. */
   destination: string;
   timeoutMs?: number;
+  /**
+   * Refuse an artifact larger than this, reporting it `skipped`.
+   *
+   * Defaults to {@link MAX_ARTIFACT_BYTES}, so an explicit `fetch_outputs`
+   * behaves exactly as it always has. The automatic path passes a far lower
+   * one — see `AUTO_FETCH_MAX_BYTES` in `tools.ts` for the policy and the
+   * measurement behind its value.
+   */
+  maxBytes?: number;
 }
 
 /**
@@ -81,11 +96,14 @@ export async function fetchArtifacts(
 }
 
 async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<FetchedArtifact> {
-  const failed = (problem: string): FetchedArtifact => ({ url, path: null, problem });
+  const failed = (problem: string): FetchedArtifact => ({ url, outcome: "failed", problem });
+  const skipped = (reason: string): FetchedArtifact => ({ url, outcome: "skipped", reason });
+  const maxBytes = opts.maxBytes ?? MAX_ARTIFACT_BYTES;
 
   if (!isArtifactUrl(url)) return failed("not an http(s) URL");
   const name = artifactFilename(url);
   if (name === null) return failed("the URL names no filename this server would write");
+  const path = join(opts.destination, name);
 
   let response: Response;
   try {
@@ -96,7 +114,17 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
   if (!response.ok) return failed(`HTTP ${response.status} ${response.statusText}`);
   if (response.body === null) return failed("the response carried no body");
 
-  const path = join(opts.destination, name);
+  // Ask before moving the bytes. `content-length` is optional and a remote may
+  // overstate it, so this is an optimisation and the streaming cap below is
+  // the guarantee — but when the header IS present it is the difference
+  // between declining a 200MB video and downloading the ceiling's worth of one
+  // to discover the same thing.
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body.cancel().catch(() => {});
+    return skipped(`${declared} bytes exceeds this call's ${maxBytes}-byte limit`);
+  }
+
   try {
     await mkdir(opts.destination, { recursive: true });
   } catch (cause) {
@@ -107,6 +135,9 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
   if (handle === null) return failed(`could not write ${path}`);
 
   let written = 0;
+  // Distinguishes the two ways out of the loop below: exceeding the ceiling is
+  // a skip, everything else is a failure. Both share the cleanup.
+  let oversize = false;
   // `getReader()` rather than `for await (… of response.body)`. Async iteration
   // over a `ReadableStream` is a comparatively recent addition and this bundle
   // targets Node 18 upward as well as Deno and Bun (`engines.node >= 18`); the
@@ -119,8 +150,9 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
       const { done, value } = await reader.read();
       if (done) break;
       written += value.byteLength;
-      if (written > MAX_ARTIFACT_BYTES) {
-        throw new Error(`larger than this server's ${MAX_ARTIFACT_BYTES}-byte limit`);
+      if (written > maxBytes) {
+        oversize = true;
+        throw new Error(`larger than this call's ${maxBytes}-byte limit`);
       }
       await handle.write(value);
     }
@@ -129,11 +161,11 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
     await handle.close().catch(() => {});
     // A partial file that looks finished is the one outcome worse than none.
     await rm(path, { force: true }).catch(() => {});
-    return failed(describe(cause));
+    return oversize ? skipped(describe(cause)) : failed(describe(cause));
   }
   await handle.close().catch(() => {});
 
-  return { url, path, problem: null };
+  return { url, outcome: "fetched", path };
 }
 
 function describe(cause: unknown): string {

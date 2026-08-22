@@ -739,12 +739,14 @@ function outputsBody(
     ...(fetched === null
       ? {}
       : {
+          // `flatMap` rather than `filter().map()`: the outcome check narrows
+          // the union inside the ternary, where a `filter` predicate would not.
           fetched: Object.fromEntries(
-            fetched.filter((one) => one.path !== null).map((one) => [one.url, one.path]),
+            fetched.flatMap((one) => (one.outcome === "fetched" ? [[one.url, one.path] as const] : [])),
           ),
-          fetch_problems: fetched
-            .filter((one) => one.problem !== null)
-            .map((one) => ({ url: one.url, problem: one.problem })),
+          fetch_problems: fetched.flatMap((one) =>
+            one.outcome === "failed" ? [{ url: one.url, problem: one.problem }] : []
+          ),
         }),
   };
 }
