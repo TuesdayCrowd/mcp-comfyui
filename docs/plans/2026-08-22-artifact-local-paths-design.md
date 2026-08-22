@@ -164,6 +164,63 @@ abandoned before a byte is written. The streaming cap stays as the backstop,
 because the header is optional and a remote may lie about it — the header is an
 optimisation, never the guarantee.
 
+### 2.2b A sleeping remote must not hold the answer
+
+**Found on 2026-08-22, after the rest of this section was written, by checking
+what an unreachable host actually costs rather than assuming.** It is the most
+important constraint here and it nearly shipped unnoticed.
+
+Measured: a `fetch` to `192.0.2.1` — RFC 5737 TEST-NET-1, which black-holes
+rather than refusing — **never fails on its own.** It ran a full 30 s and
+stopped only because the measuring probe aborted it. A closed port on loopback
+is not the same case and is not a guide: that refuses in 0 ms.
+
+`DEFAULT_TIMEOUT_MS` is 300 s. So auto-fetch against a remote that is asleep —
+the single most likely remote failure, and the exact state both this project's
+hosts were in while this was designed — would stall `get_job` for **five
+minutes**, for a copy the caller never asked for.
+
+This is `NOTES_TIMEOUT_MS`'s reasoning repeating: a decorative call issued
+beside a load-bearing one must not inherit the default budget. Two bounds, for
+the two different failures:
+
+- **Probe before fetching.** For a remote host with artifacts, `detectInstance`
+  first. If it is not answering, fetch nothing and report every artifact in
+  `not_fetched` with `the host did not answer`. That probe is already bounded
+  (CLAUDE.md: "its probe costs the 2-second budget; that is deliberate"), is the
+  same question `comfy_status` asks, and costs one small request — tens of
+  milliseconds — when the host is up. It is issued **once per call**, not once
+  per artifact, so a five-output run pays it once.
+
+  **Probe the artifact URL's own authority, not the registry's resolved host.**
+  `fetchArtifacts` requests the URL exactly as the CLI reported it, so the
+  address that decides success is the URL's — and probing anything else means
+  asking one machine whether a *different* one will answer. In production the
+  two are identical, because ComfyUI builds `/view` URLs from its own listen
+  address; where they could diverge, consistency with what the fetch will
+  actually do is the property worth keeping. The rule belongs in
+  `comfy/outputs.ts` beside the other artifact-URL rules, as an exported
+  `artifactOrigin(url): {host, port} | null` — that module exists precisely
+  because "more than one module has to agree about them, and a copy of any of
+  them that drifts is a bug nobody sees."
+
+  Stated plainly because it is the kind of thing that later reads as a
+  coincidence: this choice is also what makes the feature's happy path
+  *testable at all*. The suite can serve only loopback addresses, and any
+  address it can serve on is `local` — so a reachable remote host cannot be
+  constructed, and a probe keyed on the registry host could only ever be
+  exercised in its failing direction. Keyed on the URL, the policy gate stays
+  remote (`192.0.2.1`) while the probe and fetch reach a real loopback fixture
+  that already serves `/system_stats`. The design is defensible without that
+  benefit; the benefit is real and is why the alternative was rejected.
+- **`AUTO_FETCH_TIMEOUT_MS = 60_000` for the transfer itself**, so a host that
+  answers the probe and then stalls mid-body cannot reinstate the five-minute
+  hang. 60 s is ample for a 16 MiB ceiling over a tailnet (measured elsewhere at
+  1-13 s for that size) and caps the pathological case at one minute.
+
+The explicit path keeps 300 s. A caller who asked for a 200 MB video has said
+it is worth waiting for; a caller who asked for a job's status has not.
+
 ### 2.3 Idempotence
 
 `fetchOne` opens with `"w"` and re-downloads unconditionally. Auto-fetch makes
@@ -224,6 +281,16 @@ was attempted — which now means a **local** run's `outputs` is byte-identical
 to today's, and a remote run's carries the new keys. That is the whole
 observable contract change.
 
+**One existing test pins the old shape and must change with it.**
+`tests/server.test.ts`'s "a remote instance's outputs are never claimed to be
+here" asserts `expect(body["outputs"]).toEqual({files: [], urls: [url],
+local_paths: {}})` — an exact match, on a remote host, with no `fetch_outputs`.
+It is the mutant-killer for `resolveArtifactPath`'s `isLocalAddress` guard, and
+that purpose survives untouched: `local_paths` stays `{}`, because a copy in
+this server's cache is not the instance's own file. Only the exactness changes,
+to accommodate the new sibling keys. Weakening it to `toMatchObject` **must not**
+drop the `local_paths: {}` assertion, which is the whole point of it.
+
 ---
 
 ## 3. What changes, by file
@@ -241,9 +308,17 @@ encoded as a `problem` whose text happens to mention a ceiling — `toolResult.t
 would then be one string-match away from misreporting it. The type gains an
 explicit discriminator rather than a fourth nullable field.
 
-**Not changed:** `comfy/outputs.ts`. Its locality refusal is correct and is the
-reason this design exists; `resolveArtifactPath` returning `null` for a remote
-host stays exactly as it is.
+**Barely changed:** `comfy/outputs.ts` gains one export, `artifactOrigin`, per
+§2.2b — the address a `/view` URL names, which belongs beside the other rules
+about what a path out of `comfy` means rather than being re-derived by a
+caller. Its **behaviour is untouched**: `resolveArtifactPath` returning `null`
+for a remote host is correct, is the reason this design exists, and stays
+exactly as it is.
+
+(An earlier draft of this section said "not changed" and was wrong once §2.2b
+existed. Recorded rather than silently corrected, because the locality refusal
+being untouchable is the load-bearing claim and it would be easy to read a
+diff of this file as weakening it.)
 
 ---
 
@@ -266,8 +341,31 @@ Cases, each with the mutant it kills:
 4. **`Content-Length` past the ceiling writes zero bytes.** Asserts the
    destination directory is empty. Mutant: drop the pre-check — the test dies
    on a partially written file, which is the waste this exists to stop.
-5. **A lying `Content-Length` is still caught mid-stream.** Header says 1 KB,
-   body is larger. Mutant: trust the header and drop the streaming cap.
+5. **The streaming cap enforces the ceiling when no `Content-Length` is
+   declared.** A streamed response declares none, so the header cannot be
+   relied on and the cap is the actual guarantee. Mutant: drop the
+   `written > maxBytes` check.
+
+   **Not "a lying `Content-Length` is caught", which was this item's original
+   wording and is not constructible.** Measured two ways on 2026-08-22: with a
+   `Deno.serve` response declaring `content-length: 100` over a 2000-byte
+   stream, the client throws `error reading a body from connection` and
+   receives nothing; with a hand-rolled raw-socket response lying the same way,
+   `fetch()` silently truncates to exactly the declared 100 bytes. In neither
+   case can `written` exceed the declared header, so a *understated* header is
+   not a hazard this code can face. An *overstated* one is, and its failure
+   mode is a false skip — disclosed in `not_fetched`, never a corrupt file.
+
+   The infinite-stream fixture must be **finite but larger than the ceiling**
+   (say 16 KiB against a 4 KiB `maxBytes`). An always-ready endless stream
+   starves the event loop: measured, with the cap removed the read/write loop
+   ran 6-8 s and 935 MB without ever observing an `AbortSignal.timeout`, so the
+   mutant would hang the suite rather than fail it. A finite body ends, the
+   file lands, and the assertion fails cleanly.
+
+8. **A remote that does not answer is skipped in seconds, not minutes**, with
+   `the host did not answer` as the reason and nothing written. Mutant: drop
+   the §2.2b probe — the test dies on elapsed time, and on the reason text.
 6. **A second call does not re-download.** Two `get_job` calls, one served
    artifact; asserts the fake server saw exactly one request. Mutant: remove
    the `stat` reuse.
