@@ -52,6 +52,9 @@
 #   $FAKE_COMFY_JOBS_WAIT_ERROR    jobs wait: error code to fail with; the summary
 #                                  above still travels, in error.details
 #   $FAKE_COMFY_JOBS_WAIT_MESSAGE  jobs wait: the failure message
+#   $FAKE_COMFY_JOBS_WAIT_SLEEP    jobs wait: seconds to block before answering,
+#                                  so a test can prove this side's budget outlives
+#                                  the one it hands the CLI
 #   $FAKE_COMFY_RUN_SEQ_DIR    run_seq: directory of <n>.ndjson (stdout), <n>.exit
 #                              (exit code) and <n>.workflow (a copy of the file
 #                              --workflow named), served one per invocation
@@ -235,6 +238,12 @@ case "$FAKE_COMFY_MODE" in
       ls)     file="$FAKE_COMFY_JOBS_LS_FILE";     err="$FAKE_COMFY_JOBS_LS_ERROR" ;;
       cancel) file="$FAKE_COMFY_JOBS_CANCEL_FILE"; err="$FAKE_COMFY_JOBS_CANCEL_ERROR" ;;
       wait)
+        # A real wait blocks; this one blocks on request, so a test can pin
+        # that the budget handed to the CLI (`--timeout`, in seconds) is
+        # shorter than the one this server kills the child on. Without that
+        # gap a SIGKILL would land exactly where the CLI was about to print
+        # which jobs are still running — the only valuable part of a timeout.
+        [ -n "$FAKE_COMFY_JOBS_WAIT_SLEEP" ] && sleep "$FAKE_COMFY_JOBS_WAIT_SLEEP"
         # `jobs wait` is the one subcommand whose FAILURE arm carries a payload,
         # so it cannot use the shared error printf below. Measured 2026-08-22:
         # a wait where any job failed, was cancelled or timed out comes back
