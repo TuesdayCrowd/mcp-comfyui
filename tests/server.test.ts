@@ -103,6 +103,40 @@ async function writeStdin(child: Deno.ChildProcess, text: string): Promise<void>
   writer.releaseLock();
 }
 
+/**
+ * Tear down a raw-stdio child: stop it if it is still running, release both
+ * output streams, and wait for it to be collected.
+ *
+ * The `catch` is the whole point. Deno reaps an exited child on a background
+ * task, and `ChildProcess.kill()` throws `TypeError: Child process has
+ * already terminated` once that has happened — measured at ~2ms after exit,
+ * whether or not `child.status` has been awaited. Several children here are
+ * *expected* to exit on their own (the overflow test's whole claim is that
+ * the transport dies loudly), so teardown reaching a dead child is the normal
+ * case, not a fault; for the children that should still be alive, a `kill()`
+ * that throws would replace a real assertion failure with a confusing
+ * teardown error at the same line. Either way the child is already gone,
+ * which is all `kill()` was ever for.
+ *
+ * Not written as `if (stillRunning) kill()`: there is no such check that
+ * isn't itself racing the same background reap. Attempting the kill and
+ * treating "already terminated" as success is the only race-free form.
+ *
+ * Narrow on purpose. A `TypeError` from anything else — a locked stream, a
+ * bad signal name — is rethrown, and so is this one if Deno ever rewords it,
+ * which fails loudly rather than quietly skipping the kill.
+ */
+async function terminate(child: Deno.ChildProcess): Promise<void> {
+  try {
+    child.kill("SIGKILL");
+  } catch (err) {
+    if (!(err instanceof TypeError && err.message.includes("already terminated"))) throw err;
+  }
+  child.stdout.cancel();
+  child.stderr.cancel();
+  await child.status;
+}
+
 /** How `workflows/setSlots.ts` names the temp directories it creates. */
 const TEMP_PREFIX = "mcp-comfyui-apply-";
 
@@ -1974,10 +2008,7 @@ test("the server writes nothing to stdout but JSON-RPC frames", async () => {
   await writeStdin(child, requests.map((request) => `${JSON.stringify(request)}\n`).join(""));
 
   const stdout = await readUntil(child.stdout, 4, 10_000);
-  child.kill("SIGKILL");
-  child.stdout.cancel();
-  child.stderr.cancel();
-  await child.status;
+  await terminate(child);
 
   const lines = stdout.split("\n").filter((line) => line.trim() !== "");
   expect(lines.length).toBeGreaterThanOrEqual(4);
@@ -2144,10 +2175,7 @@ test("a legitimate large payload does not kill the server", async () => {
   await writeStdin(child, followUp);
 
   const stdout = await readUntilSafely(child.stdout, 3, 20_000);
-  child.kill("SIGKILL");
-  child.stdout.cancel();
-  child.stderr.cancel();
-  await child.status;
+  await terminate(child);
 
   const lines = stdout.split("\n").filter((line) => line.trim() !== "");
   const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -2186,12 +2214,42 @@ test("a payload beyond the buffer limit is reported on stderr rather than dying 
   await expect(readUntilSafely(child.stdout, 2, 4_000)).rejects.toThrow();
 
   const stderr = await readFor(child.stderr, 1_000);
-  child.kill("SIGKILL");
-  child.stdout.cancel();
-  child.stderr.cancel();
-  await child.status;
+  await terminate(child);
 
   expect(stderr.trim()).not.toBe("");
+});
+
+test("tearing down a child that has already exited is not itself a failure", async () => {
+  // The test above ends holding a child that has exited BY DESIGN: the
+  // transport dies on overflow, which is the very thing it asserts. Deno
+  // reaps an exited child on a background task — measured here at ~2ms after
+  // exit — and `ChildProcess.kill()` on a reaped child throws
+  // `TypeError: Child process has already terminated`. An unguarded teardown
+  // therefore passes only while every remaining step lands inside that ~2ms
+  // window, which on this machine they all do, in a single tick.
+  //
+  // Measured, by injecting a delay before teardown and changing nothing else:
+  // 0ms passes, 5ms fails with that exact TypeError. `ubuntu-latest` supplied
+  // the delay for real on run 32149609864 (2026-08-18) — failing PR #22's
+  // merge and, because publish.yml gates publishing on the test step,
+  // publishing nothing.
+  //
+  // `await child.status` below removes the race from THIS test rather than
+  // reproducing it: the child is guaranteed already reaped, so teardown meets
+  // the hostile case every time instead of one run in a hundred.
+  const child = new Deno.Command("node", {
+    args: ["-e", "process.exit(0)"],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  await child.status;
+
+  const outcome = await terminate(child).then(
+    () => "torn down",
+    (err: unknown) => `threw ${err instanceof Error ? err.message : String(err)}`,
+  );
+  expect(outcome).toBe("torn down");
 });
 
 // --- Finding 2: a malformed tools/call must not read as a server bug ------
@@ -2210,10 +2268,7 @@ test("a malformed tools/call is refused as an invalid request, not reported as a
   await writeStdin(child, malformed.map((request) => `${JSON.stringify(request)}\n`).join(""));
 
   const stdout = await readUntilSafely(child.stdout, 1 + malformed.length, 10_000);
-  child.kill("SIGKILL");
-  child.stdout.cancel();
-  child.stderr.cancel();
-  await child.status;
+  await terminate(child);
 
   const lines = stdout.split("\n").filter((line) => line.trim() !== "");
   const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
@@ -3605,10 +3660,7 @@ test("a fetched template is describable by the existing pipeline, unchanged", as
   );
   const afterList = await readUntil(child.stdout, 1, 10_000); // one more line, on the same stream
 
-  child.kill("SIGKILL");
-  child.stdout.cancel();
-  child.stderr.cancel();
-  await child.status;
+  await terminate(child);
 
   const lines = `${afterCreate}${afterList}`.split("\n").filter((line) => line.trim() !== "");
   const messages = lines.map((line) => JSON.parse(line) as Record<string, unknown>);
