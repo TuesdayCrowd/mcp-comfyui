@@ -4051,11 +4051,17 @@ test("each variant is submitted from its own file, not three times from one", as
     inputs: { "3.seed": [1, 2, 3] },
   });
 
+  // The fixture marks each variant with its own index, so the three copies are
+  // three different files rather than one file three times.
   const submitted = [0, 1, 2].map((n) => readFileSync(join(dir, `${n}.workflow`), "utf8"));
-  expect(submitted).toHaveLength(3);
-  // Every submit found its file on disk — which is what a dispose moved inside
-  // the loop would break for variants 2 and 3.
-  for (const bytes of submitted) expect(bytes.length).toBeGreaterThan(0);
+  expect(submitted.map((bytes) => bytes.match(/<<<VARIANT\n(\d+)\nVARIANT>>>/)?.[1])).toEqual([
+    "0",
+    "1",
+    "2",
+  ]);
+  // And every submit found its file still on disk — which is what a dispose
+  // moved inside the loop would break for variants 2 and 3.
+  for (const bytes of submitted) expect(bytes).toContain("KSampler");
 });
 
 test("every variant's prompt_id is attributed to the host that ran it", async () => {

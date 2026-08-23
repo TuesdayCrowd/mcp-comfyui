@@ -61,7 +61,7 @@ src/comfy/          the CLI and instance layer
   outputs.ts        artifact path-vs-URL rule, shared by run and jobs
   userdata.ts       a REMOTE instance's own saved workflows, over its HTTP API
   fetchOutputs.ts   copy a remote run's artifacts here, on request only
-  jobs.ts           jobs status | ls | cancel
+  jobs.ts           jobs status | ls | cancel | wait (many ids, one call)
   instance.ts       detection and guarded launch
   templates.ts      the gallery: search and fetch. No host — it is not a ComfyUI.
   validate.ts       comfy validate; decodes its own envelope (landmine #27)
@@ -70,6 +70,7 @@ src/workflows/
   slots.ts          comfy workflow slots -> typed Slot[]
   describe.ts       slots × object_info -> JSON Schema   ← the value-add
   setSlots.ts       byte-copy (or byte-write) + set-slot in place
+  vary.ts           comfy workflow vary --out-dir; reads the FILE PATHS only
   run.ts            comfy run --json, NDJSON decoded line by line
 src/config.ts       workflow roots and env-var vocabulary
 src/hosts.ts        the host registry: load, validate, resolve, repair, write
@@ -89,6 +90,8 @@ Dependency direction is one-way: `workflows/` may import `comfy/`, never the rev
 These are not style preferences. Each was measured, and each has a test pinning it.
 
 **1. Never let JS parse or re-serialise a workflow graph.** ComfyUI seeds reach 2^64−1; JavaScript rounds above 2^53. Measured: `set-slot --stdout` on a graph holding `18446744073709551615` returned the exact digits, and our `JSON.parse` corrupted that *untouched* seed to `18446744073709552000`. Hence the byte-copy in `setSlots.ts` and the graph-dropping in `run.ts` (`comfy run --json` echoes the whole graph as a `prompt_preview` event on every run). **Assume this recurs anywhere a comfy payload can contain a graph.**
+
+It has now recurred a third time. `comfy workflow vary` returns whole frontend graphs in `data.variants` — 84,918 bytes each on a real template, measured 2026-08-22 — and `--out-dir` is what stops it: the graphs go to disk and the envelope reports `written`, a list of paths, with `variants` present and **null**. `src/workflows/vary.ts` therefore requires `outDir` rather than defaulting it, and its payload schema deliberately does not declare `variants`, so a future CLI that returned graphs under `--out-dir` anyway would still have them stripped. Ground truth #43–#45.
 
 **2. Every registry from the CLI is an open string** — `error.code`, slot `type`, job `status`, run `event.type`. Upstream documents error codes as append-only, and its published schemas are already behind its own source. Closing an enum breaks the server on the next CLI release. Tests assert the published enums are incomplete, so the argument stays checkable.
 

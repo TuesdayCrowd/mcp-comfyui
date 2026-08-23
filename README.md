@@ -176,6 +176,7 @@ A run on another machine never has a local path, whatever its output directory i
 | `describe_workflow` | ✓ | JSON Schema of that workflow's settable inputs, plus its author's notes |
 | `validate_workflow` | ✓ | Would ComfyUI accept this graph? Offline, sub-second |
 | `run_workflow` | | Apply inputs and execute |
+| `run_sweep` | | Run N variants of one workflow, varying inputs across them |
 | `get_job` | ✓ | Poll a job by `prompt_id` |
 | `cancel_job` | | Stop a running job |
 | `list_hosts` | ✓ | The ComfyUI instances this server can be pointed at |
@@ -183,6 +184,21 @@ A run on another machine never has a local path, whatever its output directory i
 | `launch_comfyui` | | Start ComfyUI with explicit flags — only when `MCP_COMFYUI_ALLOW_LAUNCH=1` |
 
 Every tool above except `list_hosts`, `manage_hosts`, `search_templates` and `create_workflow_from_template` takes an optional `host` saying which ComfyUI to use; omitting it uses the default. (`manage_hosts` has a `host` field too, but it means the *address to record* for the entry being written, not which instance to talk to — it talks to none. `search_templates` and `create_workflow_from_template` talk to comfy-cli's template gallery, not to any ComfyUI, so neither has a `host` field at all.)
+
+`run_sweep` is `run_workflow` at N. It takes the same slot addresses, but each `inputs` value is a **list**, and the lists are **zipped rather than crossed** — every list must be the same length, and two lists of three produce three runs, not nine. Anything that should be the same on every variant goes in `fixed` instead:
+
+```jsonc
+run_sweep {
+  workflow: "default_image_gen",
+  inputs: { "3.seed": [1, 2, 3, 4] },        // what varies — zipped
+  fixed:  { "6.text": "a still life, oil" }, // what does not
+  wait: false                                // the default: submit and return
+}
+```
+
+That comes back with `variant_count`, and one entry in `runs` per variant carrying its `prompt_id`, the `values` it was varied to, and its `outputs`. A variant the server refuses outright lands in `failed` beside the ones that ran, with its index and values — one bad value does not deny you the rest. Every `prompt_id` is remembered against its host, so `get_job` finds any of them with no `host` argument. `wait: true` blocks on all of them in a single call rather than N polls, which is worth remembering is N GPU runs: four images is minutes and sixteen video variants is hours, so `timeout_seconds` is the guard.
+
+A mismatched pair of lists is refused before anything is spawned, naming both addresses and both lengths — the CLI's own behaviour is to zip to the shorter one and report a cheerful success, which is valid output of the wrong size. Setting an address `describe_workflow` lists under `inert` is refused here exactly as it is for `run_workflow`. Artifacts from a sweep on another host are copied here in variant order up to **64 MiB across the whole call** — the 16 MiB per-artifact ceiling bounds one file and not a run of them, and sixteen 1024×1024 images are about 3 MB each — with the rest listed in `outputs.not_fetched`. `fetch_outputs: true` lifts both bounds.
 
 The intended order is `list_workflows` → `describe_workflow` → `run_workflow`. Inputs are keyed by slot address (`3.seed`, `6.text`), which `describe_workflow` gives you. When `list_workflows` has nothing that fits, `search_templates` → `create_workflow_from_template` turns a gallery template into an ordinary local workflow first, and the same order continues from there.
 

@@ -363,6 +363,14 @@ case "$FAKE_COMFY_MODE" in
     # has no JSON parser, and a fake that re-serialised the graph would destroy
     # the 2^64-1 seed these tests exist to protect.
     #
+    # The copy is then marked with its own index, between markers and after the
+    # original bytes — the same idiom the set_slot mode uses, and for the same
+    # two reasons: it needs no JSON parser, and it leaves everything ahead of it
+    # untouched so a test can assert on both. The real CLI writes a DIFFERENT
+    # value into each variant, so a fake whose variants were byte-identical
+    # could not tell "submitted three files" from "submitted one file three
+    # times" — which is exactly the mistake a sweep must not make.
+    #
     # The variant count is derived from the --slot lists rather than armed by
     # the test, so a test asserting on `count` is really asserting that the
     # argv this server built carries the values it thinks it does. Elements are
@@ -402,6 +410,7 @@ case "$FAKE_COMFY_MODE" in
       dest="$outdir/${stem}_$(printf '%03d' "$i").json"
       mkdir -p "$outdir"
       cp "$src" "$dest"
+      printf '\n<<<VARIANT\n%s\nVARIANT>>>' "$i" >> "$dest"
       written="${written:+$written,}\"$dest\""
       i=$((i + 1))
     done

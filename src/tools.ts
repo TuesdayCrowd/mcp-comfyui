@@ -2327,6 +2327,17 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         // SWEEP_FETCH_BUDGET_BYTES. Created even when nothing will be fetched:
         // it costs an object, and the alternative is a conditional that has to
         // agree with `fetchIfAsked`'s own.
+        //
+        // **This line is not observable from the test suite**, and that is a
+        // property of the harness rather than an oversight. `fetchIfAsked`
+        // applies a budget only on the automatic path, which requires a host
+        // that is both remote (or the copy never happens) and reachable (or
+        // the runs are never submitted) — and `comfy/target.ts`'s
+        // `isLocalAddress` calls every address this suite can bind local, by
+        // construction. Removing `budget` here therefore passes every test.
+        // What it enables is pinned one layer down, in
+        // `tests/fetchOutputs.test.ts`, against a real `FetchBudget`; what it
+        // does end to end was measured by hand instead — see CLAUDE.md.
         const budget: FetchBudget = { remaining: SWEEP_FETCH_BUDGET_BYTES, total: SWEEP_FETCH_BUDGET_BYTES };
         const runs: Array<Record<string, unknown>> = [];
         for (const { variant, run } of submitted) {
