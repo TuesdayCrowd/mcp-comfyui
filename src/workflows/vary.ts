@@ -81,8 +81,34 @@ const VaryPayloadSchema = z.object({
   out_dir: z.string(),
   written: z.array(z.string()),
   warnings: z.array(VaryWarningSchema),
-  /** Whether the node definitions came from a cache the CLI could not refresh. */
-  stale: z.boolean(),
+  /**
+   * Whether the node definitions came from a cache the CLI could not refresh.
+   *
+   * **`.optional()` is load-bearing**, and this is the one field here that was
+   * got wrong first and found by a live run rather than by a fixture. The CLI
+   * emits `stale` only when it consulted a live `/object_info` and fell back;
+   * given `--input <cache>` it does not emit the key at all. Measured
+   * 2026-08-22, the same call twice:
+   *
+   * - `--host 127.0.0.1 --port 8188` with nothing listening → `stale: true`,
+   *   one `object_info_stale` warning.
+   * - `--input <a cached object_info>` → **no `stale` key**, `warnings: []`.
+   *
+   * That second shape is not an edge case, it is the **normal** shape for
+   * every remote sweep: comfy-cli refuses to fetch `/object_info` from a
+   * non-loopback address in local mode as potential SSRF (`cql_no_graph`,
+   * re-measured the same day against the live remote), so `--input` is the
+   * only source that works there and this server always uses it. A required
+   * `stale` therefore failed every sweep on another machine with a
+   * `contract_violation` — while passing the whole test suite, because the
+   * fixture always emitted the key.
+   *
+   * Read as `false` when absent: the CLI had no cause to mention staleness,
+   * which is what "not stale" means. The same reasoning as `notes.ts`'s
+   * `subgraph`, and the same class of hazard non-negotiable #2 covers — a
+   * field that is present in one state and absent in another.
+   */
+  stale: z.boolean().optional(),
 });
 
 /** The variants one `vary` call produced, as files. */
@@ -395,6 +421,6 @@ export async function varyWorkflow(
     count: payload.written.length,
     written: payload.written,
     warnings: payload.warnings,
-    stale: payload.stale,
+    stale: payload.stale ?? false,
   };
 }

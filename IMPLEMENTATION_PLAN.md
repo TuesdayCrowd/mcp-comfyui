@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status: all four tasks complete on branch `batch-and-sweep`, awaiting merge.** Per the note at the foot of this file, it is removed once the work has landed.
+
 **Goal:** One call produces N workflow variants, submits them all, and optionally blocks on all of them.
 
 **Architecture:** `comfy workflow vary --out-dir` writes each variant to a file and — measured — omits the graphs from its envelope entirely. This server reads only the returned file paths and submits each by path, so no workflow graph ever enters JS. `comfy jobs wait` joins them in one call.
@@ -48,11 +50,11 @@
 **Interfaces:**
 - Produces: `varyWorkflow(file: string, lists: Record<string, unknown[]>, opts: {host?, port?, objectInfoPath?, outDir: string, timeoutMs?}): Promise<{count: number, written: string[], warnings: Array<{code: string, message: string}>, stale: boolean}>`
 
-- [ ] **Step 1: Add the fake-comfy case** (append-only — do not edit existing modes)
+- [x] **Step 1: Add the fake-comfy case** (append-only — do not edit existing modes)
 
 In `tests/fixtures/fake-comfy`, add a `workflow vary` case driven by a new `$FAKE_COMFY_VARY_MODE`, defaulting to writing `$3/<stem>_000.json …` files and emitting an `envelope/1` whose `data` carries `{workflow, count, warnings: [], out_dir, written, stale: false}` — **and no `variants` key**, matching the real CLI's behaviour under `--out-dir`.
 
-- [ ] **Step 2: Write the failing tests**
+- [x] **Step 2: Write the failing tests**
 
 ```ts
 test("a variant's graph never enters this process", async () => {
@@ -138,11 +140,11 @@ test("mismatched list lengths are refused before any CLI call", async () => {
 });
 ```
 
-- [ ] **Step 3: Run to verify they fail**
+- [x] **Step 3: Run to verify they fail**
 
 `caffeinate -i deno task test:one tests/vary.test.ts` → FAIL (`varyWorkflow` undefined).
 
-- [ ] **Step 4: Implement `src/workflows/vary.ts`**
+- [x] **Step 4: Implement `src/workflows/vary.ts`**
 
 Model it on `src/workflows/notes.ts` (envelope decode, its own timeout, `looseObject` for undeclared fields). The payload schema declares `workflow`, `count`, `out_dir`, `written`, `warnings`, `stale` — and **deliberately does not declare `variants`**, with a comment saying why: declaring it would invite a future reader to use it.
 
@@ -154,11 +156,11 @@ Validate list lengths first, then build argv:
 
 Values go through `JSON.stringify` on the array, with a string element emitted as-is when it is all digits — the `setSlots.ts` rule for values JS cannot hold.
 
-- [ ] **Step 5: Run to verify they pass**, then `deno task typecheck`.
+- [x] **Step 5: Run to verify they pass**, then `deno task typecheck`.
 
-- [ ] **Step 6: Confirm the five mutants**, restoring by checksum each time.
+- [x] **Step 6: Confirm the five mutants**, restoring by checksum each time.
 
-- [ ] **Step 7: Commit** — `but commit -b batch-and-sweep -m "feat(vary): variants as files, never as graphs" <ids>`
+- [x] **Step 7: Commit** — `but commit -b batch-and-sweep -m "feat(vary): variants as files, never as graphs" <ids>`
 
 ---
 
@@ -170,7 +172,7 @@ Values go through `JSON.stringify` on the array, with a string element emitted a
 - Consumes: nothing from Task 1.
 - Produces: `waitForJobs(promptIds: readonly string[], target: {host, port}, opts?: {timeoutMs?: number}): Promise<JobStatus[]>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 test("waiting on several jobs is ONE cli invocation, not one per id", async () => {
@@ -217,11 +219,11 @@ test("a wait that times out is an answer about the jobs, not a thrown error", as
 });
 ```
 
-- [ ] **Step 2: Run to verify they fail.**
-- [ ] **Step 3: Implement** on the model of `getJobStatus` in the same file — same envelope decode, same open-string `status` (non-negotiable #2), `--timeout` in **seconds**.
-- [ ] **Step 4: Run to verify they pass**; `deno task typecheck`.
-- [ ] **Step 5: Confirm the three mutants.**
-- [ ] **Step 6: Commit** — `but commit -b batch-and-sweep -m "feat(jobs): wait on many jobs in one call" <ids>`
+- [x] **Step 2: Run to verify they fail.**
+- [x] **Step 3: Implement** on the model of `getJobStatus` in the same file — same envelope decode, same open-string `status` (non-negotiable #2), `--timeout` in **seconds**.
+- [x] **Step 4: Run to verify they pass**; `deno task typecheck`.
+- [x] **Step 5: Confirm the three mutants.**
+- [x] **Step 6: Commit** — `but commit -b batch-and-sweep -m "feat(jobs): wait on many jobs in one call" <ids>`
 
 ---
 
@@ -233,7 +235,7 @@ test("a wait that times out is an answer about the jobs, not a thrown error", as
 - Consumes: `varyWorkflow` (Task 1), `waitForJobs` (Task 2), plus the existing `runWorkflow`, `recordJobHost`, `fetchIfAsked`, `outputsBody`.
 - Produces: the `run_sweep` MCP tool.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```ts
 test("a sweep submits one run per variant and returns every prompt_id", async () => {
@@ -349,16 +351,16 @@ test("the temp directory the variants were written to does not outlive the call"
 });
 ```
 
-- [ ] **Step 2: Run to verify they fail.**
+- [x] **Step 2: Run to verify they fail.**
 
-- [ ] **Step 3: Implement.** Add `SWEEP_FETCH_BUDGET_BYTES = 64 * 1024 * 1024` beside `AUTO_FETCH_MAX_BYTES`, with the same measurement-first docstring style. Register `run_sweep` with `annotations: { readOnlyHint: false, openWorldHint: true }` — it launches nothing itself but does submit work, so it must not claim to be read-only.
+- [x] **Step 3: Implement.** Add `SWEEP_FETCH_BUDGET_BYTES = 64 * 1024 * 1024` beside `AUTO_FETCH_MAX_BYTES`, with the same measurement-first docstring style. Register `run_sweep` with `annotations: { readOnlyHint: false, openWorldHint: true }` — it launches nothing itself but does submit work, so it must not claim to be read-only.
 
 The description's **first sentence** says lists are zipped and gives the array form, because that is the error a caller is most likely to make.
 
-- [ ] **Step 4: Run the full suite and `deno task typecheck`.**
-- [ ] **Step 5: Confirm the six mutants.**
-- [ ] **Step 6: Update `README.md`** (the tool table and one worked example) and `CHANGELOG.md` under `[Unreleased]`.
-- [ ] **Step 7: Commit** — `but commit -b batch-and-sweep -m "feat: run_sweep" <ids>`
+- [x] **Step 4: Run the full suite and `deno task typecheck`.**
+- [x] **Step 5: Confirm the six mutants.**
+- [x] **Step 6: Update `README.md`** (the tool table and one worked example) and `CHANGELOG.md` under `[Unreleased]`.
+- [x] **Step 7: Commit** — `but commit -b batch-and-sweep -m "feat: run_sweep" <ids>`
 
 ---
 
@@ -366,11 +368,23 @@ The description's **first sentence** says lists are zipped and gives the array f
 
 **Files:** possibly `scripts/smoke-remote-artifacts.mjs`'s sibling; `CLAUDE.md`.
 
-- [ ] **Step 1:** With a host up, run a 3-seed sweep through `dist/index.js` under `node` over real stdio. Confirm three `prompt_id`s, three distinct images, `get_job` answering for each with no `host`, and — the one that matters — **a 2^64−1 seed reaching the submitted graph byte-exact**, which no fixture can prove.
-- [ ] **Step 2:** Record the result in CLAUDE.md's "Verified end to end", using the redacted placeholders (`rtx-video`, `198.51.100.10`).
-- [ ] **Step 3: Commit.**
+- [x] **Step 1:** With a host up, run a 3-seed sweep through `dist/index.js` under `node` over real stdio. Confirm three `prompt_id`s, three distinct images, `get_job` answering for each with no `host`, and — the one that matters — **a 2^64−1 seed reaching the submitted graph byte-exact**, which no fixture can prove.
+- [x] **Step 2:** Record the result in CLAUDE.md's "Verified end to end", using the redacted placeholders (`rtx-video`, `198.51.100.10`).
+- [x] **Step 3: Commit.**
 
 ---
+
+## Ground truth added — all confirmed
+
+Written up as ground truth #43–#51, with two corrections the implementation forced:
+
+- `--out-dir` makes `data.variants` **`null`, not absent** (#44). The design said absent.
+- `comfy jobs wait` reports a partial success as a **failure envelope**, with the same
+  summary moved into `error.details` — three codes, and a cancelled batch exits 130 (#48).
+  `waitForJobs` reads both arms, or a sweep with one bad variant would deny the caller the
+  rest.
+- And one the live run found that no fixture could: `vary`'s `stale` key is **absent**
+  whenever the schema source is `--input`, which is every remote sweep (#51).
 
 ## Ground truth to add once implementation confirms it
 

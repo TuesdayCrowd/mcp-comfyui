@@ -211,6 +211,15 @@ A real run also confirmed three things previously known only from source: `conve
 
 Two things this run corrected. The registry's `rtx-video` entry pointed at port **8189**; the box now serves **8188**, and `comfy_status` reports `target.local` — on `target`, beside the address it describes, not at the top level. And `run_workflow {wait: true}` against a real render outlasts the **MCP client's own 60s default request timeout**, which is a property of the client rather than of this server: the run is not lost, it carries on and its artifacts are still fetched. A harness waiting on a real generation must raise that timeout.
 
+**`run_sweep`, verified on 2026-08-22** through `dist/index.js` under `node` over real stdio (`scripts/smoke-sweep.mjs`), against the live ComfyUI **0.33.3** on the Windows RTX 4070, reached at `198.51.100.10:8188`, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout:
+
+- `run_sweep {workflow: "image_chroma1_radiance_text_to_image", host: "198.51.100.10:8188", inputs: {"778.noise_seed": ["18446744073709551615", 12345, 67890]}}` returned `variant_count: 3` and three distinct `prompt_id`s, with `failed: []`. Three lists' worth of values in one list of three — **zipped, not crossed**.
+- **The 2^64−1 seed reached the submitted graph byte-exact.** ComfyUI's own `/history/<prompt_id>` for variant 0 carries `"noise_seed": 18446744073709551615`, and the rounded `18446744073709552000` appears nowhere in it — checked by searching the raw response **text**, never `JSON.parse`, since parsing it in the checker would reintroduce the very rounding under test. This is the one thing no fixture can prove: every test in this repo fakes `comfy`, so the chain that carries those digits is stubbed out at its first link.
+- All three completed in 160 s and produced three **different** images — `Chroma-Radiance_00006_.png`, `_00007_`, `_00008_` — from seeds `18446744073709551615`, `12345`, `67890`. One sweep, three renders, three seeds that are each what was asked for.
+- `get_job` answered for all three `prompt_id`s **with no `host` argument**, each reporting `host_source: "ledger"`. A sweep of N is N ledger entries.
+
+**This run found a defect the whole test suite could not.** `vary`'s `stale` key is emitted only when the CLI consulted a live `/object_info` and fell back to a cache; given `--input <cache>` it is **absent entirely**. That is the normal shape for every remote sweep — comfy-cli refuses a non-loopback `/object_info` fetch as potential SSRF, so `--input` is the only source that works there — and a schema requiring `stale` failed every remote sweep with a `contract_violation` while passing all 157 test files, because the fixture always emitted the key. Fixed, measured, and pinned by a test; ground truth #51.
+
 ## Known gaps
 
 - **A detection probe that times out reads as `running: false`**, so a ComfyUI wedged mid-sampling could pass the launch guard onto a different port. Deliberate: treating timeouts as "refuse" would block every launch behind a flaky probe.

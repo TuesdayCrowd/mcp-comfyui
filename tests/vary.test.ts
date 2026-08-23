@@ -301,6 +301,33 @@ test("a stale object_info cache warns but still produces the variants", async ()
   expect(result.warnings[0]?.code).toBe("object_info_stale");
 });
 
+test("a payload with no `stale` at all reads as not stale", async () => {
+  // The shape a REMOTE sweep always gets, and the one this module got wrong
+  // first — found by a live run, not by a fixture. Measured 2026-08-22, the
+  // same command twice: pointed at a host with nothing listening it emits
+  // `stale: true`; pointed at a cache with `--input` it emits **no `stale`
+  // key**. comfy-cli refuses to fetch /object_info from a non-loopback address
+  // as potential SSRF, so `--input` is the only source that works for another
+  // machine and this server always uses it there. A required `stale` therefore
+  // failed every remote sweep with a `contract_violation` — and passed the
+  // whole suite, because the fixture always emitted the key.
+  //
+  // Mutant: make `stale` required again. Dies here.
+  servePayload({
+    workflow: source,
+    count: 2,
+    warnings: [],
+    out_dir: outDir,
+    written: [join(outDir, "flow_000.json"), join(outDir, "flow_001.json")],
+    variants: null,
+  });
+
+  const result = await varyWorkflow(source, { "3.seed": [1, 2] }, { outDir });
+
+  expect(result.count).toBe(2);
+  expect(result.stale).toBe(false);
+});
+
 test("a warning code this server has never heard of is carried, not refused", async () => {
   // Non-negotiable #2: every registry from the CLI is an open string, and
   // upstream documents its codes as append-only.
