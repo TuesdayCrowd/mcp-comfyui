@@ -41,6 +41,23 @@
 #   $FAKE_COMFY_TEMPLATE_NAME      templates_fetch: name echoed back in data.name
 #   $FAKE_COMFY_NOTES_FILE     notes_file: JSON file served as data; unset means
 #                              a workflow that carries no notes
+#   $FAKE_COMFY_VARY_WARNINGS  vary: literal JSON array for data.warnings
+#   $FAKE_COMFY_VARY_STALE     vary: data.stale, "true" or "false" (default false)
+#   $FAKE_COMFY_VARY_VARIANTS_FILE  vary: JSON file served as data.variants,
+#                              standing in for a future CLI that returns whole
+#                              graphs even under --out-dir (default: null, which
+#                              is what today's CLI really emits)
+#   $FAKE_COMFY_JOBS_WAIT_FILE     jobs wait: JSON file served as the summary —
+#                                  as data on success, as error.details on failure
+#   $FAKE_COMFY_JOBS_WAIT_ERROR    jobs wait: error code to fail with; the summary
+#                                  above still travels, in error.details
+#   $FAKE_COMFY_JOBS_WAIT_MESSAGE  jobs wait: the failure message
+#   $FAKE_COMFY_JOBS_WAIT_SLEEP    jobs wait: seconds to block before answering,
+#                                  so a test can prove this side's budget outlives
+#                                  the one it hands the CLI
+#   $FAKE_COMFY_RUN_SEQ_DIR    run_seq: directory of <n>.ndjson (stdout), <n>.exit
+#                              (exit code) and <n>.workflow (a copy of the file
+#                              --workflow named), served one per invocation
 
 [ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
 
@@ -220,6 +237,28 @@ case "$FAKE_COMFY_MODE" in
       status) file="$FAKE_COMFY_JOBS_STATUS_FILE"; err="$FAKE_COMFY_JOBS_STATUS_ERROR" ;;
       ls)     file="$FAKE_COMFY_JOBS_LS_FILE";     err="$FAKE_COMFY_JOBS_LS_ERROR" ;;
       cancel) file="$FAKE_COMFY_JOBS_CANCEL_FILE"; err="$FAKE_COMFY_JOBS_CANCEL_ERROR" ;;
+      wait)
+        # A real wait blocks; this one blocks on request, so a test can pin
+        # that the budget handed to the CLI (`--timeout`, in seconds) is
+        # shorter than the one this server kills the child on. Without that
+        # gap a SIGKILL would land exactly where the CLI was about to print
+        # which jobs are still running — the only valuable part of a timeout.
+        [ -n "$FAKE_COMFY_JOBS_WAIT_SLEEP" ] && sleep "$FAKE_COMFY_JOBS_WAIT_SLEEP"
+        # `jobs wait` is the one subcommand whose FAILURE arm carries a payload,
+        # so it cannot use the shared error printf below. Measured 2026-08-22:
+        # a wait where any job failed, was cancelled or timed out comes back
+        # ok:false with codes `execution_error`, `cancelled` or `wait_timeout`
+        # — and the SAME summary the success arm puts in `data` moved verbatim
+        # into `error.details`. Four completed jobs and one that raised is a
+        # failure envelope, which is exactly why nothing may read the exit code.
+        if [ -n "$FAKE_COMFY_JOBS_WAIT_ERROR" ]; then
+          printf '{"schema":"envelope/1","type":"envelope","ok":false,"command":"jobs wait","version":"0.0.0","where":null,"data":null,"error":{"code":"%s","message":"%s","hint":null,"details":' \
+            "$FAKE_COMFY_JOBS_WAIT_ERROR" "${FAKE_COMFY_JOBS_WAIT_MESSAGE:-jobs wait reported a non-success}"
+          if [ -n "$FAKE_COMFY_JOBS_WAIT_FILE" ]; then cat "$FAKE_COMFY_JOBS_WAIT_FILE"; else printf 'null'; fi
+          printf '}}\n'
+          exit 1
+        fi
+        file="$FAKE_COMFY_JOBS_WAIT_FILE"; err="" ;;
       *)      file=""; err="unknown_subcommand" ;;
     esac
     # A subcommand the test never armed is a fault in the test, not a payload:
@@ -306,6 +345,109 @@ case "$FAKE_COMFY_MODE" in
     fi
     printf ',"error":null}\n'
     exit 0 ;;
+  vary)
+    # `comfy workflow vary --out-dir`, which is the ONLY form this server ever
+    # invokes. Measured 2026-08-22 against the installed CLI: with --out-dir it
+    # writes <out-dir>/<stem>_<NNN>.json, zero-padded to three digits, and its
+    # envelope reports `written` (the paths) with `variants` present and set to
+    # **null** — not absent, as an earlier reading of the design had it. Without
+    # --out-dir the same key carries whole frontend graphs, 84,918 bytes each on
+    # a real template, which is landmine #1 waiting to happen.
+    #
+    # `variants: null` is emitted here for exactly that reason: a fixture that
+    # dropped the key could not tell a reader of `data.variants` apart from a
+    # reader of `data.written`, and the mutant this fake exists to kill is
+    # precisely the one that reads the wrong one.
+    #
+    # Each variant is a BYTE COPY of the source workflow, never a rewrite: sh
+    # has no JSON parser, and a fake that re-serialised the graph would destroy
+    # the 2^64-1 seed these tests exist to protect.
+    #
+    # The copy is then marked with its own index, between markers and after the
+    # original bytes — the same idiom the set_slot mode uses, and for the same
+    # two reasons: it needs no JSON parser, and it leaves everything ahead of it
+    # untouched so a test can assert on both. The real CLI writes a DIFFERENT
+    # value into each variant, so a fake whose variants were byte-identical
+    # could not tell "submitted three files" from "submitted one file three
+    # times" — which is exactly the mistake a sweep must not make.
+    #
+    # The variant count is derived from the --slot lists rather than armed by
+    # the test, so a test asserting on `count` is really asserting that the
+    # argv this server built carries the values it thinks it does. Elements are
+    # counted as commas + 1, which is exact for the scalar lists a sweep sends
+    # and would miscount a comma inside a quoted string -- no test needs one.
+    src=""
+    outdir=""
+    count=0
+    take=""
+    for arg in "$@"; do
+      case "$take" in
+        src)    take=""; src="$arg"; continue ;;
+        outdir) take=""; outdir="$arg"; continue ;;
+        slot)
+          take=""
+          list=$(printf '%s' "${arg#*=}" | tr -d '[]')
+          if [ -z "$list" ]; then
+            n=0
+          else
+            n=$(printf '%s' "$list" | tr -cd ',' | wc -c | tr -d ' ')
+            n=$((n + 1))
+          fi
+          [ "$n" -gt "$count" ] && count=$n
+          continue ;;
+      esac
+      case "$arg" in
+        vary)      take=src ;;
+        --out-dir) take=outdir ;;
+        --slot)    take=slot ;;
+      esac
+    done
+    stem=$(basename "$src")
+    stem="${stem%.json}"
+    written=""
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      dest="$outdir/${stem}_$(printf '%03d' "$i").json"
+      mkdir -p "$outdir"
+      cp "$src" "$dest"
+      printf '\n<<<VARIANT\n%s\nVARIANT>>>' "$i" >> "$dest"
+      written="${written:+$written,}\"$dest\""
+      i=$((i + 1))
+    done
+    printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"workflow vary","version":"0.0.0","where":null,"data":{"workflow":"%s","count":%s,"warnings":%s,"out_dir":"%s","written":[%s],"variants":' \
+      "$src" "$count" "${FAKE_COMFY_VARY_WARNINGS:-[]}" "$outdir" "$written"
+    if [ -n "$FAKE_COMFY_VARY_VARIANTS_FILE" ]; then
+      cat "$FAKE_COMFY_VARY_VARIANTS_FILE"
+    else
+      printf 'null'
+    fi
+    printf ',"stale":%s},"error":null,"changed":true}\n' "${FAKE_COMFY_VARY_STALE:-false}"
+    exit 0 ;;
+  run_seq)
+    # `comfy run --json`, answering DIFFERENTLY on each invocation.
+    #
+    # A sweep submits N runs in one tool call, and every existing run mode
+    # serves one fixed stream — so N submits would come back with N identical
+    # prompt_ids, which is the one thing a sweep must not do. A counter in the
+    # served directory picks `<n>.ndjson`, so a test spells each variant's
+    # answer separately and can make any one of them a failure envelope.
+    #
+    # `<n>.workflow` is a copy of the file `--workflow` named, taken at the
+    # moment of the submit. That is what proves variant N's file still existed
+    # when variant N was submitted — the assertion that kills a `dispose()`
+    # moved inside the submit loop.
+    seq_n=0
+    [ -f "$FAKE_COMFY_RUN_SEQ_DIR/.n" ] && seq_n=$(cat "$FAKE_COMFY_RUN_SEQ_DIR/.n")
+    printf '%s\n' "$((seq_n + 1))" > "$FAKE_COMFY_RUN_SEQ_DIR/.n"
+    take=0
+    for arg in "$@"; do
+      if [ "$take" = 1 ]; then cp "$arg" "$FAKE_COMFY_RUN_SEQ_DIR/$seq_n.workflow" 2>/dev/null; break; fi
+      [ "$arg" = "--workflow" ] && take=1
+    done
+    [ -f "$FAKE_COMFY_RUN_SEQ_DIR/$seq_n.ndjson" ] && cat "$FAKE_COMFY_RUN_SEQ_DIR/$seq_n.ndjson"
+    seq_exit=0
+    [ -f "$FAKE_COMFY_RUN_SEQ_DIR/$seq_n.exit" ] && seq_exit=$(cat "$FAKE_COMFY_RUN_SEQ_DIR/$seq_n.exit")
+    exit "$seq_exit" ;;
   *)
     echo "$OK"
     exit 0 ;;

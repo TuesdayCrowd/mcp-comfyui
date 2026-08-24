@@ -61,7 +61,7 @@ src/comfy/          the CLI and instance layer
   outputs.ts        artifact path-vs-URL rule, shared by run and jobs
   userdata.ts       a REMOTE instance's own saved workflows, over its HTTP API
   fetchOutputs.ts   copy a remote run's artifacts here, on request only
-  jobs.ts           jobs status | ls | cancel
+  jobs.ts           jobs status | ls | cancel | wait (many ids, one call)
   instance.ts       detection and guarded launch
   templates.ts      the gallery: search and fetch. No host — it is not a ComfyUI.
   validate.ts       comfy validate; decodes its own envelope (landmine #27)
@@ -70,6 +70,7 @@ src/workflows/
   slots.ts          comfy workflow slots -> typed Slot[]
   describe.ts       slots × object_info -> JSON Schema   ← the value-add
   setSlots.ts       byte-copy (or byte-write) + set-slot in place
+  vary.ts           comfy workflow vary --out-dir; reads the FILE PATHS only
   run.ts            comfy run --json, NDJSON decoded line by line
 src/config.ts       workflow roots and env-var vocabulary
 src/hosts.ts        the host registry: load, validate, resolve, repair, write
@@ -89,6 +90,8 @@ Dependency direction is one-way: `workflows/` may import `comfy/`, never the rev
 These are not style preferences. Each was measured, and each has a test pinning it.
 
 **1. Never let JS parse or re-serialise a workflow graph.** ComfyUI seeds reach 2^64−1; JavaScript rounds above 2^53. Measured: `set-slot --stdout` on a graph holding `18446744073709551615` returned the exact digits, and our `JSON.parse` corrupted that *untouched* seed to `18446744073709552000`. Hence the byte-copy in `setSlots.ts` and the graph-dropping in `run.ts` (`comfy run --json` echoes the whole graph as a `prompt_preview` event on every run). **Assume this recurs anywhere a comfy payload can contain a graph.**
+
+It has now recurred a third time. `comfy workflow vary` returns whole frontend graphs in `data.variants` — 84,918 bytes each on a real template, measured 2026-08-22 — and `--out-dir` is what stops it: the graphs go to disk and the envelope reports `written`, a list of paths, with `variants` present and **null**. `src/workflows/vary.ts` therefore requires `outDir` rather than defaulting it, and its payload schema deliberately does not declare `variants`, so a future CLI that returned graphs under `--out-dir` anyway would still have them stripped. Ground truth #43–#45.
 
 **2. Every registry from the CLI is an open string** — `error.code`, slot `type`, job `status`, run `event.type`. Upstream documents error codes as append-only, and its published schemas are already behind its own source. Closing an enum breaks the server on the next CLI release. Tests assert the published enums are incomplete, so the argument stays checkable.
 
@@ -207,6 +210,15 @@ A real run also confirmed three things previously known only from source: `conve
 - **The ceiling and its disclosure**, with `AUTO_FETCH_MAX_BYTES` temporarily lowered to 1 MiB and an isolated `MCP_COMFYUI_CACHE_DIR`: that same image came back in `outputs.not_fetched` as `1559836 bytes exceeds this call's 1048576-byte limit; pass fetch_outputs: true to copy it anyway`, with `fetch_problems: []` — and `fetch_outputs: true` then brought it across. The byte count is the remote's own `Content-Length` (ground truth #41), so the pre-check declines a large artifact without moving it.
 
 Two things this run corrected. The registry's `rtx-video` entry pointed at port **8189**; the box now serves **8188**, and `comfy_status` reports `target.local` — on `target`, beside the address it describes, not at the top level. And `run_workflow {wait: true}` against a real render outlasts the **MCP client's own 60s default request timeout**, which is a property of the client rather than of this server: the run is not lost, it carries on and its artifacts are still fetched. A harness waiting on a real generation must raise that timeout.
+
+**`run_sweep`, verified on 2026-08-22** through `dist/index.js` under `node` over real stdio (`scripts/smoke-sweep.mjs`), against the live ComfyUI **0.33.3** on the Windows RTX 4070, reached at `198.51.100.10:8188`, with `MCP_COMFYUI_AUTO_LAUNCH=0` throughout:
+
+- `run_sweep {workflow: "image_chroma1_radiance_text_to_image", host: "198.51.100.10:8188", inputs: {"778.noise_seed": ["18446744073709551615", 12345, 67890]}}` returned `variant_count: 3` and three distinct `prompt_id`s, with `failed: []`. Three lists' worth of values in one list of three — **zipped, not crossed**.
+- **The 2^64−1 seed reached the submitted graph byte-exact.** ComfyUI's own `/history/<prompt_id>` for variant 0 carries `"noise_seed": 18446744073709551615`, and the rounded `18446744073709552000` appears nowhere in it — checked by searching the raw response **text**, never `JSON.parse`, since parsing it in the checker would reintroduce the very rounding under test. This is the one thing no fixture can prove: every test in this repo fakes `comfy`, so the chain that carries those digits is stubbed out at its first link.
+- All three completed in 160 s and produced three **different** images — `Chroma-Radiance_00006_.png`, `_00007_`, `_00008_` — from seeds `18446744073709551615`, `12345`, `67890`. One sweep, three renders, three seeds that are each what was asked for.
+- `get_job` answered for all three `prompt_id`s **with no `host` argument**, each reporting `host_source: "ledger"`. A sweep of N is N ledger entries.
+
+**This run found a defect the whole test suite could not.** `vary`'s `stale` key is emitted only when the CLI consulted a live `/object_info` and fell back to a cache; given `--input <cache>` it is **absent entirely**. That is the normal shape for every remote sweep — comfy-cli refuses a non-loopback `/object_info` fetch as potential SSRF, so `--input` is the only source that works there — and a schema requiring `stale` failed every remote sweep with a `contract_violation` while passing all 157 test files, because the fixture always emitted the key. Fixed, measured, and pinned by a test; ground truth #51.
 
 ## Known gaps
 

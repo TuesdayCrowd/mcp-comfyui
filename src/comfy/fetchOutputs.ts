@@ -61,6 +61,27 @@ export type FetchedArtifact =
   | { readonly url: string; readonly outcome: "failed"; readonly problem: string }
   | { readonly url: string; readonly outcome: "skipped"; readonly reason: string };
 
+/**
+ * A copy allowance shared across several {@link fetchArtifacts} calls.
+ *
+ * The per-artifact ceiling bounds ONE file; nothing bounds a run of them. A
+ * sixteen-variant sweep whose images are each comfortably under the ceiling
+ * still copies a few hundred megabytes from a call that asked for none of it,
+ * so `run_sweep` hands one of these down its variants and the artifacts are
+ * copied in variant order until it is spent.
+ *
+ * **Mutable on purpose.** The budget is a running total across calls that do
+ * not otherwise know about each other, and threading a return value through
+ * every one of them would put the arithmetic in the caller — which is where it
+ * would drift from the bytes that actually landed.
+ */
+export interface FetchBudget {
+  /** Bytes still available. Decremented by what each artifact actually wrote. */
+  remaining: number;
+  /** What it started at, so a refusal can say which budget it was. */
+  readonly total: number;
+}
+
 export interface FetchOutputsOptions {
   /** The directory to write into. Created if need be. */
   destination: string;
@@ -74,6 +95,18 @@ export interface FetchOutputsOptions {
    * measurement behind its value.
    */
   maxBytes?: number;
+  /**
+   * A shared allowance across this whole tool call — see {@link FetchBudget}.
+   *
+   * Enforced at the same point the per-artifact ceiling is: against the
+   * remote's declared `content-length`, before any bytes move. Where the
+   * remote sends no `content-length` there is nothing to check in advance, so
+   * that artifact is fetched under the per-artifact ceiling and the budget is
+   * charged what landed — which can overshoot, by at most one ceiling's worth.
+   * Bounded and stated, rather than paid for with a second streaming cap whose
+   * skip message could not say which of the two limits bit.
+   */
+  budget?: FetchBudget;
 }
 
 /**
@@ -133,6 +166,24 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
     await response.body.cancel().catch(() => {});
     return skipped(`${declared} bytes exceeds this call's ${maxBytes}-byte limit`);
   }
+  // The shared allowance, checked at the same point and on the same number.
+  // Two messages rather than one, because the two limits have different fixes:
+  // a single artifact past the ceiling is a big file, a sweep past its budget
+  // is a lot of ordinary ones and the earlier variants already came across.
+  const budget = opts.budget;
+  if (budget !== undefined) {
+    if (budget.remaining <= 0) {
+      await response.body.cancel().catch(() => {});
+      return skipped(`this call's ${budget.total}-byte copy budget was already spent`);
+    }
+    if (Number.isFinite(declared) && declared > budget.remaining) {
+      await response.body.cancel().catch(() => {});
+      return skipped(
+        `${declared} bytes exceeds the ${budget.remaining} bytes left of this call's ` +
+          `${budget.total}-byte copy budget`,
+      );
+    }
+  }
 
   try {
     await mkdir(opts.destination, { recursive: true });
@@ -173,6 +224,12 @@ async function fetchOne(url: string, opts: FetchOutputsOptions): Promise<Fetched
     return oversize ? skipped(describe(cause)) : failed(describe(cause));
   }
   await handle.close().catch(() => {});
+
+  // Charged what actually landed, not what was declared: a remote may overstate
+  // its length, and the budget's job is to bound the bytes this call brings
+  // here. A file served with no `content-length` is the only case that can push
+  // `remaining` negative, which the check above reads as "spent".
+  if (budget !== undefined) budget.remaining -= written;
 
   return { url, outcome: "fetched", path };
 }

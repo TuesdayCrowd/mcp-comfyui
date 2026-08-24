@@ -8,7 +8,7 @@ import {
   LaunchTimeoutError,
   RemoteLaunchRefusedError,
 } from "./comfy/instance.ts";
-import { JobPayloadError } from "./comfy/jobs.ts";
+import { JobPayloadError, WaitListError } from "./comfy/jobs.ts";
 import { ObjectInfoCacheWriteError, ObjectInfoFetchError } from "./comfy/objectInfo.ts";
 import { TemplatesPayloadError } from "./comfy/templates.ts";
 import { ValidatePayloadError } from "./comfy/validate.ts";
@@ -23,6 +23,7 @@ import { JobHostUnknownError } from "./jobLedger.ts";
 import type { InertUpstream } from "./workflows/discover.ts";
 import { RunContractError, RunFailedError, type RunEvent } from "./workflows/run.ts";
 import { SetSlotContractError, SlotValueError, WorkflowFileError } from "./workflows/setSlots.ts";
+import { VariantSetParseError, VaryListError } from "./workflows/vary.ts";
 import { SlotListingParseError } from "./workflows/slots.ts";
 
 /**
@@ -387,7 +388,8 @@ export function describeError(err: unknown): ToolErrorBody {
     err instanceof SlotListingParseError ||
     err instanceof JobPayloadError ||
     err instanceof TemplatesPayloadError ||
-    err instanceof ValidatePayloadError
+    err instanceof ValidatePayloadError ||
+    err instanceof VariantSetParseError
   ) {
     return { kind: "contract_violation", message: err.message };
   }
@@ -401,7 +403,16 @@ export function describeError(err: unknown): ToolErrorBody {
   if (err instanceof RemoteLaunchRefusedError) {
     return { kind: "host_not_local", message: err.message, host: err.address };
   }
-  if (err instanceof LaunchArgumentError || err instanceof ToolArgumentError) {
+  if (
+    err instanceof LaunchArgumentError ||
+    err instanceof ToolArgumentError ||
+    // A sweep's value lists could not describe a sweep, or there was
+    // nothing to wait on. Both name the caller's own arguments and both
+    // are raised before anything is spawned, so the fix is entirely in the
+    // next call — `invalid_input` exactly.
+    err instanceof VaryListError ||
+    err instanceof WaitListError
+  ) {
     return { kind: "invalid_input", message: err.message };
   }
 

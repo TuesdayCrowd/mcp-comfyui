@@ -6,9 +6,11 @@ import { ComfyCliError } from "../src/comfy/exec.ts";
 import {
   InvalidPromptIdError,
   JobPayloadError,
+  WaitListError,
   cancelJob,
   getJobStatus,
   listJobs,
+  waitForJobs,
 } from "../src/comfy/jobs.ts";
 
 /**
@@ -28,7 +30,7 @@ const OTHER_ID = "9b1c7d2e-0000-4000-8000-000000000002";
  */
 const OUTPUT_URL = "http://127.0.0.1:8188/view?filename=banana_00001_.png&subfolder=&type=output";
 
-type Subcommand = "status" | "ls" | "cancel";
+type Subcommand = "status" | "ls" | "cancel" | "wait";
 
 let workdir: string;
 let argvOut: string;
@@ -45,6 +47,10 @@ const FIXTURE_ENV = [
   "FAKE_COMFY_JOBS_LS_ERROR",
   "FAKE_COMFY_JOBS_CANCEL_FILE",
   "FAKE_COMFY_JOBS_CANCEL_ERROR",
+  "FAKE_COMFY_JOBS_WAIT_FILE",
+  "FAKE_COMFY_JOBS_WAIT_ERROR",
+  "FAKE_COMFY_JOBS_WAIT_MESSAGE",
+  "FAKE_COMFY_JOBS_WAIT_SLEEP",
 ];
 
 beforeEach(() => {
@@ -729,4 +735,331 @@ test("the copied schema does not describe `jobs cancel` at all", () => {
     "$: missing required host",
     "$: missing required port",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// `jobs wait` — one call, N jobs
+// ---------------------------------------------------------------------------
+
+/**
+ * One row of a `jobs wait` summary, as `wait_cmd` builds it. Measured
+ * 2026-08-22: a completed row carries `outputs`, a cancelled or errored one
+ * carries `error_message`, and a job still running when the budget ran out is
+ * given the invented status `timed_out`.
+ */
+function waitRow(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return { prompt_id: PROMPT_ID, status: "completed", ok: true, outputs: [OUTPUT_URL], ...over };
+}
+
+/** The summary `jobs wait` emits — as `data` on success, `error.details` on failure. */
+function waitSummary(jobs: Array<Record<string, unknown>>): Record<string, unknown> {
+  const count = (status: string) => jobs.filter((job) => job["status"] === status).length;
+  return {
+    total: jobs.length,
+    completed: count("completed"),
+    failed: count("error"),
+    cancelled: count("cancelled"),
+    timed_out: count("timed_out"),
+    elapsed_seconds: 1.5,
+    jobs,
+  };
+}
+
+/**
+ * Arm `jobs wait`'s FAILURE arm: `ok:false` with a code, and the same summary
+ * carried in `error.details` rather than in `data`.
+ */
+function serveWaitFailure(code: string, jobs: Array<Record<string, unknown>>): void {
+  serve("wait", waitSummary(jobs));
+  process.env.FAKE_COMFY_JOBS_WAIT_ERROR = code;
+}
+
+async function waitFailure(work: () => Promise<unknown>): Promise<Error> {
+  try {
+    await work();
+  } catch (err) {
+    return err as Error;
+  }
+  throw new Error("expected a failure, but the call succeeded");
+}
+
+test("waiting on several jobs is ONE cli invocation, not one per id", async () => {
+  // The entire reason this primitive is worth using: a five-variant sweep is
+  // one blocking call, not five polling loops.
+  //
+  // Mutant: loop `getJobStatus` per id. Dies on three invocations.
+  serve("wait", waitSummary([
+    waitRow({ prompt_id: "a" }),
+    waitRow({ prompt_id: "b" }),
+    waitRow({ prompt_id: "c" }),
+  ]));
+
+  const statuses = await waitForJobs(["a", "b", "c"]);
+
+  expect(statuses).toHaveLength(3);
+  expect(statuses.map((s) => s.promptId)).toEqual(["a", "b", "c"]);
+  expect(invocations()).toHaveLength(1);
+});
+
+test("the ids are positionals ahead of this module's own flags", async () => {
+  // `jobsArgs` places the positionals before `--host`/`--port`, and the ids are
+  // several rather than one — so an id that swallowed a flag would take the
+  // real host with it. The order is what the CLI's parser reads.
+  serve("wait", waitSummary([waitRow({ prompt_id: "a" }), waitRow({ prompt_id: "b" })]));
+
+  await waitForJobs(["a", "b"], { host: "rtx-video", port: 8189 });
+
+  const sent = argv();
+  expect(sent.indexOf("--json")).toBeLessThan(sent.indexOf("jobs"));
+  expect(sent.indexOf("a")).toBeLessThan(sent.indexOf("--host"));
+  expect(sent.indexOf("b")).toBeLessThan(sent.indexOf("--host"));
+  expect(sent[sent.indexOf("--host") + 1]).toBe("rtx-video");
+});
+
+test("the timeout reaches the CLI in seconds rather than being enforced here", async () => {
+  // `jobs wait` has its own --timeout (default 1800s) and a second timer on
+  // this side would race it and report the wrong thing. The CLI's budget is in
+  // SECONDS and this codebase's is in milliseconds, so the conversion is the
+  // whole risk.
+  //
+  // Mutant: drop --timeout, or send milliseconds. Dies on either.
+  serve("wait", waitSummary([waitRow({ prompt_id: "a" })]));
+
+  await waitForJobs(["a"], { timeoutMs: 90_000 });
+
+  const sent = argv();
+  expect(sent).toContain("--timeout");
+  expect(sent[sent.indexOf("--timeout") + 1]).toBe("90");
+  expect(sent).not.toContain("90000");
+});
+
+test("the CLI is given room to answer after its own budget expires", async () => {
+  // Two budgets on one call, and they must not be equal. `jobs wait` spends
+  // its --timeout polling and THEN builds the summary that names which jobs
+  // are still running — the only valuable part of a timeout. If this side
+  // killed the child at the same instant, that summary would be lost to a
+  // SIGKILL and the caller would get "the CLI was killed" instead of "b is
+  // still rendering".
+  //
+  // The fixture answers a second after the budget it was handed, which is what
+  // a real wait does on its last poll.
+  //
+  // Mutant: pass `timeoutMs` straight through to `runComfy`. Dies with a
+  // ComfyTimeoutError, because the child is killed before it can print.
+  serve("wait", waitSummary([waitRow({ prompt_id: "a" })]));
+  process.env.FAKE_COMFY_JOBS_WAIT_SLEEP = "2";
+
+  const statuses = await waitForJobs(["a"], { timeoutMs: 1_000 });
+
+  expect(argv()[argv().indexOf("--timeout") + 1]).toBe("1");
+  expect(statuses[0]?.promptId).toBe("a");
+});
+
+test("a wait with no budget of its own states the CLI's, rather than inheriting two", async () => {
+  // `runComfy`'s default budget is 120 seconds and `jobs wait`'s is 1800. Left
+  // to their defaults those disagree, and the shorter one wins — so every wait
+  // longer than two minutes would be killed here while the CLI was still
+  // polling perfectly happily. The budget is stated for the same reason
+  // `--host`, `--port` and `--limit` always are.
+  //
+  // Mutant: omit --timeout and let both defaults stand. Dies on the flag.
+  serve("wait", waitSummary([waitRow({ prompt_id: "a" })]));
+
+  await waitForJobs(["a"]);
+
+  const sent = argv();
+  expect(sent[sent.indexOf("--timeout") + 1]).toBe("1800");
+});
+
+test("a wait where one job failed is an answer about the jobs, not a thrown error", async () => {
+  // THE correction this primitive turns on. Measured 2026-08-22: `jobs wait`
+  // returns ok:false whenever ANY job failed, was cancelled, or timed out —
+  // codes `execution_error`, `cancelled` and `wait_timeout` — with the SAME
+  // summary the success arm puts in `data` moved verbatim into `error.details`.
+  // So four completed variants and one that raised arrive as a FAILURE
+  // envelope, and a wrapper that let it throw would deny the caller the four
+  // that worked. Non-negotiable #3, one layer up.
+  //
+  // Mutant: let the CLI error propagate. Dies because nothing is returned.
+  serveWaitFailure("execution_error", [
+    waitRow({ prompt_id: "a" }),
+    waitRow({ prompt_id: "b", status: "error", ok: false, outputs: undefined, error_message: "Node 3 raised" }),
+    waitRow({ prompt_id: "c" }),
+  ]);
+
+  const statuses = await waitForJobs(["a", "b", "c"]);
+
+  expect(statuses).toHaveLength(3);
+  expect(statuses[0]?.status).toBe("completed");
+  expect(statuses[0]?.outputs.urls).toEqual([OUTPUT_URL]);
+  expect(statuses[1]?.status).toBe("error");
+  expect(statuses[1]?.error).toBe("Node 3 raised");
+  expect(statuses[2]?.status).toBe("completed");
+});
+
+test("a cancelled job in the batch does not deny the others their outputs", async () => {
+  // The same arm, under a different code and a different exit status: measured
+  // live, a mixed completed/cancelled wait exits **130**, not 1. Branching on
+  // the exit code would classify this as an interrupt.
+  serveWaitFailure("cancelled", [
+    waitRow({ prompt_id: "a" }),
+    waitRow({ prompt_id: "b", status: "cancelled", ok: false, outputs: undefined, error_message: "Job was interrupted/cancelled." }),
+  ]);
+
+  const statuses = await waitForJobs(["a", "b"]);
+
+  expect(statuses[0]?.outputs.urls).toEqual([OUTPUT_URL]);
+  expect(statuses[1]?.terminal).toBe(true);
+});
+
+test("a job still running when the budget expired is reported as not terminal", async () => {
+  // `wait_timeout`'s rows carry the status `timed_out`, which `wait_cmd`
+  // invents for a job it stopped waiting on — the job itself is unaffected and
+  // is still executing inside ComfyUI. Reporting it terminal would tell a
+  // caller their render is over when it is not.
+  //
+  // Mutant: add "timed_out" to TERMINAL_STATUSES. Dies here.
+  serveWaitFailure("wait_timeout", [
+    waitRow({ prompt_id: "a" }),
+    waitRow({ prompt_id: "b", status: "timed_out", ok: false, outputs: undefined }),
+  ]);
+
+  const statuses = await waitForJobs(["a", "b"], { timeoutMs: 1_000 });
+
+  expect(statuses[0]?.terminal).toBe(true);
+  expect(statuses[1]?.status).toBe("timed_out");
+  expect(statuses[1]?.terminal).toBe(false);
+});
+
+test("a failure that is not a wait outcome still throws", async () => {
+  // The three wait codes say something about the JOBS. `server_not_running`
+  // says the wait never happened, and there is no summary behind it — so
+  // swallowing it would report an empty batch as a successful wait on nothing.
+  //
+  // Mutant: swallow every ComfyCliError. Dies because nothing is thrown.
+  serveError("wait", "server_not_running");
+
+  const error = await waitFailure(() => waitForJobs(["a"]));
+
+  expect(error).toBeInstanceOf(ComfyCliError);
+  expect((error as ComfyCliError).code).toBe("server_not_running");
+});
+
+test("a code outside the outcome set throws even when it carries a summary", async () => {
+  // The guard that decides this is the CODE, not the presence of `details` —
+  // and the two must not be allowed to stand in for each other. Non-negotiable
+  // #2: the CLI's registry is append-only, so a code added next year may well
+  // arrive with a payload attached, and reading any payload as a batch outcome
+  // would report a fault this server does not understand as "here is what
+  // happened to your jobs".
+  //
+  // Hand-built: a healthy CLI does not emit this combination today, which is
+  // exactly why a real fixture cannot reach the case.
+  //
+  // Mutant: drop the WAIT_OUTCOME_CODES check and gate on `details` alone.
+  // Dies here, because the call then succeeds.
+  serveWaitFailure("server_not_running", [waitRow({ prompt_id: "a" })]);
+
+  const error = await waitFailure(() => waitForJobs(["a"]));
+
+  expect(error).toBeInstanceOf(ComfyCliError);
+  expect((error as ComfyCliError).code).toBe("server_not_running");
+});
+
+test("a wait outcome with no summary behind it throws rather than inventing one", async () => {
+  // `error.details` is where the answer lives on the failure arm. A
+  // `wait_timeout` without one is the CLI's contract not holding, and the
+  // honest answer is the CLI's own error — not an empty list of jobs, which
+  // reads as "none of them existed".
+  process.env.FAKE_COMFY_JOBS_WAIT_ERROR = "wait_timeout";
+
+  const error = await waitFailure(() => waitForJobs(["a"]));
+
+  expect(error).toBeInstanceOf(ComfyCliError);
+  expect((error as ComfyCliError).code).toBe("wait_timeout");
+});
+
+test("a wait outcome whose summary is not a summary is a payload error", async () => {
+  serve("wait", { total: 2 });
+  process.env.FAKE_COMFY_JOBS_WAIT_ERROR = "wait_timeout";
+
+  const error = await waitFailure(() => waitForJobs(["a"]));
+
+  expect(error).toBeInstanceOf(JobPayloadError);
+});
+
+test("a status this server has never heard of is carried, not refused", async () => {
+  // Non-negotiable #2: `status` is an open string here exactly as it is on
+  // `jobs status`, and `terminal` reads false for an unrecognised one — a
+  // status we cannot place is one we cannot claim has finished.
+  serve("wait", waitSummary([waitRow({ prompt_id: "a", status: "reticulating" })]));
+
+  const statuses = await waitForJobs(["a"]);
+
+  expect(statuses[0]?.status).toBe("reticulating");
+  expect(statuses[0]?.terminal).toBe(false);
+});
+
+test("a summary row this server has never seen a field on keeps it", async () => {
+  // `looseObject`, for the same reason every other payload here uses one: the
+  // useful part of a future release is the field nothing has heard of yet.
+  serve("wait", waitSummary([waitRow({ prompt_id: "a", queue_position: 4 })]));
+
+  const statuses = await waitForJobs(["a"]);
+
+  expect(statuses[0]?.promptId).toBe("a");
+});
+
+test("waiting on nothing is refused before any CLI call", async () => {
+  // The CLI's own answer is `no_prompt_ids` at exit code 2, which is a round
+  // trip to learn something this side already knew.
+  //
+  // Mutant: drop the guard. Dies because the CLI is invoked.
+  const error = await waitFailure(() => waitForJobs([]));
+
+  expect(error).toBeInstanceOf(WaitListError);
+  expect(invocations()).toHaveLength(0);
+});
+
+test("a prompt_id that would be read as a flag is refused before any CLI call", async () => {
+  // The same guard `getJobStatus` and `cancelJob` carry, and it matters more
+  // here: these ids are several positionals in a row ahead of --host/--port.
+  //
+  // Mutant: drop validatePromptId. Dies because the CLI is invoked.
+  const error = await waitFailure(() => waitForJobs(["a", "--host"]));
+
+  expect(error).toBeInstanceOf(InvalidPromptIdError);
+  expect(invocations()).toHaveLength(0);
+});
+
+test("a row the caller never asked about is refused", async () => {
+  // The rows are matched to the ids that were requested. A summary naming a
+  // job nobody asked for means this answer is about a different call, and
+  // `run_sweep` would attribute a stranger's artifacts to a variant.
+  //
+  // Mutant: return the payload's rows unchecked. Dies here.
+  serve("wait", waitSummary([waitRow({ prompt_id: "a" }), waitRow({ prompt_id: "z" })]));
+
+  const error = await waitFailure(() => waitForJobs(["a", "b"]));
+
+  expect(error).toBeInstanceOf(JobPayloadError);
+  expect(error.message).toContain("b");
+});
+
+test("a wait reports its rows in the order the ids were given", async () => {
+  // A sweep's variants are ordered, and the response pairs each variant with
+  // its row. The CLI already answers in request order (`for pid in ids`), but
+  // relying on that silently would make a future change reorder somebody's
+  // benchmark.
+  //
+  // Mutant: return the payload's array as it arrived. Dies on the order.
+  serve("wait", waitSummary([
+    waitRow({ prompt_id: "c" }),
+    waitRow({ prompt_id: "a" }),
+    waitRow({ prompt_id: "b" }),
+  ]));
+
+  const statuses = await waitForJobs(["a", "b", "c"]);
+
+  expect(statuses.map((s) => s.promptId)).toEqual(["a", "b", "c"]);
 });

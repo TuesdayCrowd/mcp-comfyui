@@ -4,6 +4,65 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`run_sweep`: one call produces N variants of a workflow, submits them all, and
+  optionally blocks on all of them.** Comparing four seeds was four `run_workflow`
+  calls and four polling loops. Now `inputs` takes per-slot value **lists** and
+  `fixed` takes what stays the same across them:
+
+  ```jsonc
+  run_sweep {
+    workflow: "default_image_gen",
+    inputs: { "3.seed": [1, 2, 3, 4] },
+    fixed:  { "6.text": "a still life, oil" }
+  }
+  ```
+
+  The lists are **zipped, not crossed** — two lists of three give three runs, not
+  nine — which is stated in the tool description's first sentence and enforced
+  before anything is spawned, naming both addresses and both lengths. The CLI's
+  own answer to a mismatch is to zip to the shorter list and report success, which
+  is valid output of the wrong size and the one failure a benchmark cannot detect.
+
+  Every variant's `prompt_id` is recorded against the host that ran it, so `get_job`
+  finds any of them with no `host` argument, and a variant that will not submit
+  lands in `failed` with its index and values rather than denying the caller the
+  rest. `wait: true` blocks on all of them in a **single** `comfy jobs wait` call
+  instead of N polling loops.
+
+  **No workflow graph enters this process at any point.** `comfy workflow vary`
+  returns whole frontend graphs in `data.variants` — 84,918 bytes each on a real
+  template, measured — and parsing one would round every seed above 2^53, which is
+  the exact value a seed sweep exists to vary. Passing `--out-dir` makes the CLI
+  write the variants to disk and report their paths instead, so this server reads
+  file names and nothing else; the payload schema deliberately does not declare
+  `variants`, so a future CLI that returned graphs anyway would still have them
+  stripped here.
+
+- **A sweep-wide artifact copy budget of 64 MiB**, beside the existing 16 MiB
+  per-artifact ceiling. The ceiling bounds one file and nothing bounded a run of
+  them: sixteen 1024×1024 images are about 3 MB each — every one comfortably
+  inside the ceiling, and nearly 50 MB together from a call that asked for none of
+  it. Artifacts are copied in variant order until the budget is spent and the rest
+  are listed in `outputs.not_fetched`, so which ones arrived is deterministic
+  rather than whichever finished first. `fetch_outputs: true` lifts both bounds.
+
+### Fixed
+
+- **A `comfy jobs wait` where any job failed is no longer read as a failed wait.**
+  Measured: the command answers `ok:false` whenever any job failed, was cancelled,
+  or was still running when its budget expired — and moves the same summary its
+  success arm puts in `data` verbatim into `error.details`. Four completed
+  variants and one that raised is therefore a failure envelope (exit 1; a cancelled
+  one exits **130**), and letting it throw would have denied the caller the four
+  that worked. This is non-negotiable #3 one layer up: the `ok` flag describes the
+  batch, not whether the question was answered. Codes outside that set still throw,
+  and the guard is the code rather than the presence of `details`, since an
+  append-only registry means a future code may well arrive carrying a payload.
+
 ## [0.7.0] — 2026-08-22
 
 ### Added

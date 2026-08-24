@@ -9,9 +9,14 @@ import { DEFAULT_PORT, resolveHost } from "./target.ts";
  * returns a `prompt_id` and returns immediately, and without a way to observe
  * or stop that job the handle is a receipt for something nobody can reach.
  *
- * Three subcommands are wrapped — `status`, `ls` and `cancel`. `wait` and
- * `watch` are deliberately absent: blocking is already `run --wait`, and
- * live-tailing needs a streaming API this server does not have.
+ * Four subcommands are wrapped — `status`, `ls`, `cancel` and `wait`. `watch`
+ * is deliberately absent: live-tailing needs a streaming API this server does
+ * not have.
+ *
+ * `wait` earns its place only because of `run_sweep`. Blocking on ONE job is
+ * already `run --wait`; blocking on N is the thing nothing else can do in a
+ * single round trip, and a five-variant sweep is one call rather than five
+ * polling loops. See {@link waitForJobs} for the measurement that shapes it.
  *
  * Two things about the CLI shape everything below.
  *
@@ -47,6 +52,54 @@ const TERMINAL_STATUSES = new Set(["completed", "error", "cancelled"]);
  * control, the same reason `--host`/`--port` are always sent.
  */
 const DEFAULT_LIMIT = 10;
+
+/**
+ * The three error codes `comfy jobs wait` uses to report an OUTCOME rather
+ * than a fault, measured 2026-08-22 against the installed CLI.
+ *
+ * This is the whole reason {@link waitForJobs} is not four lines. `wait_cmd`
+ * emits `ok:false` whenever **any** job failed, was cancelled, or was still
+ * running when the budget ran out — and moves the same summary its success arm
+ * puts in `data` verbatim into `error.details`. So a sweep of five where four
+ * completed and one raised arrives as a failure envelope, exit code 1; a
+ * cancelled one arrives as a failure envelope, exit code **130**.
+ *
+ * Letting either throw would deny the caller the four that worked, which is
+ * non-negotiable #3 one layer up: the envelope's `ok` flag is about the batch,
+ * not about whether the question was answered. Every other code — a downed
+ * server, an id the CLI would not take — really is a fault, and still throws.
+ */
+const WAIT_OUTCOME_CODES = new Set(["execution_error", "cancelled", "wait_timeout"]);
+
+/**
+ * `jobs wait`'s own default budget, in milliseconds, stated rather than
+ * inherited.
+ *
+ * Two defaults meet on this call and they disagree: `runComfyRaw`'s is 120
+ * seconds and the CLI's `--timeout` is 1800. Left alone the shorter wins, so
+ * every wait past two minutes would be SIGKILLed here while the CLI was still
+ * polling — and a sweep of video variants is hours. Same reasoning as
+ * {@link DEFAULT_LIMIT}.
+ */
+const DEFAULT_WAIT_TIMEOUT_MS = 1_800_000;
+
+/**
+ * How much longer than the CLI's budget this side waits before killing it.
+ *
+ * The valuable part of a timed-out wait is the summary naming which jobs are
+ * still running, and the CLI builds that **after** its `--timeout` expires. A
+ * kill at the same instant would replace that answer with "the child was
+ * killed", which is the one outcome a caller can do nothing with. Thirty
+ * seconds is far past the cost of one last poll and a JSON print, and it only
+ * ever elapses when the CLI has stopped behaving.
+ */
+const WAIT_GRACE_MS = 30_000;
+
+/**
+ * Seconds between the CLI's own status polls. Its default, stated for the same
+ * reason {@link DEFAULT_LIMIT} is.
+ */
+const WAIT_POLL_INTERVAL_SECONDS = 5;
 
 /**
  * The root-level JSON mode flag. Piped stdout would select JSON anyway, but
@@ -116,6 +169,46 @@ const JobRowSchema = z.looseObject({
   where: z.string().nullable().optional(),
   workflow_path: z.string().nullable().optional(),
   updated_at: z.string().nullable().optional(),
+});
+
+/**
+ * One row of a `jobs wait` summary, as `wait_cmd` builds it.
+ *
+ * A third shape for the same subject, and the fields are the CLI's own choice
+ * rather than a variation on {@link JobStatusPayloadSchema}: `outputs` appears
+ * only on a completed row, the diagnosis is a flat `error_message` string
+ * rather than the structured `error` a `jobs status` carries, and there is no
+ * queue position, workflow size, host or port anywhere in it.
+ *
+ * `status` is an **open string** exactly as it is above, and here it is
+ * demonstrably incomplete: `timed_out` is a value `wait_cmd` invents for a job
+ * it stopped waiting on, and it appears in no published enum and in no other
+ * subcommand's vocabulary. It is deliberately NOT in
+ * {@link TERMINAL_STATUSES} — a job the wait gave up on is still executing
+ * inside ComfyUI, and reporting it terminal would tell a caller their render
+ * is over when it is not.
+ */
+const JobWaitRowSchema = z.looseObject({
+  prompt_id: z.string(),
+  status: z.string(),
+  /** The CLI's own verdict, `status === "completed"`. Derived, so not carried. */
+  ok: z.boolean().optional(),
+  /** `/view` URLs, present only on a row that produced something. */
+  outputs: z.array(z.string()).optional(),
+  /** A flat sentence — "Job was interrupted/cancelled." — not the structured error. */
+  error_message: z.string().optional(),
+});
+
+/**
+ * `jobs wait`'s summary. The counts it also carries (`total`, `completed`,
+ * `failed`, `cancelled`, `timed_out`, `elapsed_seconds`) are deliberately not
+ * declared: every one is derivable from `jobs`, and a tally that could
+ * disagree with the array a caller iterates is the mistake {@link JobListing}
+ * already avoids. `looseObject` keeps them on the payload for anyone reading
+ * the raw envelope.
+ */
+const JobWaitPayloadSchema = z.looseObject({
+  jobs: z.array(JobWaitRowSchema),
 });
 
 const JobListPayloadSchema = z.looseObject({
@@ -235,6 +328,15 @@ export interface ListJobsOptions extends JobsOptions {
   limit?: number;
 }
 
+export interface WaitJobsOptions extends JobsOptions {
+  /**
+   * How long the CLI may block, defaulting to its own 1800 seconds. Sent as
+   * `--timeout` in **seconds**; this side waits {@link WAIT_GRACE_MS} longer,
+   * so the CLI gets to answer rather than being killed mid-sentence.
+   */
+  timeoutMs?: number;
+}
+
 /**
  * What a cancel actually did.
  *
@@ -315,6 +417,18 @@ export class InvalidPromptIdError extends Error {
  */
 function validatePromptId(promptId: string): void {
   if (promptId.startsWith("-")) throw new InvalidPromptIdError(promptId);
+}
+
+/**
+ * There was nothing to wait on.
+ *
+ * Thrown before anything is spawned. The CLI's own answer is `no_prompt_ids`
+ * at exit code 2, which is a round trip to learn something this side already
+ * knew — and a wait that returned an empty list instead would read as "all of
+ * them finished", which is the opposite of true.
+ */
+export class WaitListError extends Error {
+  override readonly name = "WaitListError";
 }
 
 /** Flatten a thrown CLI error into something that survives serialisation. */
@@ -476,6 +590,140 @@ export async function listJobs(opts: ListJobsOptions = {}): Promise<JobListing> 
     host: payload.host ?? null,
     port: payload.port ?? null,
   };
+}
+
+/** One wait row, in the same shape a `jobs status` answer arrives in. */
+function waitRowToStatus(row: z.infer<typeof JobWaitRowSchema>): JobStatus {
+  return {
+    promptId: row.prompt_id,
+    status: row.status,
+    terminal: isTerminal(row.status),
+    // Four fields `jobs wait` genuinely does not report. `null` is the honest
+    // value and the same one `getJobStatus` gives `queuePosition` on every
+    // call — absence here is structural, not a gap in the decode.
+    queuePosition: null,
+    workflowSize: null,
+    outputs: classifyOutputs(row.outputs ?? []),
+    // A flat sentence rather than the structured diagnosis `jobs status`
+    // carries, because that is what the CLI puts here. `get_job` on the same
+    // id is where the traceback lives.
+    error: row.error_message ?? null,
+    host: null,
+    port: null,
+  };
+}
+
+/**
+ * The summary of a `jobs wait`, from whichever half of the envelope carries it.
+ *
+ * The success arm puts it in `data`; the three {@link WAIT_OUTCOME_CODES} put
+ * the identical object in `error.details`. Reading both here is what makes a
+ * batch with one bad job an answer rather than a thrown error.
+ */
+function waitSummaryOf(err: ComfyCliError): unknown {
+  // A code outside the outcome set is a real fault — a downed server, an id
+  // the CLI would not take — and there is no summary behind it.
+  if (!WAIT_OUTCOME_CODES.has(err.code)) throw err;
+  // An outcome code with no details is the contract not holding. The CLI's own
+  // error is a better answer than an empty batch, which would read as "none of
+  // these jobs exist".
+  if (err.details === null || err.details === undefined) throw err;
+  return err.details;
+}
+
+/**
+ * Block until every one of `promptIds` reaches a terminal state, then report
+ * them all.
+ *
+ * **One CLI invocation for N jobs**, which is the only reason this exists:
+ * `run_sweep` submits five variants and blocks on all five in a single round
+ * trip rather than five polling loops.
+ *
+ * **The outcome is the return value, not the exception.** Measured 2026-08-22:
+ * `comfy jobs wait` answers `ok:false` whenever any job failed, was cancelled,
+ * or was still running when its budget expired — with the same summary its
+ * success arm emits moved into `error.details`. Four completed variants and
+ * one that raised is therefore a failure envelope, and throwing it away would
+ * deny the caller the four that worked. See {@link WAIT_OUTCOME_CODES}.
+ *
+ * The rows are returned **in the order the ids were given**, and an id the
+ * summary does not answer for is a payload error rather than a silent gap: a
+ * sweep pairs each row with the variant that produced it, so a shifted or
+ * missing row would attribute one variant's artifacts to another.
+ *
+ * @throws {WaitListError} `promptIds` was empty; nothing was spawned.
+ * @throws {InvalidPromptIdError} an id starts with `-` and would be read as a
+ * flag rather than a positional — see {@link InvalidPromptIdError}. Checked for
+ * every id, because they are several positionals in a row ahead of this
+ * module's own `--host`/`--port`.
+ * @throws {JobPayloadError} the summary was not one, or did not answer for
+ * every id that was asked about.
+ * @throws {ComfyCliError} the CLI reported a failure that is not a wait
+ * outcome — `server_not_running` for a downed server.
+ * @throws {ComfyTimeoutError} the CLI outlived its own budget plus
+ * {@link WAIT_GRACE_MS} and was killed. The jobs are unaffected.
+ * @throws {ComfyUnavailableError} the `comfy` binary could not be started.
+ * @throws {TypeError} `host` was given as an empty string.
+ */
+export async function waitForJobs(
+  promptIds: readonly string[],
+  opts: WaitJobsOptions = {},
+): Promise<JobStatus[]> {
+  if (promptIds.length === 0) {
+    throw new WaitListError(
+      "there are no jobs to wait on. Pass the prompt_ids a run returned; an empty wait is not " +
+        "the same as a wait that finished.",
+    );
+  }
+  for (const promptId of promptIds) validatePromptId(promptId);
+
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+  const args = jobsArgs(
+    "wait",
+    [
+      ...promptIds,
+      "--timeout",
+      // Seconds, and the CLI's flag is a float. `Math.ceil` rather than a
+      // truncation: a budget of 1500ms must not become one second.
+      String(Math.ceil(timeoutMs / 1_000)),
+      "--poll-interval",
+      String(WAIT_POLL_INTERVAL_SECONDS),
+    ],
+    opts,
+  );
+
+  let data: unknown;
+  try {
+    // The child's budget, not the caller's — see {@link WAIT_GRACE_MS}.
+    data = await runComfy(args, { timeoutMs: timeoutMs + WAIT_GRACE_MS });
+  } catch (err) {
+    if (!(err instanceof ComfyCliError)) throw err;
+    data = waitSummaryOf(err);
+  }
+
+  const result = JobWaitPayloadSchema.safeParse(data);
+  if (!result.success) throw new JobPayloadError("jobs wait", data, result.error);
+
+  const rows = new Map(result.data.jobs.map((row) => [row.prompt_id, row]));
+  return promptIds.map((promptId) => {
+    const row = rows.get(promptId);
+    if (row === undefined) {
+      throw new JobPayloadError(
+        "jobs wait",
+        data,
+        new z.ZodError([
+          {
+            code: "custom",
+            path: ["jobs"],
+            message:
+              `the summary does not answer for ${promptId}, which this call waited on. ` +
+              `A row per requested id is what pairs each answer with the run that produced it.`,
+          },
+        ]),
+      );
+    }
+    return waitRowToStatus(row);
+  });
 }
 
 /**
