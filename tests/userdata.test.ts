@@ -12,7 +12,7 @@ import {
  *
  * The fixture answers ComfyUI's real routes, in ComfyUI's real shapes — both
  * taken from `app/user_manager.py` and confirmed against a live 0.30.2 instance
- * (see `IMPLEMENTATION_PLAN.md`'s measurements). Two of them matter enough to
+ * (see `docs/comfy-cli-ground-truth.md` #22). Two of them matter enough to
  * restate:
  *
  * - the listing's `path` is relative and always `/`-separated, even on Windows,
