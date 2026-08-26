@@ -1,7 +1,35 @@
 # One call, N variants
 
-**Status:** designed 2026-08-22. Not started.
+**Status:** implemented on 2026-08-23 — merged in PR #33 (`72bdb8b`); see
+`CHANGELOG.md`. This document is kept as the record of the decisions and the
+ground truth behind them, not as a description of the code; where the two
+differ, the code, `CLAUDE.md` and `docs/comfy-cli-ground-truth.md` are current.
 **Date:** 2026-08-22
+
+**Three of the measurements below were corrected during implementation.** Each
+correction is itself a re-measurement, recorded as a numbered ground-truth
+entry; the design is otherwise accurate, and the reasoning it records is why the
+code has the shape it does. **Three further places where the implementation
+went a different way** — the per-variant response shape, the budget disclosure,
+and one overstated safety claim — are marked inline below.
+
+- **§1 — `--out-dir` does not make `data.variants` absent.** The key is present
+  and **`null`** (ground truth #44). The architecture is unaffected, since the
+  graphs still never enter this process. What it changes is the fixture: one
+  that dropped the key could not tell a reader of `written` from a reader of
+  `variants`, which is the one mutant that form of decoding needs to kill.
+- **§2 — the `object_info_stale` warning is not universal.** `vary` emits it,
+  and the `stale` key beside it, only on the live-fetch path. Given `--input`
+  there is **no `stale` key at all** (ground truth #51) — and that is the normal
+  shape for every *remote* sweep, because comfy-cli refuses a non-loopback
+  `/object_info` fetch as potential SSRF, so `--input` is the only source that
+  works there. A schema requiring the key failed every remote sweep while the
+  entire fixture-based suite stayed green; the live run is what caught it.
+- **§5 — `comfy jobs wait` does not fail only on a timeout.** It answers
+  `ok:false` whenever **any** job failed, was cancelled, or timed out, moving
+  the same summary its success arm puts in `data` verbatim into `error.details`
+  (ground truth #48). Reading that envelope as a failed wait would have denied
+  the caller every variant that did complete.
 
 Comparing four seeds today is four `run_workflow` calls and four polling loops.
 The CLI already has both halves of the answer — `comfy workflow vary` zips
@@ -32,7 +60,8 @@ Decoding that envelope naively would corrupt every large seed in every variant �
 and a seed sweep is the one workflow where seeds are the entire point.
 
 **`--out-dir` removes the hazard at the source.** Measured: with `--out-dir`
-set, `data.variants` is **absent** from the envelope entirely. What comes back
+set, `data.variants` is **absent** from the envelope entirely. **[Corrected on
+implementation: the key is present and `null` — ground truth #44.]** What comes back
 instead is `written`, a list of file paths, plus `out_dir`, `count`, `warnings`
 and `stale`. The graphs go to disk and never enter this process.
 
@@ -45,6 +74,10 @@ So the whole chain is safe **as long as this server never parses a variant**:
 `vary --out-dir` writes files → `run_sweep` submits each file by path →
 `workflows/run.ts` already drops the graph it gets echoed back. `run_sweep`
 therefore reads `written` and nothing else from that payload.
+**[Precise on implementation: it also reads `count` and `warnings`
+(`tools.ts:2368,2375`). The safety property this sentence exists to state does
+hold — the graph-bearing `variants` field is never touched — but "nothing
+else" is literally wrong, and a safety claim is the wrong place to overstate.]**
 
 **This is the design.** Everything below follows from it.
 
@@ -63,6 +96,9 @@ therefore reads `written` and nothing else from that payload.
   With nothing running it emitted a `warnings` entry, `object_info_stale`, and
   still succeeded — the same stale-cache posture this server already has, and
   it means a sweep can be *built* with no GPU up.
+  **[Corrected on implementation: that is the live-fetch path only. With
+  `--input` there is no `stale` key at all, which is every remote sweep —
+  ground truth #51.]**
 - **`written` names the files**, `<out-dir>/<stem>_000.json` upward, zero-padded
   to three digits.
 - **`comfy jobs wait [prompt_ids…]`** blocks until all are terminal, with
@@ -103,6 +139,11 @@ tool reject a length mismatch *before* spending a CLI call, and what keeps
 what `run_workflow` returns for a single run — `prompt_id`, `status`,
 `applied`, `outputs`. Plus `variant_count`, and `failed` for variants that could
 not be submitted at all.
+**[Changed on implementation: an entry is `{variant, values, prompt_id, status,
+terminal, outputs, error?}` (`tools.ts:2354`). There is no `applied` — `vary` did
+the substituting, so each variant is submitted with `applied: []` — and
+`variant` and `values` were added so an entry names its own index and the values
+that produced it. `variant_count` and `failed` are as designed.]**
 
 ## 4. Artifacts: the per-artifact ceiling, plus a sweep-wide budget
 
@@ -116,6 +157,12 @@ per-artifact ceiling, or many more at realistic sizes. Artifacts are copied in
 variant order until the budget is spent; the rest land in `not_fetched` with
 `the sweep's NN MB copy budget was already spent`, reusing the disclosure that
 already exists rather than inventing a second one.
+**[Changed on implementation: two messages, not one. `fetchOutputs.ts:167,177`
+keep `N bytes exceeds this call's M-byte limit` distinct from `this call's
+N-byte copy budget was already spent`, because the two limits have different
+fixes: a single artifact past the ceiling is one big file, while a sweep past
+its budget is a lot of ordinary ones and the earlier variants already came
+across. Reusing one message would have named the wrong fix half the time.]**
 
 `fetch_outputs: true` lifts both bounds, exactly as it lifts the per-artifact
 one today.
@@ -136,6 +183,10 @@ four. It lands in `failed` with its error, and the run continues.
 **`wait: true` uses `comfy jobs wait` with every id in one call** — that
 primitive is the whole reason this is one round trip instead of N. Its
 `--timeout` takes the tool's `timeout_seconds`.
+**[Corrected on implementation: a timeout is not its only failure. `jobs wait`
+answers `ok:false` whenever any job failed, was cancelled or timed out, with the
+same summary moved into `error.details` — so the failure envelope must be read,
+not thrown. Ground truth #48.]**
 
 **Temp directory ownership.** `vary --out-dir` writes into a directory this
 server creates and owns, and disposes in a `finally` on every path, on the same
