@@ -35,6 +35,8 @@ Deno 2 runs the test suite and builds `dist/index.js` (via `deno bundle`). That 
 
 So `npx -y mcp-comfyui` and `bunx mcp-comfyui` do not resolve and never will. Do not write them into a doc, a README, or an install instruction.
 
+**A freshly published version is not immediately installable, by design.** Deno enforces a **minimum dependency age** — 24 hours by default — so for a day after a release `deno run -A jsr:@tuesdaycrowd/mcp-comfyui` still resolves to the *previous* version, and naming the new one explicitly fails with *"Could not find version … that matches specified version constraint"* plus a hint about the policy. Measured 2026-08-26, minutes after 0.8.0 published: the bare specifier ran 0.7.0 and the pinned `@0.8.0` refused. Nothing is broken when this happens, and **it reads exactly like a failed publish** — a green `Publish to JSR` step and an install that serves the old version. `https://jsr.io/@tuesdaycrowd/mcp-comfyui/meta.json` is the authority; pass `--min-dep-age 0` to verify a release inside that window.
+
 **`deno.json` is the only manifest. There is no `package.json`** — it was deleted in 0.6.0, once measurement showed only two things in it were load-bearing and both had better homes. `typescript` and `@types/node` are now `npm:` entries in `deno.json`'s own `imports`, which `nodeModulesDir: "auto"` materialises into `node_modules` for `tsc` — verified from a clean room, with `node_modules` and `deno.lock` both deleted. Everything else it held (`bin`, `files`, `prepublishOnly`, `scripts`, `description`, `repository`, `keywords`) was npm-registry metadata for a channel this project does not use, and the duplicate `version` field had already caused two silent desyncs.
 
 Two things that came out of that and must not be undone:
@@ -154,7 +156,11 @@ Fixtures are real captures from a live ComfyUI 0.29.0 and 0.30.2, plus comfy-cli
 
 **Two hosts in one test are two ports on loopback.** `deno task test` grants `--allow-net=127.0.0.1,[::1],192.0.2.1`, so a second *address* is not available — except `192.0.2.1`, an RFC 5737 documentation address that is on no interface anywhere and answers nothing, which is exactly what a sleeping remote is and is the fixture the launch-refusal tests use. Its probe costs the 2-second budget; that is deliberate, and it buys the test that pins the defect this whole feature was designed around.
 
-**The job ledger is module state and outlives a test.** `tests/server.test.ts` calls `clearJobLedger()` in `beforeEach` because every test there polls the same `PROMPT_ID` constant, and without it a later test inherits an earlier run's host and port. That is correct in production, where a `prompt_id` belongs to exactly one run. Tests also point `MCP_COMFYUI_HOSTS_FILE` inside their own temp directory, or they would read whichever real `~/.config/mcp-comfyui/hosts.json` the machine running the suite happens to have.
+**One line in the sweep path is unreachable by any test here, and that is by construction.** `tools.ts` passes a shared `FetchBudget` to `fetchIfAsked`; removing it passes the entire suite. A sweep-wide allowance only bites on a host that is both *remote* (or the copy never happens) and *reachable* (or the runs never submit), and `comfy/target.ts`'s `isLocalAddress` calls every address the suite can bind local. **Do not "fix" this by widening `--allow-net`** — every address the suite can serve on is on a local interface, so there is nothing to widen it to. The limitation is stated at the code site, the budget's arithmetic is pinned in `tests/fetchOutputs.test.ts` against a real `FetchBudget`, and the end-to-end behaviour was measured by hand.
+
+**A fixture encodes the shape you observed; the bug lives in the shape you did not.** The `run_sweep` live run found a defect the whole suite could not, because the fixture always emitted a key the real CLI omits under `--input` — ground truth #51, recorded in full under "Verified end to end" below. Prefer a live check for anything whose failure mode is "the CLI omits a field in a state my fixture never produced". **`scripts/smoke-sweep.mjs` is the harness for that**, run as `node scripts/smoke-sweep.mjs <host:port> [workflow] [seed-address]` against a live host — rebuild `dist/` with `deno task build` first, or it tests the previous build. It reads ComfyUI's own `/history/<prompt_id>` as **raw text**; **never `JSON.parse` that body in the checker**, or you reintroduce the exact rounding under test and a corrupted seed reports as intact.
+
+**The job ledger is module state and outlives a test.** `tests/server.test.ts` calls `clearJobLedger()` in `beforeEach` because every test there polls the same `PROMPT_ID` constant, and without it a later test inherits an earlier run's host and port. That is correct in production, where a `prompt_id` belongs to exactly one run. Tests also point `MCP_COMFYUI_HOSTS_FILE` inside their own temp directory, or they would read whichever real `~/.config/mcp-comfyui/hosts.json` the machine running the suite happens to have. That registry lives outside the repo on purpose: run `list_hosts` to see what it holds rather than recording its contents anywhere tracked, because a host's real name and address are exactly what must not enter a public file.
 
 **Mutation testing is the standard here, not an extra.** Every module was developed against constructed mutants, and several real defects were found only that way — a suite can be thorough and still be unable to express the failure that matters. When you change behaviour, construct the mutant that would break it and confirm your test dies. Restore by checksum afterwards; an interrupted mutation run that leaves a mutant applied has happened.
 
@@ -174,6 +180,14 @@ GitButler. Use the `gitbutler` skill and `but commit`, never `git commit`.
 > `rtx-video`; home directories appear as `~/`. Only the identifying values
 > were substituted — every measured behaviour, byte count, error code and
 > path *shape* is exactly as observed.
+>
+> **These entries are dated because they are measurements, not descriptions.**
+> Do not edit an older one to match today's reality: that turns a measurement
+> into a fiction, which is the same failure the redaction note above exists to
+> prevent. The remote box was at port `8189` with `D:\ComfyUI\output` in early
+> August 2026, and reports a different port and a different output directory now
+> — recorded as a **new line** at the foot of the 2026-08-22 entry, not as an edit
+> to the older ones. Add a new dated entry.
 
 
 Against a live ComfyUI 0.29.0 through the compiled binary over stdio: `describe_workflow` returned bounds for all five slots of `workflow.smoke` with zero unresolved, and `run_workflow {1.width:128, 1.height:96} wait:true` produced a 128×96 PNG. `get_job` reported an earlier submit `completed` with its output. `applySlots` was separately verified to keep a 2^64−1 seed byte-exact.
@@ -218,7 +232,7 @@ Two things this run corrected. The registry's `rtx-video` entry pointed at port 
 - All three completed in 160 s and produced three **different** images — `Chroma-Radiance_00006_.png`, `_00007_`, `_00008_` — from seeds `18446744073709551615`, `12345`, `67890`. One sweep, three renders, three seeds that are each what was asked for.
 - `get_job` answered for all three `prompt_id`s **with no `host` argument**, each reporting `host_source: "ledger"`. A sweep of N is N ledger entries.
 
-**This run found a defect the whole test suite could not.** `vary`'s `stale` key is emitted only when the CLI consulted a live `/object_info` and fell back to a cache; given `--input <cache>` it is **absent entirely**. That is the normal shape for every remote sweep — comfy-cli refuses a non-loopback `/object_info` fetch as potential SSRF, so `--input` is the only source that works there — and a schema requiring `stale` failed every remote sweep with a `contract_violation` while passing all 157 test files, because the fixture always emitted the key. Fixed, measured, and pinned by a test; ground truth #51.
+**This run found a defect the whole test suite could not.** `vary`'s `stale` key is emitted only when the CLI consulted a live `/object_info` and fell back to a cache; given `--input <cache>` it is **absent entirely**. That is the normal shape for every remote sweep — comfy-cli refuses a non-loopback `/object_info` fetch as potential SSRF, so `--input` is the only source that works there — and a schema requiring `stale` failed every remote sweep with a `contract_violation` while passing all 157 tests, because the fixture always emitted the key. Fixed, measured, and pinned by a test; ground truth #51.
 
 ## Known gaps
 
