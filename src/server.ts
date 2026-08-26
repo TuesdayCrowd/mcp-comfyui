@@ -38,7 +38,7 @@ import { registerTools, toolConfig } from "./tools.ts";
  * disagree. A release bumps both — `deno bump-version` only knows about the
  * manifest — and forgetting is loud rather than silent.
  */
-export const SERVER_VERSION = "0.7.0";
+export const SERVER_VERSION = "0.8.0";
 
 /** Identity as it appears in a client's server list. */
 const SERVER_INFO = {
