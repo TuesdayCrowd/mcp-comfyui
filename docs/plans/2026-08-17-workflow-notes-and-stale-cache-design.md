@@ -1,7 +1,33 @@
 # Telling a stuck caller what to do next
 
-**Status:** designed 2026-08-17. Not started.
+**Status:** implemented on 2026-08-18 — merged in PR #22 (`638165c`), released in
+0.6.11, with follow-ups in 0.7.0 (`a064ce6`). This document is kept as the record
+of the decisions and the ground truth behind them, not as a description of the
+code; where the two differ, the code, `CLAUDE.md` and
+`docs/comfy-cli-ground-truth.md` are current.
 **Date:** 2026-08-17
+
+**An audit against the shipped code found no corrected measurements.** Every
+figure in the ground-truth sections below became `docs/comfy-cli-ground-truth.md`
+#32–#34, and nothing since amends them. **Four places where the implementation
+went a different way**, none of which disturbs the reasoning here:
+
+- **`WorkflowNote` drops `pos` and `size`.** Shipped as `{id, type, title, text,
+  subgraph}` (`notes.ts:63-70`). The CLI still sends all seven keys and ground
+  truth #32 still records that — canvas coordinates simply mean nothing to an
+  MCP caller, so zod strips them.
+- **`notes_count` is a wire key this document never proposes.** It arrived three
+  days after the release, in `a064ce6`/0.7.0, so that a caller can tell how many
+  notes were withheld: `notes_count - notes.length`.
+- **The caps are the implementation's own numbers.** `MAX_NOTES = 24` and
+  `MAX_NOTE_TEXT = 8_000` (`notes.ts:36-37`); this document asked only that the
+  payload be capped and the truncation made visible, giving no figures.
+- **`NOTES_TIMEOUT_MS = 15_000` is a post-design bugfix** (`tools.ts:145`), not
+  something anticipated here. The first landing let a hung `workflow notes` hold
+  the whole `describe_workflow` response for `runComfy`'s full default.
+
+One paragraph below is **stale within this document itself**, and is marked where
+it sits.
 
 `validate_workflow` can already tell you that seven of a workflow's inputs name
 a model this host does not have. It cannot tell you where to get them, and on a
@@ -316,6 +342,11 @@ remote workflows with no extra code.
 +330ms per `describe_workflow` call, unconditionally, on a call that already
 spawns `comfy workflow slots` and may fetch 1.4MB. No `notes: boolean` knob —
 YAGNI, and a caller cannot choose well.
+**[Stale, and superseded inside this document by "Cost: concurrent, not additive"
+above. What shipped is concurrent: `tools.ts:1857` joins `listSlots`,
+`inertInputsOfFile` and `listNotes` in one `Promise.all`, so the three overlap
+instead of adding and the measured cost is close to zero. Read the concurrent
+figure, not this one. The `notes: boolean` decision itself stands.]**
 
 ## §2 — A stale-cache floor
 
