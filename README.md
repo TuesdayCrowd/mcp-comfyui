@@ -173,15 +173,23 @@ A run on another machine never has a local path, whatever its output directory i
 | `list_workflows` | ✓ | Every workflow found, classified by content |
 | `search_templates` | ✓ | Search comfy-cli's curated workflow-template gallery |
 | `create_workflow_from_template` | | Fetch a gallery template into a new local workflow |
-| `describe_workflow` | ✓ | JSON Schema of that workflow's settable inputs, plus its author's notes |
-| `validate_workflow` | ✓ | Would ComfyUI accept this graph? Offline, sub-second |
+| `describe_workflow` | ✓&nbsp;* | JSON Schema of that workflow's settable inputs, plus its author's notes |
+| `validate_workflow` | ✓&nbsp;* | Would ComfyUI accept this graph? Offline, sub-second |
 | `run_workflow` | | Apply inputs and execute |
 | `run_sweep` | | Run N variants of one workflow, varying inputs across them |
 | `get_job` | ✓ | Poll a job by `prompt_id` |
 | `cancel_job` | | Stop a running job |
 | `list_hosts` | ✓ | The ComfyUI instances this server can be pointed at |
-| `manage_hosts` | | Add, change, remove or repair entries in the host registry |
+| `manage_hosts` | | `add`, `update`, `remove`, `set_default` or `repair` an entry in the host registry |
 | `launch_comfyui` | | Start ComfyUI with explicit flags — only when `MCP_COMFYUI_ALLOW_LAUNCH=1` |
+
+\* **Read-only only when auto-launch is off, and it is on by default.** With
+`MCP_COMFYUI_AUTO_LAUNCH` at its default these two report `readOnlyHint: false`,
+because either may start ComfyUI to rebuild a missing cache — and `readOnlyHint:
+true` is a promise not to. `comfy_status` is read-only under every setting; it is
+the tool to call to ask whether anything is running. `launch_comfyui` is absent
+from the surface entirely unless `MCP_COMFYUI_ALLOW_LAUNCH=1`, so a default
+install lists twelve tools rather than thirteen.
 
 Every tool above except `list_hosts`, `manage_hosts`, `search_templates` and `create_workflow_from_template` takes an optional `host` saying which ComfyUI to use; omitting it uses the default. (`manage_hosts` has a `host` field too, but it means the *address to record* for the entry being written, not which instance to talk to — it talks to none. `search_templates` and `create_workflow_from_template` talk to comfy-cli's template gallery, not to any ComfyUI, so neither has a `host` field at all.)
 
@@ -202,9 +210,9 @@ A mismatched pair of lists is refused before anything is spawned, naming both ad
 
 The intended order is `list_workflows` → `describe_workflow` → `run_workflow`. Inputs are keyed by slot address (`3.seed`, `6.text`), which `describe_workflow` gives you. When `list_workflows` has nothing that fits, `search_templates` → `create_workflow_from_template` turns a gallery template into an ordinary local workflow first, and the same order continues from there.
 
-`search_templates` requires at least one of `type`, `category`, `tag`, `model`, `provider` or `name` — an unfiltered call is refused before anything runs, because the gallery holds hundreds of templates. `create_workflow_from_template` writes into this server's own directory (`MCP_COMFYUI_CREATED_DIR`, default `~/.local/share/mcp-comfyui/workflows`), not yours; it takes no `host`, needs network access even though the gallery index is cached, and will not replace an existing file unless you pass `overwrite: true`.
+`search_templates` requires at least one of `type`, `category`, `tag`, `model`, `provider` or `name` — an unfiltered call is refused before anything runs, because the gallery holds hundreds of templates. `create_workflow_from_template` writes into this server's own directory (`MCP_COMFYUI_CREATED_DIR`, default `~/.local/share/mcp-comfyui/workflows`), not yours; it takes no `host`, needs network access even though the gallery index is cached, and will not replace an existing file unless you pass `overwrite: true`. Pass `as` to choose the filename when the template's own name is not something you want to type again — or when you want to re-fetch an updated template and keep both copies.
 
-**Filter by `tag`, not `type`.** A template's `output_type` is its gallery category restated rather than anything read off the workflow — measured across all 578 rows, every category maps to exactly one value, and five of the eight map to `image` — so `type` is only meaningful for `video`, `audio` and `3d`. 47 of the 103 `Use Cases` templates produce video while typed `image`, and `type: "video"` matches none of them. `tag` recovers 43 of those 47, but it is exact and case-insensitive with **no substring matching**, so a whole tag is required: `"Image to Video"`, `"Text to Video"`, `"Video Edit"`, `"Reference to Video"`, `"Audio to Video"`, `"Video to Video"`, `"Video"`, or `"FLF2V"` — first-last-frame-to-video, which the word "video" will not find and which 11 templates need. Tags are wrong in both directions at the margins, so treat this as the better filter rather than a reliable one; `describe_workflow` reads the real graph and settles it one call later. Measured 2026-08-12; see ground truth #28–#29.
+**Filter by `tag`, not `type`.** A template's `output_type` is its gallery category restated rather than anything read off the workflow — measured across every row of the gallery twice, two weeks apart, every category maps to exactly one value, and five of the eight map to `image` — so `type` is only meaningful for `video`, `audio` and `3d`. 47 of the 103 `Use Cases` templates produce video while typed `image`, and `type: "video"` matches none of them. `tag` recovers 43 of those 47, but it is exact and case-insensitive with **no substring matching**, so a whole tag is required: `"Image to Video"`, `"Text to Video"`, `"Video Edit"`, `"Reference to Video"`, `"Audio to Video"`, `"Video to Video"`, `"Video"`, or `"FLF2V"` — first-last-frame-to-video, which the word "video" will not find and which 11 templates need. Tags are wrong in both directions at the margins, so treat this as the better filter rather than a reliable one; `describe_workflow` reads the real graph and settles it one call later. Measured 2026-08-12 across 578 templates and re-measured 2026-08-27 across 603: every count in this paragraph reproduced exactly, the growth having landed entirely outside `Use Cases`. See ground truth #28–#29.
 
 `validate_workflow` answers "would ComfyUI accept this?" without submitting — in well under a second, against the cached node definitions, so it normally works with ComfyUI stopped. A graph that fails there would otherwise fail after the queue, the model load and however much of a render ComfyUI got through first. A workflow being invalid is a normal answer rather than an error: `valid: false` comes back with the node, the field and, for a bad dropdown, the values that would have worked. Warnings are advisory and a clean workflow routinely has several, so they are capped while `warning_count` stays honest. **`valid: true` is structural, not semantic** — every node exists, every required input is present, every value is in range, every edge is wired. Not that the result will look like what you asked for.
 
@@ -213,6 +221,55 @@ The intended order is `list_workflows` → `describe_workflow` → `run_workflow
 **Both tools answer from an aged cache rather than failing.** The order is fresh cache → live fetch → launch and refetch → stale cache, so freshness still wins whenever a ComfyUI is reachable and auto-launch means what it always did. Only when all three fail does the floor apply, and it says so: the response carries `object_info: {stale: true, age_hours, path}`, and no `object_info` key means the definitions were current. Read a stale answer with the bias in mind — `/object_info` changes when something is **installed**, so a stale copy can under-report a model that is really present, which makes "that model is missing" the characteristic wrong answer. Re-run once ComfyUI is reachable to confirm one.
 
 `describe_workflow` and `validate_workflow` are read-only only when auto-launch is off — with it on, either may start ComfyUI if it has no cached `/object_info`, and `readOnlyHint` has to say so. `comfy_status` never launches under any setting; it's the tool you call to ask whether anything is running.
+
+## When a tool fails
+
+A failure is structured, not a sentence. Every tool answers `isError: true` with a single JSON block:
+
+```json
+{ "error": { "kind": "unknown_host",
+             "message": "no host named \"rtx-vidio\"…",
+             "known_hosts": ["mac-local", "rtx-video"],
+             "registry_path": "/Users/you/.config/mcp-comfyui/hosts.json" } }
+```
+
+`kind` is the part to branch on. It is deliberately coarser than the errors underneath it, because the useful question is *who fixes this and how* — fix the arguments, wait, start something, or give up. Finer detail travels alongside: `code` carries comfy-cli's own append-only error code, and each kind adds the fields it alone knows (`known_workflows`, `inert_addresses`, `cache_path`, `prompt_id`, and so on). Nothing is flattened into prose.
+
+**The caller can fix these.**
+
+| `kind` | Means |
+|---|---|
+| `invalid_input` | An argument could not be used — a bad value, a sweep whose lists disagree in length. Raised before anything is spawned |
+| `inert_slot` | You set a decoy address whose value ComfyUI overrides from a link. `inert_addresses` names them, and `describe_workflow`'s `inert` list names what to set instead |
+| `workflow_not_found` | No workflow by that name. `known_workflows` carries the ones that exist |
+| `unknown_host` | No host by that name. `known_hosts` carries the ones that would have worked |
+| `job_host_unknown` | Which ComfyUI this job ran on cannot be established. Pass `host` — guessing gives a confidently wrong answer rather than a detectable one |
+
+**Something has to change on a machine.**
+
+| `kind` | Means |
+|---|---|
+| `comfyui_not_running` | Nothing is answering and this server may not start anything. Start ComfyUI, or set `MCP_COMFYUI_AUTO_LAUNCH=1` |
+| `host_unreachable` | A ComfyUI on **another** machine is not answering. Neither fix above applies — that box is asleep |
+| `host_not_local` | Something only a local address can do was asked of a remote one. The address is fine; the fix is on the other machine |
+| `launch_timeout` | `comfy launch` ran, but nothing answered inside the budget |
+| `launch_failed` | `comfy launch` exited before producing a server. Waiting longer would not have helped |
+| `comfy_unavailable` | The `comfy` binary could not be started at all — an install problem. See *Requirements* |
+| `object_info_unavailable` | `/object_info` could not be read and no cache could stand in, so no constraints are knowable |
+| `object_info_cache_unwritable` | The definitions were fetched but could not be cached. `cache_path` names the file |
+| `workflow_file` | The file could not be read: missing, unreadable, a directory. `code` is the errno, and `ENOENT` vs `EACCES` is the whole diagnosis |
+| `registry_invalid` | `hosts.json` could not be parsed, and a named host needed it. `line` and `column` locate the fault |
+| `permission_denied` | Running under Deno without a permission it needs. The message names the flag; Node and Bun never produce this |
+
+**Wait, retry, or report it.**
+
+| `kind` | Means |
+|---|---|
+| `comfy_cli` | ComfyUI or the CLI said no, carrying `code` from an append-only registry — **treat an unfamiliar code as forward-compatible and read the message**, never as a parse failure |
+| `run_failed` | A run executed and failed. A `comfy_cli` failure with the server's own events attached, which is where the traceback is |
+| `timeout` | The CLI outlived its budget and was killed. **The run itself may still be going** — the message names the job to poll |
+| `contract_violation` | The CLI answered with something that is not its own contract. Not your fault and not ComfyUI's; this is a version-skew bug worth reporting |
+| `internal_error` | A bug in this server, said plainly rather than blamed on the request. The stack also goes to stderr, which is the only place anyone would see it |
 
 ## Design notes
 
@@ -235,6 +292,7 @@ deno task test                              # full suite
 deno task test:one tests/describe.test.ts   # one file
 deno task typecheck                         # tsc --noEmit, under node
 deno task build                             # -> dist/index.js
+deno task release patch|minor|major         # bump the version everywhere it lives
 ```
 
 `test:one` exists because a bare `deno test <file>` type-checks by default, and
@@ -249,6 +307,19 @@ Tests never contact a real ComfyUI and never invoke the real `comfy`. The CLI is
 Fixtures under `tests/fixtures/` are real captures from a live ComfyUI (0.29.0, and 0.30.2 for the userdata API), not hand-written approximations — including `slots.6key.json`, a 210-slot listing from a 122KB video workflow, and comfy-cli's own published JSON Schemas.
 
 `tests/fixtures/workflow.smoke.json` is an `EmptyImage` → `SaveImage` graph that needs no checkpoint, for end-to-end verification on any install.
+
+Three things the suite structurally cannot prove — that a gallery template really fetches, that a run on another machine has its artifacts copied here, and that a 2^64−1 seed survives all the way into the submitted graph — have live harnesses under `scripts/`, each driving the built server over real stdio:
+
+```bash
+deno task build                                        # or you test the previous build
+node scripts/smoke-templates.mjs                       # network; needs no ComfyUI
+node scripts/smoke-remote-artifacts.mjs <host:port>    # needs a live REMOTE ComfyUI
+node scripts/smoke-sweep.mjs <host:port>               # needs a live ComfyUI
+```
+
+Every one of them forces `MCP_COMFYUI_AUTO_LAUNCH=0`, so none can start a ComfyUI on your machine while it is aimed at another one.
+
+`deno task release` exists because the version number lives in three files — `deno.json`, `SERVER_VERSION` in `src/server.ts`, and the CHANGELOG heading. It edits all three and stops, without committing or publishing: JSR refuses to republish a version number, so a spent one is spent.
 
 ## Licence
 

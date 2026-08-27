@@ -4,6 +4,51 @@ All notable changes to this project are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Documentation
+
+- **The error contract is now documented.** Every tool answers a failure with
+  structured JSON — `{"error": {"kind", "message", …kind-specific fields}}` — and
+  `kind` is a deliberately coarse 21-value vocabulary that says *who fixes this
+  and how*. All 21 were documented in `src/toolResult.ts`'s JSDoc and in no
+  user-facing file, which is the gap worth naming: internal documentation quality
+  can hide an external documentation absence. README now groups them the way a
+  caller has to act on them — fix your arguments, change something on a machine,
+  or wait and retry — including the standing rule that an unfamiliar `comfy_cli`
+  code is forward-compatible and must be read, never treated as a parse failure.
+
+- **`deno task release` is documented, and it is not `deno bump-version`.** The
+  version lives in three files — `deno.json`, `SERVER_VERSION` in `src/server.ts`,
+  and the CHANGELOG heading — and `deno bump-version` rewrites only the first.
+  `SERVER_VERSION` drifted from the manifest for four releases before a test
+  pinned them together. The whole release path (log as it lands → bump → PR →
+  merge publishes → the 24-hour minimum-dependency-age window that reads exactly
+  like a failed publish) is now written down in `CLAUDE.md`.
+
+- **Two shipped things were missing from the maps that are supposed to list
+  them:** `src/workflows/notes.ts` from the architecture listing, and
+  `tests/fixtures/fake-comfy-dispatch` — the front end that picks a fixture mode
+  per subcommand, with its own seven-variable vocabulary — from the testing
+  notes. The three live smoke harnesses under `scripts/` are now listed together
+  with what each proves that no fixture can.
+
+- **The template-gallery measurements were re-run and are now dated rather than
+  bare.** The gallery has grown 578 → 603 since 2026-08-12, and every structural
+  claim built on it survived unchanged: `output_type` still has cardinality
+  exactly 1 in every category, and re-fetching all 103 `Use Cases` templates
+  reproduced the video counts *exactly* — 47 carrying a video node, 46 active,
+  43 of 47 recovered by tag, the same named misses and the same single false
+  positive. Recorded as dated paragraphs beside the originals in ground truth
+  #28–#29 rather than edited over them, because the property surviving a gallery
+  change is stronger evidence than the original single measurement was.
+
+- **README's tool table no longer contradicts the default configuration.**
+  `describe_workflow` and `validate_workflow` were marked read-only, but
+  auto-launch is on by default and both then report `readOnlyHint: false`;
+  verified over real stdio in both configurations. The table now marks it where
+  a reader sees the claim, instead of correcting it two paragraphs later.
+
 ## [0.8.0] — 2026-08-26
 
 ### Added

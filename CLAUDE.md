@@ -14,7 +14,20 @@ deno task test:one tests/describe.test.ts   # one file (see below — a bare `de
 deno task typecheck                   # tsc --noEmit, via node — see "Toolchain" below
 deno task build                       # -> dist/index.js, runnable under plain `node`
 deno task compile                     # -> dist/mcp-comfyui (self-contained binary, optional)
+deno task release patch|minor|major   # bump the version in all THREE places it lives
 ```
+
+**Use `deno task release`, not `deno bump-version`.** The version number lives in
+three files — `deno.json`, `SERVER_VERSION` in `src/server.ts` (a deliberate
+literal, not an import of the manifest), and the CHANGELOG's `[Unreleased]`
+heading, which a release turns into a dated section. `deno bump-version` rewrites
+only the first, and `SERVER_VERSION` drifted from the manifest for four releases
+before `tests/server.test.ts` started pinning them together. `scripts/release.mjs`
+edits all three and re-reads them at the end rather than trusting its own edits;
+it deliberately does **not** commit, push or publish, since JSR refuses to
+republish a version number and a spent one is spent. Two design docs under
+`docs/plans/` predate this script and still say "leave the version bump to
+`deno bump-version`" — they are dated records, and this is the current answer.
 
 **No per-test `--filter` for a file that uses `beforeEach`/`afterEach`/`beforeAll`.** Every test in this project's `tests/support/testing.ts` shim is registered through `@std/testing/bdd`'s `it` (aliased `test`); a file with hooks becomes one wrapping `Deno.test` named `"global"` with each `test()` as a *step*, and `deno test --filter` matches only top-level test names — it cannot reach into steps. `deno test --filter "…" tests/exec.test.ts` therefore runs either the whole file or nothing, never a single case inside it. The file itself is the practical unit (`deno test tests/foo.test.ts`); to isolate one test inside a hooked file, add `test.only(...)` at that call site temporarily (bdd's `it.only`, re-exported through the same shim) and remove it before committing. Files with no hooks at all (`target.test.ts`, `envelope.test.ts`, `index.test.ts`, `describe.test.ts`) register as ordinary top-level tests, and `--filter` reaches them by name.
 
@@ -72,6 +85,7 @@ src/workflows/
   slots.ts          comfy workflow slots -> typed Slot[]
   describe.ts       slots × object_info -> JSON Schema   ← the value-add
   setSlots.ts       byte-copy (or byte-write) + set-slot in place
+  notes.ts          comfy workflow notes -> the author's canvas notes, capped
   vary.ts           comfy workflow vary --out-dir; reads the FILE PATHS only
   run.ts            comfy run --json, NDJSON decoded line by line
 src/config.ts       workflow roots and env-var vocabulary
@@ -152,6 +166,21 @@ Rules earned by getting each of these wrong in this repo, usually more than once
 
 Tests never contact a real ComfyUI and never invoke the real `comfy`. The CLI is faked by `tests/fixtures/fake-comfy` (dependency-free POSIX `sh`, driven by `$FAKE_COMFY_MODE`, argv captured to `$FAKE_COMFY_ARGV_OUT`); HTTP is faked with `Deno.serve({port: 0})`. Fixture modes are append-only — never change an existing one.
 
+**One tool call can be several CLI calls, and `$FAKE_COMFY_MODE` names only one of them.** `run_workflow` shells out twice — `workflow set-slot`, then `run` — so `tests/fixtures/fake-comfy-dispatch` sits in front of the fixture, picks a mode from the *subcommand* and `exec`s it. That keeps every mode written before this existed behaving exactly as it did. Its vocabulary, all optional:
+
+| variable | applies to | default |
+|---|---|---|
+| `FAKE_COMFY_SET_SLOT_MODE` | `workflow set-slot` | `set_slot` |
+| `FAKE_COMFY_RUN_MODE` | `run` | `run_stream` |
+| `FAKE_COMFY_JOBS_MODE` | `jobs` | `jobs` |
+| `FAKE_COMFY_NOTES_MODE` | `workflow notes` | `notes_file` |
+| `FAKE_COMFY_VARY_MODE` | `workflow vary` | `vary` |
+| `FAKE_COMFY_SLOTS_MODE` | `workflow slots` | *opt-in — no default* |
+| `FAKE_COMFY_LAUNCH_MODE` | `launch` | *opt-in — no default* |
+| `FAKE_COMFY_DISPATCH_LOG` | every call; argv **appended** | unset |
+
+The last three are the ones worth knowing. `SLOTS_MODE` and `LAUNCH_MODE` are deliberately undefaulted so that tests predating those call sites are untouched, and `DISPATCH_LOG` exists because the fixture's own `$FAKE_COMFY_ARGV_OUT` is *overwritten* per call — it therefore holds only the last of the two, which is never the `set-slot` one. Anything the dispatcher does not recognise falls through to `$FAKE_COMFY_MODE`, so a single-command test can still arm the fixture directly.
+
 Fixtures are real captures from a live ComfyUI 0.29.0 and 0.30.2, plus comfy-cli's own published JSON Schemas.
 
 **Two hosts in one test are two ports on loopback.** `deno task test` grants `--allow-net=127.0.0.1,[::1],192.0.2.1`, so a second *address* is not available — except `192.0.2.1`, an RFC 5737 documentation address that is on no interface anywhere and answers nothing, which is exactly what a sleeping remote is and is the fixture the launch-refusal tests use. Its probe costs the 2-second budget; that is deliberate, and it buys the test that pins the defect this whole feature was designed around.
@@ -159,6 +188,16 @@ Fixtures are real captures from a live ComfyUI 0.29.0 and 0.30.2, plus comfy-cli
 **One line in the sweep path is unreachable by any test here, and that is by construction.** `tools.ts` passes a shared `FetchBudget` to `fetchIfAsked`; removing it passes the entire suite. A sweep-wide allowance only bites on a host that is both *remote* (or the copy never happens) and *reachable* (or the runs never submit), and `comfy/target.ts`'s `isLocalAddress` calls every address the suite can bind local. **Do not "fix" this by widening `--allow-net`** — every address the suite can serve on is on a local interface, so there is nothing to widen it to. The limitation is stated at the code site, the budget's arithmetic is pinned in `tests/fetchOutputs.test.ts` against a real `FetchBudget`, and the end-to-end behaviour was measured by hand.
 
 **A fixture encodes the shape you observed; the bug lives in the shape you did not.** The `run_sweep` live run found a defect the whole suite could not, because the fixture always emitted a key the real CLI omits under `--input` — ground truth #51, recorded in full under "Verified end to end" below. Prefer a live check for anything whose failure mode is "the CLI omits a field in a state my fixture never produced". **`scripts/smoke-sweep.mjs` is the harness for that**, run as `node scripts/smoke-sweep.mjs <host:port> [workflow] [seed-address]` against a live host — rebuild `dist/` with `deno task build` first, or it tests the previous build. It reads ComfyUI's own `/history/<prompt_id>` as **raw text**; **never `JSON.parse` that body in the checker**, or you reintroduce the exact rounding under test and a corrupted seed reports as intact.
+
+**Three such harnesses exist.** Each drives `dist/index.js` over real stdio the way an MCP client does, so **`deno task build` first** or you are testing the previous build. Each forces `MCP_COMFYUI_AUTO_LAUNCH=0`, so none of them can start a GPU process while you are aiming at another machine.
+
+| harness | proves the thing no fixture can | needs |
+|---|---|---|
+| `node scripts/smoke-templates.mjs` | a real gallery template fetches and lands as an ordinary local workflow | network; **no** ComfyUI (it exits 1 on `object_info_unavailable` — that path is the point) |
+| `node scripts/smoke-remote-artifacts.mjs <host:port> [workflow]` | a run on another machine has its artifacts copied here | a live **remote** ComfyUI |
+| `node scripts/smoke-sweep.mjs <host:port> [workflow] [seed-address]` | a 2^64−1 seed reaches the **submitted graph** byte-exact | a live ComfyUI |
+
+The last two need a host that is both remote and reachable, which `deno task test` structurally cannot provide — see the `FetchBudget` note above for why.
 
 **The job ledger is module state and outlives a test.** `tests/server.test.ts` calls `clearJobLedger()` in `beforeEach` because every test there polls the same `PROMPT_ID` constant, and without it a later test inherits an earlier run's host and port. That is correct in production, where a `prompt_id` belongs to exactly one run. Tests also point `MCP_COMFYUI_HOSTS_FILE` inside their own temp directory, or they would read whichever real `~/.config/mcp-comfyui/hosts.json` the machine running the suite happens to have. That registry lives outside the repo on purpose: run `list_hosts` to see what it holds rather than recording its contents anywhere tracked, because a host's real name and address are exactly what must not enter a public file.
 
@@ -171,6 +210,37 @@ Rule-shaped code (when to drop a constraint, which source wins) needs hand-built
 GitButler. Use the `gitbutler` skill and `but commit`, never `git commit`.
 
 **Pull requests are required.** Commit to a named virtual branch, `but push <branch>`, then open a PR (`but pr new`, or `gh pr create` — `gh` is authenticated with `repo` scope here even when GitButler's forge auth is not). Never commit to `main`, and **do not use `but land`**: it pushes straight to `origin/main`, skipping review and CI, and `but undo` cannot un-push it. This repo previously did land directly; that override was retired on 2026-08-07.
+
+## Releasing
+
+There is exactly one automated gate — `.github/workflows/publish.yml` — and it is
+the same job on a pull request and on a push to `main`. Only the final step is
+conditional, so a PR runs the identical steps, on the identical pinned Deno
+(2.9.4) and Node (20), that will gate the release. That symmetry is deliberate:
+until 2026-08-22 the gate ran *only* on the push that publishes, so a test that
+failed just on `ubuntu-latest` stayed invisible until it blocked a release, and
+one did — 0.6.11 reached JSR only because a later PR happened to pass behind it.
+
+The order, and why each step is where it is:
+
+1. **Log the change in `CHANGELOG.md` under `[Unreleased]` as it lands**, not at
+   release time — the entry is written while the reasoning is still to hand.
+2. `deno task release patch|minor|major` — rewrites the three version sites and
+   dates the heading. It stops there on purpose; the diff is worth a human's eyes
+   before it becomes a release, because **JSR refuses to republish a version
+   number, so a spent one is spent.**
+3. Commit, push, and open a PR like any other change. The PR runs `deno task test`
+   and `deno task typecheck` and does **not** reach the publish step, which is
+   guarded on the event rather than the branch so `workflow_dispatch` keeps working.
+4. Merge. The push to `main` re-runs both gates and then `npx jsr publish
+   --no-check`. **A green merge is not a published release** — check
+   `gh run list --workflow=publish.yml`. Publishing is a no-op when `deno.json`'s
+   version is already on JSR, so pushing to `main` without a bump is safe and silent.
+5. **Do not treat the first 24 hours as a failed publish.** Deno's minimum
+   dependency age means `deno run -A jsr:@tuesdaycrowd/mcp-comfyui` still resolves
+   to the *previous* version for a day, and naming the new one explicitly fails
+   outright. `https://jsr.io/@tuesdaycrowd/mcp-comfyui/meta.json` is the authority;
+   `--min-dep-age 0` verifies a release inside that window.
 
 ## Verified end to end
 
@@ -233,6 +303,18 @@ Two things this run corrected. The registry's `rtx-video` entry pointed at port 
 - `get_job` answered for all three `prompt_id`s **with no `host` argument**, each reporting `host_source: "ledger"`. A sweep of N is N ledger entries.
 
 **This run found a defect the whole test suite could not.** `vary`'s `stale` key is emitted only when the CLI consulted a live `/object_info` and fell back to a cache; given `--input <cache>` it is **absent entirely**. That is the normal shape for every remote sweep — comfy-cli refuses a non-loopback `/object_info` fetch as potential SSRF, so `--input` is the only source that works there — and a schema requiring `stale` failed every remote sweep with a `contract_violation` while passing all 157 tests, because the fixture always emitted the key. Fixed, measured, and pinned by a test; ground truth #51.
+
+**Documentation audit, 2026-08-27.** No ComfyUI was reachable — the local one was stopped and the remote sits behind a Tailscale that was down — so this verified the toolchain and the MCP surface rather than a render. Everything below was run, not read:
+
+- **`deno task test`: 157 passed (737 steps), 0 failed, 34 s. `deno task typecheck`: zero errors.** The suite's own count is what CLAUDE.md claims elsewhere, so that number is current rather than inherited.
+- **`deno task build` → `dist/index.js` (1,365,243 bytes, 249 modules) plus `dist/package.json` holding exactly `{"type":"module"}`**, and `node --no-experimental-detect-module -e "import('./dist/index.js')"` resolved. That is the Node 18/20 guarantee from the Toolchain section, exercised rather than assumed.
+- **The tool surface, over real stdio, matches the README table in both configurations.** With `MCP_COMFYUI_ALLOW_LAUNCH=1` the server lists **13** tools; with it off, **12** — `launch_comfyui` is simply absent. And `describe_workflow`/`validate_workflow` really do flip `readOnlyHint` with `MCP_COMFYUI_AUTO_LAUNCH`: `true` with it off, `false` with it on. Since auto-launch is **on by default**, a default install answers `readOnlyHint: false` for both, which the README's table now marks rather than merely explaining two paragraphs later.
+- **`bun dist/index.js` served the same 12 tools as `node`** (bun 1.3.14), so the Toolchain section's "Bun remains a supported runtime" is measured on this build, not carried forward.
+- **The three version sites agree at 0.8.0** — `deno.json`, `SERVER_VERSION`, the CHANGELOG heading — and `https://jsr.io/@tuesdaycrowd/mcp-comfyui/meta.json` reports `latest: 0.8.0`. The minimum-dependency-age window recorded on 2026-08-26 has since passed, exactly as that entry predicted; nothing was broken then.
+- **The template gallery has grown 578 → 603, and every structural claim built on it survived.** Re-running the full 2026-08-12 procedure — all 603 rows grouped by category, all 103 `Use Cases` templates re-fetched and their nodes re-matched — reproduced the video counts *exactly*, template names included. Recorded in ground truth #28–#29 as dated paragraphs beside the originals. The counts in the README were the stale part and are now dated.
+- **`comfy validate`'s diagnostic vocabulary is still 13 on the installed build**, still disjoint from `error_codes.py`. Ground truth #27 asks to be re-counted and says what to change if the installed copy is ever upgraded; it has not been.
+
+Three documentation defects came out of this and are fixed: `src/workflows/notes.ts` was missing from the Architecture map, `deno task release` was documented nowhere despite being the only correct way to bump a version, and `tests/fixtures/fake-comfy-dispatch` — a second fixture with its own seven-variable vocabulary — was unmentioned in the Testing section.
 
 ## Known gaps
 
