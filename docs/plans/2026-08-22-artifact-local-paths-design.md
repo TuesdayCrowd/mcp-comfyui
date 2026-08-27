@@ -1,7 +1,20 @@
 # Give every artifact a place on this disk
 
-**Status:** designed 2026-08-22. Not started.
+**Status:** implemented on 2026-08-22 — merged in PR #28 (`f450036`), released in
+0.7.0, and amended on 2026-08-26 by 0.8.0's sweep-wide copy budget (PR #33, which
+added `SWEEP_FETCH_BUDGET_BYTES` and a second skip-reason vocabulary this document
+predates). Kept as the record of the decisions and the ground truth behind them,
+not as a description of the code; where the two differ, the code, `CLAUDE.md` and
+`docs/comfy-cli-ground-truth.md` are current.
 **Date:** 2026-08-22
+
+**An audit against the shipped code found no corrected measurements** — worth
+stating, because it is unusual here. Every behavioural and numeric claim below
+held: the 16 MiB ceiling, the 60 s auto-fetch budget against 300 s for an
+explicit one, the `Content-Length` pre-check that declines a large artifact
+without moving it, and `artifactOrigin` probing the URL's own authority. Ground
+truth #41 **confirms** the `Content-Length` assumption rather than correcting it.
+Two presentational notes are marked inline below.
 
 A run on the Windows box finishes, and the answer says the image is at
 `http://198.51.100.10:8189/view?filename=ComfyUI_00013_.png&type=output`. That
@@ -272,6 +285,12 @@ the observed size, and the argument that would override it:
 { "url": "http://…/view?filename=out.mp4&type=output",
   "reason": "214.7 MB exceeds the 16 MiB auto-fetch ceiling; pass fetch_outputs: true to copy it anyway" }
 ```
+**[Illustrative, not the wire text. The shipped reason carries raw byte counts on
+both sides — `<declared> bytes exceeds this call's <max>-byte limit`
+(`fetchOutputs.ts:167`) — with `; pass fetch_outputs: true to copy it anyway`
+appended by `outputsBody` (`tools.ts:838`). Ground truth #41 records the live
+form. A reader expecting "16 MiB" or "214.7 MB" in a real response will not
+find it.]**
 
 Structural absence is kept, on the rule `local_paths` and `notes_count` already
 follow: `not_fetched` is absent when nothing was skipped, rather than `[]`.
@@ -282,6 +301,10 @@ to today's, and a remote run's carries the new keys. That is the whole
 observable contract change.
 
 **One existing test pins the old shape and must change with it.**
+**[The name quoted below is a paraphrase; no test ever carried it. The real one
+is "a remote host's artifacts are never reported as files on this machine"
+(`tests/server.test.ts:2969`). Its prediction held exactly: the assertion
+weakened to `toMatchObject` and `local_paths` stayed `{}`.]**
 `tests/server.test.ts`'s "a remote instance's outputs are never claimed to be
 here" asserts `expect(body["outputs"]).toEqual({files: [], urls: [url],
 local_paths: {}})` — an exact match, on a remote host, with no `fetch_outputs`.
