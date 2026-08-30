@@ -83,7 +83,13 @@ test("a resolved IPv6 host produces a URL the platform will accept", () => {
 const INTERFACES = {
   lo0: [{ address: "127.0.0.1" }, { address: "::1" }],
   en0: [{ address: "192.168.1.50" }, { address: "fe80::1c3f:5aff:fe22:1" }],
-  utun4: [{ address: "100.86.199.77" }],
+  // A tailnet address must stay inside 100.64.0.0/10 (RFC 6598 shared address
+  // space) for this fixture to mean anything — that is the range Tailscale
+  // assigns from, and the whole point of the case below. It must NOT be a real
+  // one: this repo is public, and a tailnet address identifies a machine as
+  // surely as a hostname does. `100.64.0.1` is the first address of the
+  // reserved range, so it is realistic in shape and belongs to nobody.
+  utun4: [{ address: "100.64.0.1" }],
   awdl0: undefined,
 };
 
@@ -111,8 +117,8 @@ test("isLocalAddress(192.168.1.50) — an address bound on one of this machine's
   expect(isLocalAddress("192.168.1.50", INTERFACES)).toBe(true);
 });
 
-test("isLocalAddress(100.86.199.77) — this machine's own Tailscale address is still this machine", () => {
-  expect(isLocalAddress("100.86.199.77", INTERFACES)).toBe(true);
+test("isLocalAddress(100.64.0.1) — this machine's own Tailscale address is still this machine", () => {
+  expect(isLocalAddress("100.64.0.1", INTERFACES)).toBe(true);
 });
 
 test("isLocalAddress(198.51.100.10) — another box on the same tailnet is NOT this machine", () => {

@@ -6,6 +6,22 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- **A real tailnet address was removed from a tracked test file.**
+  `tests/target.test.ts` carried one in its injected interface table, under a test
+  named "this machine's own Tailscale address" — and it sat in the same /24 as the
+  live remote, which is what marked it real rather than invented. It is now
+  `100.64.0.1`, the first address of RFC 6598's shared address space: the same
+  100.64.0.0/10 range Tailscale assigns from, so the case still tests what it was
+  written to test while belonging to nobody. The 2026-08-22 sweep missed it because
+  it is a `.ts` file, which is precisely the mistake that sweep's own write-up
+  warned about — sweep `git ls-files`, never just `*.md`. RFC 1918 addresses
+  elsewhere in the suite were left alone: that space is non-unique by design and
+  names no machine, where a tailnet address is unique per node and does. **The old
+  value is deliberately not quoted here** — naming it in a public changelog would
+  republish exactly what this entry is about removing.
+
 ### Documentation
 
 - **The error contract is now documented.** Every tool answers a failure with
