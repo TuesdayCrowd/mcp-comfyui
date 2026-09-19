@@ -783,6 +783,39 @@ test("a launch whose CLI exits non-zero with no envelope fails fast, not after t
   expect(message).toContain("RuntimeError: boom"); // the traceback survives, not just a verdict
 });
 
+test("a launch that died because comfy could not re-exec itself says so, not 'workspace'", async () => {
+  // Measured 2026-09-19 under Claude Desktop's bare launchd PATH: `comfy
+  // launch --background` re-execs ITSELF by bare name via subprocess.Popen,
+  // so with its own directory off PATH the child dies with
+  // `FileNotFoundError: ... 'comfy'` -- nothing to do with the workspace,
+  // which comfy-cli had already resolved and printed.
+  //
+  // This is the regression that matters: the old message asserted a workspace
+  // cause unconditionally and pointed at MCP_COMFYUI_WORKSPACE, a setting that
+  // cannot fix a PATH problem. Worse, the evidence was structurally out of
+  // reach -- the signature sits at the END of a long traceback, past
+  // envelope.ts's 200-char snippet, so only the full stderr can reveal it.
+  process.env.FAKE_COMFY_MODE = "garbage_self_exec";
+  const port = await closedPort();
+
+  const err = await rejection(launchInstance({ port, timeoutMs: 15_000, pollIntervalMs: 50 }));
+
+  expect(err).toBeInstanceOf(LaunchFailedError);
+  const message = (err as Error).message;
+
+  // The real cause, named.
+  expect(message).toContain("PATH");
+  expect(message).toContain("re-exec");
+  // The evidence, recovered from beyond the snippet limit.
+  expect(message).toContain("No such file or directory: 'comfy'");
+  // COMFY_BIN is this server's variable; comfy-cli has never heard of it, so
+  // a reader must not be sent to it as the fix.
+  expect(message).toContain("COMFY_BIN");
+  // And the wrong diagnosis must be gone.
+  expect(message).not.toContain("The most common cause is a workspace");
+  expect(message).not.toContain("MCP_COMFYUI_WORKSPACE");
+});
+
 test("a missing comfy binary aborts the wait rather than polling to the budget", async () => {
   process.env.COMFY_BIN = join(workdir, "definitely-not-installed");
   const port = serveReadyAfter(Number.MAX_SAFE_INTEGER);

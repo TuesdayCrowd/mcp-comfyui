@@ -76,6 +76,22 @@ case "$FAKE_COMFY_MODE" in
     echo 'RuntimeError: boom' >&2
     echo 'not json at all'
     exit 1 ;;
+  garbage_self_exec)
+    # `comfy launch --background` re-execs ITSELF by bare name through PATH.
+    # When its own directory is not on PATH the child dies uncaught, and the
+    # one informative line sits at the END of a long Rich traceback -- past
+    # envelope.ts's 200-char snippet limit, so a diagnosis that reads only the
+    # error message cannot see it. Measured 2026-09-19 against comfy-cli
+    # running under Claude Desktop's bare launchd PATH.
+    echo 'Launching ComfyUI from: /workspace/ComfyUI' >&2
+    i=0
+    while [ $i -lt 12 ]; do
+      echo "| /opt/comfy-cli/lib/python3.13/site-packages/comfy_cli/command/launch.py:463 in launch_and_monitor |" >&2
+      i=$((i + 1))
+    done
+    echo "FileNotFoundError: [Errno 2] No such file or directory: 'comfy'" >&2
+    echo 'not json at all'
+    exit 1 ;;
   stderr_noise)
     # Human-readable chatter on stderr, including something envelope-shaped.
     # Anything that parses stderr instead of stdout fails loudly here.

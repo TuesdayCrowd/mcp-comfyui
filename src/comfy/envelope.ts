@@ -14,12 +14,32 @@ import { z } from "zod";
 export class EnvelopeParseError extends Error {
   override readonly name = "EnvelopeParseError";
 
+  /**
+   * The child's stderr **in full**, when this error came from a completed run.
+   *
+   * {@link snippet} keeps only the first {@link SNIPPET_LIMIT} characters, and
+   * it keeps the *head*. A Python traceback puts its one informative line —
+   * the exception type and message — at the **end**, so for any real crash the
+   * message carries the frames and discards the diagnosis. Measured
+   * 2026-09-19: a `comfy launch --background` that died on
+   * `FileNotFoundError: … 'comfy'` produced 1331 bytes of stderr whose last
+   * line was the only one worth reading, and the caller diagnosing it saw none
+   * of it.
+   *
+   * So the truncated text stays in `message` — bounded output matters — and
+   * the untruncated text lives here, for code that must *classify* a failure
+   * rather than display it. Undefined when no child ran (a parse of a string
+   * this process already had).
+   */
+  readonly stderr?: string;
+
   constructor(
     message: string,
     readonly raw: string,
-    options?: { cause?: unknown },
+    options?: { cause?: unknown; stderr?: string },
   ) {
     super(message, options);
+    this.stderr = options?.stderr;
   }
 }
 

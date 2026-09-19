@@ -8,6 +8,28 @@ All notable changes to this project are recorded here. The format follows
 
 ### Fixed
 
+- **A launch that died on PATH no longer blames the workspace.**
+  `comfy launch --background` re-execs *itself* by bare name through
+  `subprocess.Popen`, so when the directory holding the comfy binary is off the
+  PATH this server inherited, the child dies with
+  `FileNotFoundError: [Errno 2] No such file or directory: 'comfy'` — after
+  comfy-cli has already resolved and printed its workspace. `LaunchFailedError`
+  asserted "the most common cause is a workspace comfy-cli could not resolve"
+  unconditionally and pointed at `MCP_COMFYUI_WORKSPACE`, a setting that cannot
+  fix a PATH problem. It now names the real cause from the evidence and keeps the
+  workspace guess only for stderr showing nothing recognisable.
+
+  **The evidence was structurally out of reach, which is the part worth
+  recording.** `EnvelopeParseError`'s message quotes stderr through `snippet()`,
+  which keeps the first 200 characters — the *head* — while a Python traceback
+  puts its one informative line at the *end*. The real failure produced 1331
+  bytes whose last line was the only one worth reading, so no amount of rewording
+  could have fixed the diagnosis. `EnvelopeParseError` now also carries the
+  untruncated stderr for code that must classify a failure rather than display
+  it; the message stays bounded. Measured 2026-09-19 against comfy-cli running
+  under a GUI MCP client's bare launchd PATH, and pinned by a new fixture mode
+  (`garbage_self_exec`) whose signature deliberately sits past the snippet limit.
+
 - **A real tailnet address was removed from a tracked test file.**
   `tests/target.test.ts` carried one in its injected interface table, under a test
   named "this machine's own Tailscale address" — and it sat in the same /24 as the
