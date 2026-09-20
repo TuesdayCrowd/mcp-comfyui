@@ -221,11 +221,6 @@ async function written(path: string, timeoutMs = 5_000): Promise<string> {
   return path;
 }
 
-/** The argv the fake recorded. No path in these tests contains a space. */
-async function argvOf(path: string): Promise<string[]> {
-  return readFileSync(await written(path), "utf8").trim().split(" ");
-}
-
 /**
  * The argv of the LAUNCH invocation specifically.
  *
@@ -541,6 +536,12 @@ test("no contention warning when nothing else is running", async () => {
   const configuredPort = await closedPort(); // nothing is running at the configured address
   const targetPort = serveReadyAfter(1);
   armCli("launch");
+  // The raw fixture answers every subcommand as `launch`, so an unarmed
+  // `which` call here would resolve to no workspace and add an unrelated
+  // --output-directory warning of its own -- pointing it at a real, already
+  // torn-down-for-free directory keeps this test scoped to contention alone.
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
+  process.env.FAKE_COMFY_WHICH_PATH = workdir;
 
   const result = await launchInstance({
     port: configuredPort,
@@ -556,6 +557,10 @@ test("no contention warning when nothing else is running", async () => {
 test("no contention warning when the target is the configured address itself", async () => {
   const port = serveReadyAfter(1);
   armCli("launch");
+  // See the previous test: without this, the raw fixture's `which` call
+  // resolves to no workspace and adds an unrelated warning of its own.
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
+  process.env.FAKE_COMFY_WHICH_PATH = workdir;
 
   const result = await launchInstance({ port, pollIntervalMs: 10 });
 
@@ -1304,18 +1309,25 @@ test("a workspace that does not exist is not turned into an output directory", a
   const argvOut = join(workdir, "argv");
   process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
   process.env.FAKE_COMFY_MODE = "launch";
-  process.env.FAKE_COMFY_WHICH_PATH = join(workdir, "no-such-workspace");
+  const noSuchWorkspace = join(workdir, "no-such-workspace");
+  process.env.FAKE_COMFY_WHICH_PATH = noSuchWorkspace;
   process.env.FAKE_COMFY_ARGV_OUT = argvOut;
   const port = serveReadyAfter(1);
 
-  await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
+  const result = await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
 
   // launchArgvOf, not readFileSync: asserting `not.toContain` against the
   // which argv would pass no matter what the launch did.
   expect(await launchArgvOf(argvOut)).not.toContain("--output-directory");
+
+  // Silent-but-skipped would recreate the exact invisible failure this
+  // feature exists to remove: no flag, no local_paths, and no explanation.
+  expect(result.outcome).toBe("launched");
+  if (result.outcome !== "launched") return;
+  expect(result.warnings.join("\n")).toContain(`workspace does not exist: ${noSuchWorkspace}`);
 });
 
-test("a failing `which` leaves the launch untouched", async () => {
+test("a failing `which` leaves the launch untouched, but says why", async () => {
   const argvOut = join(workdir, "argv");
   process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
   process.env.FAKE_COMFY_MODE = "launch";
@@ -1327,6 +1339,9 @@ test("a failing `which` leaves the launch untouched", async () => {
   const result = await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
 
   expect(result.outcome).toBe("launched");
+  if (result.outcome === "launched") {
+    expect(result.warnings.join("\n")).toContain("could not determine a ComfyUI workspace");
+  }
   expect(await launchArgvOf(argvOut)).not.toContain("--output-directory");
 });
 

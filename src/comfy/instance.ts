@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
@@ -66,6 +66,12 @@ const DEFAULT_POLL_INTERVAL_MS = 500;
  * `RunOptions` defaults to 120 s. Blocking a launch for two minutes on a call
  * measured as effectively instant would be wrong, and this call is optional —
  * failing fast and skipping the flag is strictly better than waiting.
+ *
+ * This is a ceiling, not a guarantee: `whichWorkspace` clamps it to the
+ * caller's own `timeoutMs` too, so a caller who asked for a short launch
+ * budget never has this optional call spend more of it than they gave —
+ * `performLaunch` computes its readiness deadline AFTER this call returns, so
+ * an unclamped 10s here would silently borrow from a 2s caller's budget.
  */
 const WHICH_TIMEOUT_MS = 10_000;
 
@@ -972,17 +978,31 @@ async function contentionWarnings(
  *
  * `opts.workspace` short-circuits the CLI call: it is already the answer, and
  * asking anyway would add an invocation to every launch for nothing.
+ *
+ * `timeoutMs` is the CALLER's own launch budget, not a suggestion — the
+ * budget actually passed to `runComfy` is `Math.min(WHICH_TIMEOUT_MS,
+ * timeoutMs)`, so a caller who asked for a short launch never has this
+ * optional call outlive what they asked for.
  */
-async function whichWorkspace(opts: LaunchOptions): Promise<string | undefined> {
+async function whichWorkspace(opts: LaunchOptions, timeoutMs: number): Promise<string | undefined> {
   if (opts.workspace !== undefined) return opts.workspace;
   try {
     const payload = WhichPayloadSchema.parse(
-      await runComfy([JSON_MODE, "which"], { timeoutMs: WHICH_TIMEOUT_MS }),
+      await runComfy([JSON_MODE, "which"], { timeoutMs: Math.min(WHICH_TIMEOUT_MS, timeoutMs) }),
     );
     return payload.workspace_path ?? undefined;
   } catch {
     // Every failure is survivable here — see withDefaultOutputDirectory.
     return undefined;
+  }
+}
+
+/** Whether `path` exists and is a directory — never a file, and never a throw. */
+function isExistingDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
   }
 }
 
@@ -995,14 +1015,24 @@ async function whichWorkspace(opts: LaunchOptions): Promise<string | undefined> 
  * The value is the directory ComfyUI would have used anyway, so nothing moves
  * for anyone — this makes an existing default legible, it does not relocate it.
  *
- * Skipped, silently and without a CLI call where possible, in three cases:
- * the caller already named one; no workspace could be determined; or the
- * workspace does not exist. The last is not hypothetical — `comfy which`
- * returns ok:true for a nonexistent workspace (ground truth #55), so a
- * try/catch alone would pass `--output-directory <nonexistent>/output`.
+ * Skipped without a CLI call and without a `warning`, when there is genuinely
+ * nothing to say: the caller already supplied `--output-directory`, or named
+ * an explicit `opts.workspace` themselves. An explicit workspace is the
+ * caller's own claim, not this function's to second-guess — if it is wrong,
+ * `not_in_workspace` is the failure that says so.
+ *
+ * Skipped WITH a `warning` on the return value in the two cases that are
+ * worth a caller's attention: no workspace could be determined (`comfy which`
+ * failed, or reported none), or the workspace it reported does not exist —
+ * not hypothetical, `comfy which` returns ok:true for a nonexistent workspace
+ * (ground truth #55), so a try/catch alone would not catch this and would
+ * happily pass `--output-directory <nonexistent>/output`. A silent skip in
+ * either case would recreate exactly the invisible failure this feature
+ * exists to remove: no flag, no `local_paths`, and nothing said why.
  *
  * This is legibility, never a precondition: it must never convert a launch
- * that would have worked into one that fails.
+ * that would have worked into one that fails. The caller (`performLaunch`)
+ * attaches the warning to the `launched` result's own `warnings` array.
  *
  * One invariant is now narrower than its documentation: `validateComfyuiArgs`
  * runs in `launchInstance` BEFORE `performLaunch`, so the pair appended here
@@ -1013,14 +1043,35 @@ async function whichWorkspace(opts: LaunchOptions): Promise<string | undefined> 
 async function withDefaultOutputDirectory(
   argv: string[],
   opts: LaunchOptions,
-): Promise<string[]> {
-  if (flagValue(argv, OUTPUT_DIRECTORY_FLAG) !== null) return argv;
+  timeoutMs: number,
+): Promise<{ argv: string[]; warning?: string }> {
+  if (flagValue(argv, OUTPUT_DIRECTORY_FLAG) !== null) return { argv };
 
-  const workspace = await whichWorkspace(opts);
-  if (workspace === undefined) return argv;
-  if (!existsSync(workspace)) return argv;
+  const explicitWorkspace = opts.workspace !== undefined;
+  const workspace = await whichWorkspace(opts, timeoutMs);
 
-  return [...argv, OUTPUT_DIRECTORY_FLAG, join(workspace, "output")];
+  if (workspace === undefined) {
+    // Only reachable with no explicit workspace: whichWorkspace always
+    // returns opts.workspace verbatim when it is set, never undefined.
+    return {
+      argv,
+      warning:
+        "could not determine a ComfyUI workspace, so no --output-directory was sent; artifact " +
+        "paths will not resolve for this instance",
+    };
+  }
+
+  if (!isExistingDirectory(workspace)) {
+    if (explicitWorkspace) return { argv }; // the caller's own claim; see the doc comment above
+    return {
+      argv,
+      warning:
+        `workspace does not exist: ${workspace}; no --output-directory was sent, so artifact ` +
+        `paths will not resolve for this instance`,
+    };
+  }
+
+  return { argv: [...argv, OUTPUT_DIRECTORY_FLAG, join(workspace, "output")] };
 }
 
 /** The launch itself, once it has been established that this caller leads it. */
@@ -1037,8 +1088,9 @@ async function performLaunch(opts: LaunchOptions, argv: string[], target: Target
 
   const warnings = await contentionWarnings(opts, target, probeTimeoutMs);
 
-  const launchArgs = await withDefaultOutputDirectory(argv, opts);
-  const cli = startLaunch(launchArgv(launchArgs, opts.workspace), timeoutMs);
+  const defaulted = await withDefaultOutputDirectory(argv, opts, timeoutMs);
+  if (defaulted.warning !== undefined) warnings.push(defaulted.warning);
+  const cli = startLaunch(launchArgv(defaulted.argv, opts.workspace), timeoutMs);
 
   const deadline = Date.now() + timeoutMs;
   let lastReason = "no probe completed";
