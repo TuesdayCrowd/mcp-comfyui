@@ -49,6 +49,26 @@ All notable changes to this project are recorded here. The format follows
   value is deliberately not quoted here** — naming it in a public changelog would
   republish exactly what this entry is about removing.
 
+- **The server finds comfy-cli itself, and repairs the `PATH` its children get.**
+  `COMFY_BIN` is now an override rather than a requirement: with it unset the
+  server checks `PATH`, then `~/.local/bin`, uv's tool directory, and the two
+  Homebrew prefixes. Set, it wins absolutely and never falls back — a named
+  binary that is missing is an error, not an invitation to substitute one.
+
+  The `PATH` repair is the part that fixes a real failure. `comfy launch
+  --background` re-execs *itself* by bare name, so a GUI-launched MCP client —
+  which inherits `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else — could set
+  `COMFY_BIN` correctly and still have every auto-launch die with
+  `FileNotFoundError: … 'comfy'`, while every other subcommand worked. The
+  binary's directory is *prepended*, so comfy-cli's re-exec finds the binary
+  this server resolved rather than some other one earlier on the path.
+
+  A launch now also passes `--output-directory <workspace>/output`, which is
+  where ComfyUI would have written anyway — the point is that the path appears
+  in its `system.argv`, so `outputs.ts` can resolve `/view` URLs and
+  `local_paths` stops coming back empty for local runs. `comfy_status` gained a
+  `cli` block reporting which binary was resolved and how.
+
 ### Documentation
 
 - **The error contract is now documented.** Every tool answers a failure with

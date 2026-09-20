@@ -69,6 +69,7 @@ A thin orchestrator. **The server never parses or rewrites a workflow graph.** I
 
 ```
 src/comfy/          the CLI and instance layer
+  binary.ts         which comfy to spawn, and the PATH its child needs
   envelope.ts       decodes envelope/1; the single decode point
   exec.ts           the ONLY place this project spawns a process
   target.ts         host/port resolution and address parsing, so they cannot diverge

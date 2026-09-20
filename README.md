@@ -93,9 +93,20 @@ A `deno task compile` task is also available if a self-contained platform binary
 | `MCP_COMFYUI_HOST` / `_PORT` | `127.0.0.1` / `8188` | Where the **default** ComfyUI is |
 | `MCP_COMFYUI_HOSTS_FILE` | `~/.config/mcp-comfyui/hosts.json` | The host registry, for more than one ComfyUI |
 | `MCP_COMFYUI_CACHE_DIR` | `~/.cache/mcp-comfyui` | `/object_info` cache |
-| `COMFY_BIN` | `comfy` | Path to the `comfy` binary |
+| `COMFY_BIN` | auto-detected | Optional override for the path to the `comfy` binary |
 
 Booleans accept `1/true/yes/on` and `0/false/no/off`; anything else is refused at startup rather than read as off.
+
+`COMFY_BIN` is an **override, not a requirement.** With it unset the server
+looks for `comfy` on `PATH`, then in `~/.local/bin`, uv's tool directory,
+`/opt/homebrew/bin` and `/usr/local/bin`. Setting it wins absolutely and
+disables that search — a named binary that is missing is reported as an error
+rather than quietly replaced.
+
+The server also **prepends the resolved binary's directory to the `PATH` it
+gives its children**, because `comfy launch --background` re-execs itself by
+bare name. A GUI-launched MCP client inherits a minimal `PATH`, so without this
+auto-launch fails there even though every other command works.
 
 The two launch switches answer different questions and are deliberately separate. `AUTO_LAUNCH` governs launches **the server decides to make** on your behalf. `ALLOW_LAUNCH` governs whether **a model may ask for one** with `--cpu`, `--listen` and a free-form argument list — strictly more powerful, so it stays opt-in.
 
