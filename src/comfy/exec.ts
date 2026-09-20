@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Readable } from "node:stream";
+import { defaultBinaryDeps, resolveComfyBinary } from "./binary.ts";
 import {
   EnvelopeParseError,
   parseEnvelope,
@@ -166,7 +167,8 @@ function exited(child: ChildProcess): Promise<void> {
  * @throws {ComfyTimeoutError} the child exceeded `timeoutMs` and was killed.
  */
 export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promise<ComfyRun> {
-  const binary = process.env.COMFY_BIN ?? "comfy";
+  const resolved = resolveComfyBinary(defaultBinaryDeps());
+  const binary = resolved.path;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const argv = [binary, SKIP_PROMPT, ...args];
   const commandLine = argv.join(" ");
@@ -181,7 +183,14 @@ export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promis
     // former Bun toolchain (landmine #17): Bun's spawn captured the
     // environment only at process start and ignored runtime mutations
     // unless `env` was passed explicitly.
-    env: process.env,
+    //
+    // The PATH override is the part that is not defensive. comfy-cli's
+    // `launch --background` re-execs ITSELF by bare name, so a child whose
+    // PATH cannot find `comfy` dies with FileNotFoundError even when this
+    // server invoked it by absolute path (ground truth #52).
+    env: resolved.childPath === undefined
+      ? process.env
+      : { ...process.env, PATH: resolved.childPath },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
