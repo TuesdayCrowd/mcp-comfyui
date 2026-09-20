@@ -1,9 +1,9 @@
 # Find comfy-cli, and give it an environment it can work in
 
-**Status:** designed, not implemented. Written 2026-09-19; **revised the same day**
-after an adversarial review found five blockers and twelve internal
-inconsistencies in the first draft. Every correction is marked **[rev]** where a
-reader of the first draft would otherwise be misled.
+**Status:** implemented on 2026-09-19 in PR #NN. Kept as the record of the
+decisions and the ground truth behind them, not as a description of the code;
+where the two differ, the code, `CLAUDE.md` and
+`docs/comfy-cli-ground-truth.md` are current.
 **Date:** 2026-09-19
 
 > **Paths below are redacted placeholders.** This file is public. Home
