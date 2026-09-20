@@ -1,9 +1,9 @@
 # Find comfy-cli, and give it an environment it can work in
 
-**Status:** implemented on 2026-09-19 in PR #NN. Kept as the record of the
-decisions and the ground truth behind them, not as a description of the code;
-where the two differ, the code, `CLAUDE.md` and
-`docs/comfy-cli-ground-truth.md` are current.
+**Status:** implemented on 2026-09-19. Kept as the record of the decisions and
+the ground truth behind them, not as a description of the code; where the two
+differ, the code, `CLAUDE.md` and `docs/comfy-cli-ground-truth.md` are
+current.
 **Date:** 2026-09-19
 
 > **Paths below are redacted placeholders.** This file is public. Home
