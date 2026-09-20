@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { AUTO_LAUNCH_ENV, WORKSPACE_ENV } from "../config.ts";
@@ -57,6 +59,24 @@ const DEFAULT_READY_TIMEOUT_MS = 300_000;
 
 /** Between readiness probes. Short enough to feel immediate, idle otherwise. */
 const DEFAULT_POLL_INTERVAL_MS = 500;
+
+/**
+ * Budget for the `comfy which` call that derives the output directory.
+ *
+ * `RunOptions` defaults to 120 s. Blocking a launch for two minutes on a call
+ * measured as effectively instant would be wrong, and this call is optional —
+ * failing fast and skipping the flag is strictly better than waiting.
+ */
+const WHICH_TIMEOUT_MS = 10_000;
+
+/**
+ * `comfy which`'s payload. `looseObject` and no enum on purpose:
+ * `workspace_type` is a further open-string registry (non-negotiable #2), and
+ * nothing here needs to read it.
+ */
+const WhichPayloadSchema = z.looseObject({
+  workspace_path: z.string().nullable().optional(),
+});
 
 /**
  * The root-level JSON mode flag. Piped stdout would select JSON anyway, but
@@ -947,6 +967,62 @@ async function contentionWarnings(
   ];
 }
 
+/**
+ * The workspace to derive an output directory from, or undefined.
+ *
+ * `opts.workspace` short-circuits the CLI call: it is already the answer, and
+ * asking anyway would add an invocation to every launch for nothing.
+ */
+async function whichWorkspace(opts: LaunchOptions): Promise<string | undefined> {
+  if (opts.workspace !== undefined) return opts.workspace;
+  try {
+    const payload = WhichPayloadSchema.parse(
+      await runComfy([JSON_MODE, "which"], { timeoutMs: WHICH_TIMEOUT_MS }),
+    );
+    return payload.workspace_path ?? undefined;
+  } catch {
+    // Every failure is survivable here — see withDefaultOutputDirectory.
+    return undefined;
+  }
+}
+
+/**
+ * Give ComfyUI an explicit `--output-directory`, so the path it writes to
+ * appears in its own `system.argv` and `outputs.ts` can resolve artifact URLs
+ * against it (ground truth #54). Without it the flag is absent, `argv` says
+ * nothing, and every local artifact comes back with no `local_paths` entry.
+ *
+ * The value is the directory ComfyUI would have used anyway, so nothing moves
+ * for anyone — this makes an existing default legible, it does not relocate it.
+ *
+ * Skipped, silently and without a CLI call where possible, in three cases:
+ * the caller already named one; no workspace could be determined; or the
+ * workspace does not exist. The last is not hypothetical — `comfy which`
+ * returns ok:true for a nonexistent workspace (ground truth #55), so a
+ * try/catch alone would pass `--output-directory <nonexistent>/output`.
+ *
+ * This is legibility, never a precondition: it must never convert a launch
+ * that would have worked into one that fails.
+ *
+ * One invariant is now narrower than its documentation: `validateComfyuiArgs`
+ * runs in `launchInstance` BEFORE `performLaunch`, so the pair appended here
+ * is never validated. `join(workspace, "output")` cannot be empty and the flag
+ * is a literal, so nothing reachable is affected — but a future caller of this
+ * function must not assume validation covers what it adds.
+ */
+async function withDefaultOutputDirectory(
+  argv: string[],
+  opts: LaunchOptions,
+): Promise<string[]> {
+  if (flagValue(argv, OUTPUT_DIRECTORY_FLAG) !== null) return argv;
+
+  const workspace = await whichWorkspace(opts);
+  if (workspace === undefined) return argv;
+  if (!existsSync(workspace)) return argv;
+
+  return [...argv, OUTPUT_DIRECTORY_FLAG, join(workspace, "output")];
+}
+
 /** The launch itself, once it has been established that this caller leads it. */
 async function performLaunch(opts: LaunchOptions, argv: string[], target: Target): Promise<LaunchResult> {
   const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
@@ -961,7 +1037,8 @@ async function performLaunch(opts: LaunchOptions, argv: string[], target: Target
 
   const warnings = await contentionWarnings(opts, target, probeTimeoutMs);
 
-  const cli = startLaunch(launchArgv(argv, opts.workspace), timeoutMs);
+  const launchArgs = await withDefaultOutputDirectory(argv, opts);
+  const cli = startLaunch(launchArgv(launchArgs, opts.workspace), timeoutMs);
 
   const deadline = Date.now() + timeoutMs;
   let lastReason = "no probe completed";

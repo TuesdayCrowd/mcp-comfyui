@@ -60,6 +60,13 @@
 #                              --workflow named), served one per invocation
 #   $FAKE_COMFY_PATH_OUT   file to record the child's own $PATH in, so a test can
 #                          prove the repaired PATH actually reached the process
+#   $FAKE_COMFY_WHICH_PATH  workspace_path reported by the `which` mode. No
+#                           default: an unset value reports null, so a launch
+#                           that has not armed it derives no output directory.
+#                           A fixed path under the shared /tmp would silently
+#                           change every dispatcher-driven launch the moment
+#                           anything created it -- this repo has already lost a
+#                           session to a shared-tmpdir collision.
 
 [ -n "$FAKE_COMFY_ARGV_OUT" ] && printf '%s\n' "$*" > "$FAKE_COMFY_ARGV_OUT"
 
@@ -100,6 +107,16 @@ case "$FAKE_COMFY_MODE" in
     # the re-exec bug (ground truth #52) was invisible to 157 tests.
     [ -n "$FAKE_COMFY_PATH_OUT" ] && printf '%s\n' "$PATH" > "$FAKE_COMFY_PATH_OUT"
     echo "$OK"
+    exit 0 ;;
+  which)
+    # `comfy which`. Measured shape (ground truth #55): ok:true with
+    # workspace_path and workspace_type -- and it succeeds even for a
+    # workspace that does not exist, which is why the caller checks.
+    if [ -n "$FAKE_COMFY_WHICH_PATH" ]; then
+      printf '{"schema":"envelope/1","type":"envelope","ok":true,"command":"which","version":"0.0.0","where":null,"data":{"workspace_path":"%s","workspace_type":"recent"},"error":null}\n' "$FAKE_COMFY_WHICH_PATH"
+    else
+      echo '{"schema":"envelope/1","type":"envelope","ok":true,"command":"which","version":"0.0.0","where":null,"data":{"workspace_path":null,"workspace_type":"recent"},"error":null}'
+    fi
     exit 0 ;;
   stderr_noise)
     # Human-readable chatter on stderr, including something envelope-shaped.

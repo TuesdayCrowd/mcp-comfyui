@@ -116,6 +116,8 @@ afterEach(async () => {
   delete process.env.FAKE_COMFY_ERROR_CODE;
   delete process.env.FAKE_COMFY_ERROR_MESSAGE;
   delete process.env.FAKE_COMFY_DISPATCH_LOG;
+  delete process.env.FAKE_COMFY_WHICH_PATH;
+  delete process.env.FAKE_COMFY_WHICH_MODE;
   rmSync(workdir, { recursive: true, force: true });
 });
 
@@ -222,6 +224,28 @@ async function written(path: string, timeoutMs = 5_000): Promise<string> {
 /** The argv the fake recorded. No path in these tests contains a space. */
 async function argvOf(path: string): Promise<string[]> {
   return readFileSync(await written(path), "utf8").trim().split(" ");
+}
+
+/**
+ * The argv of the LAUNCH invocation specifically.
+ *
+ * `performLaunch` now makes a `comfy which` call first, and the fixture
+ * truncate-writes $FAKE_COMFY_ARGV_OUT on EVERY invocation — so the file
+ * merely existing no longer proves the launch ran, and reading it too early
+ * yields the which argv. Poll for the line that actually names `launch`.
+ */
+async function launchArgvOf(path: string, timeoutMs = 5_000): Promise<string[]> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (existsSync(path)) {
+      const argv = readFileSync(path, "utf8").trim().split(" ");
+      if (argv.includes("launch")) return argv;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`the fake comfy never recorded a launch in ${path}`);
+    }
+    await sleep(5);
+  }
 }
 
 async function rejection(promise: Promise<unknown>): Promise<unknown> {
@@ -474,7 +498,7 @@ test("a launch targeting a free port proceeds while another instance runs elsewh
   // The CLI really ran this time — awaited, since `launchInstance` does not
   // wait for the (fire-and-forget) spawn, so a synchronous check here would
   // race it.
-  await written(argvOut);
+  await launchArgvOf(argvOut);
 });
 
 test("already_running never substitutes an instance from a different address", async () => {
@@ -549,7 +573,7 @@ test("the ComfyUI arguments follow a bare -- separator", async () => {
   const result = await launchInstance({ port, args: { lowvram: true }, pollIntervalMs: 10 });
 
   expect(result.outcome).toBe("launched");
-  const argv = await argvOf(argvOut);
+  const argv = await launchArgvOf(argvOut);
   expect(argv).toEqual(["--skip-prompt", "--json", "launch", "--background", "--", "--lowvram"]);
   expect(argv.indexOf("--")).toBeLessThan(argv.indexOf("--lowvram"));
 });
@@ -560,7 +584,7 @@ test("root flags precede the subcommand", async () => {
   const argvOut = armCli("launch");
   await launchInstance({ port, pollIntervalMs: 10 });
 
-  const argv = await argvOf(argvOut);
+  const argv = await launchArgvOf(argvOut);
   expect(argv[0]).toBe("--skip-prompt");
   expect(argv.indexOf("--json")).toBeLessThan(argv.indexOf("launch"));
 });
@@ -570,7 +594,7 @@ test("no startup arguments means no separator with nothing to separate", async (
   const argvOut = armCli("launch");
   await launchInstance({ port, pollIntervalMs: 10 });
 
-  expect(await argvOf(argvOut)).toEqual(["--skip-prompt", "--json", "launch", "--background"]);
+  expect(await launchArgvOf(argvOut)).toEqual(["--skip-prompt", "--json", "launch", "--background"]);
 });
 
 test("the curated startup arguments are spelled the way ComfyUI expects", async () => {
@@ -594,7 +618,7 @@ test("the curated startup arguments are spelled the way ComfyUI expects", async 
     pollIntervalMs: 10,
   });
 
-  expect(await argvOf(argvOut)).toEqual([
+  expect(await launchArgvOf(argvOut)).toEqual([
     "--skip-prompt",
     "--json",
     "launch",
@@ -623,7 +647,7 @@ test("a flag that was not asked for is not sent", async () => {
   const argvOut = armCli("launch");
   await launchInstance({ port, args: { lowvram: false, cpu: true }, pollIntervalMs: 10 });
 
-  expect(await argvOf(argvOut)).not.toContain("--lowvram");
+  expect(await launchArgvOf(argvOut)).not.toContain("--lowvram");
 });
 
 test("readiness is polled until the instance answers, not decided by one probe", async () => {
@@ -724,6 +748,11 @@ test("a CLI that never returns does not delay a ComfyUI that is already up", asy
   // out of a logfile. Waiting on that would make this server's readiness depend
   // on a log string upstream can change (landmine #9); the HTTP probe is the
   // authority, so a CLI still blocked must not hold up a ready instance.
+  // Point at the dispatcher so the new `which` call resolves to the instant
+  // `which` mode. The `launch)` arm is opt-in and still falls through to
+  // `hang`, which is what this test is about. This also stops the which child
+  // overwriting $FAKE_COMFY_PID_OUT and making the kill target the wrong pid.
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
   process.env.FAKE_COMFY_MODE = "hang";
   const pidOut = join(workdir, "pid");
   process.env.FAKE_COMFY_PID_OUT = pidOut;
@@ -968,7 +997,7 @@ test("a configured workspace is a root flag, before the subcommand", async () =>
 
   await launchInstance({ port, workspace: "/Users/you/ComfyUI-Installs/ComfyUI/ComfyUI", pollIntervalMs: 10 });
 
-  const argv = await argvOf(argvOut);
+  const argv = await launchArgvOf(argvOut);
   expect(argv).toContain("--workspace");
   expect(argv[argv.indexOf("--workspace") + 1]).toBe("/Users/you/ComfyUI-Installs/ComfyUI/ComfyUI");
   expect(argv.indexOf("--workspace")).toBeLessThan(argv.indexOf("launch"));
@@ -983,7 +1012,7 @@ test("no configured workspace sends no --workspace at all", async () => {
 
   await launchInstance({ port, pollIntervalMs: 10 });
 
-  expect(await argvOf(argvOut)).not.toContain("--workspace");
+  expect(await launchArgvOf(argvOut)).not.toContain("--workspace");
 });
 
 test("not_in_workspace is answered with the setting that fixes it", async () => {
@@ -1056,7 +1085,8 @@ test("ensureInstance launches when nothing is answering", async () => {
 
   expect(ensured.outcome).toBe("launched");
   expect(ensured.instance.version).toBe("0.29.0");
-  expect(await settledInvocations(log, 1)).toBe(1);
+  // +1: performLaunch asks `comfy which` to default --output-directory.
+  expect(await settledInvocations(log, 2)).toBe(2);
 });
 
 test("a ComfyUI that appears between the two probes is not raced", async () => {
@@ -1086,7 +1116,8 @@ test("ensureInstance launches at the configured address, not at an instance runn
   expect(ensured.outcome).toBe("launched");
   expect(ensured.instance.port).toBe(configuredPort);
   expect(ensured.instance.port).not.toBe(elsewherePort);
-  expect(await settledInvocations(log, 1)).toBe(1);
+  // +1: performLaunch asks `comfy which` to default --output-directory.
+  expect(await settledInvocations(log, 2)).toBe(2);
 });
 
 test("ensureInstance refuses actionably when auto-launch is off", async () => {
@@ -1114,7 +1145,8 @@ test("concurrent ensures start exactly one ComfyUI", async () => {
     ensureInstance({ port, autoLaunch: true, pollIntervalMs: 10 }),
   ]);
 
-  expect(await settledInvocations(log, 1)).toBe(1);
+  // +1: performLaunch asks `comfy which` to default --output-directory.
+  expect(await settledInvocations(log, 2)).toBe(2);
   for (const result of ensured) expect(result.instance.version).toBe("0.29.0");
 });
 
@@ -1127,7 +1159,8 @@ test("a launch already in flight is joined rather than started again", async () 
     launchInstance({ port, pollIntervalMs: 10 }),
   ]);
 
-  expect(await settledInvocations(log, 1)).toBe(1);
+  // +1: performLaunch asks `comfy which` to default --output-directory.
+  expect(await settledInvocations(log, 2)).toBe(2);
   expect(first.instance.url).toBe(second.instance.url);
 });
 
@@ -1144,7 +1177,8 @@ test("concurrent launches for different targets do not share an in-flight launch
     launchInstance({ port: configured, args: { port: portB }, pollIntervalMs: 10 }),
   ]);
 
-  expect(await settledInvocations(log, 2)).toBe(2);
+  // 2 -> 4: two launches proceed, and each now makes a `which` call too.
+  expect(await settledInvocations(log, 4)).toBe(4);
   expect(a.instance.port).toBe(portA);
   expect(b.instance.port).toBe(portB);
 });
@@ -1161,7 +1195,8 @@ test("a later launch runs again, because the in-flight entry is released", async
   await rejection(launchInstance({ port: closed, timeoutMs: 3_000, pollIntervalMs: 10 }));
   await rejection(launchInstance({ port: closed, timeoutMs: 3_000, pollIntervalMs: 10 }));
 
-  expect(await settledInvocations(log, 2)).toBe(2);
+  // 2 -> 4: two launch attempts, and each now makes a `which` call too.
+  expect(await settledInvocations(log, 4)).toBe(4);
 });
 
 test("a caller's bad argument fails only that caller", async () => {
@@ -1177,5 +1212,136 @@ test("a caller's bad argument fails only that caller", async () => {
 
   expect(bad).toBeInstanceOf(LaunchArgumentError);
   expect(good.outcome).toBe("launched");
+  // +1: performLaunch asks `comfy which` to default --output-directory.
+  expect(await settledInvocations(log, 2)).toBe(2);
+});
+
+// --- defaulting --output-directory from the workspace ---------------------
+
+test("a launch defaults --output-directory to the workspace's own output dir", async () => {
+  const ws = mkdtempSync(join(tmpdir(), "mcp-comfyui-ws-"));
+  const argvOut = join(workdir, "argv");
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
+  process.env.FAKE_COMFY_MODE = "launch";
+  process.env.FAKE_COMFY_WHICH_PATH = ws;
+  process.env.FAKE_COMFY_ARGV_OUT = argvOut;
+  const port = serveReadyAfter(1);
+
+  await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+  const argv = await launchArgvOf(argvOut);
+  expect(argv).toContain("--output-directory");
+  expect(argv[argv.indexOf("--output-directory") + 1]).toBe(join(ws, "output"));
+  rmSync(ws, { recursive: true, force: true });
+});
+
+test("an explicit workspace needs no `which` call", async () => {
+  // opts.workspace is already the answer, so asking the CLI would be a
+  // pointless extra invocation on a path that already takes seconds.
+  const ws = mkdtempSync(join(tmpdir(), "mcp-comfyui-ws-"));
+  const log = countingCli("launch");
+  const port = serveReadyAfter(1);
+
+  await launchInstance({ port, workspace: ws, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+  expect(await settledInvocations(log, 1)).toBe(1); // launch only
+  rmSync(ws, { recursive: true, force: true });
+});
+
+test("a caller's own --output-directory suppresses the default entirely", async () => {
+  const log = countingCli("launch");
+  const port = serveReadyAfter(1);
+
+  await launchInstance({
+    port,
+    args: { outputDirectory: join(workdir, "caller-chose-this") },
+    timeoutMs: 5_000,
+    pollIntervalMs: 10,
+  });
+
+  // No `which` call: the flag is already present, so there is nothing to derive.
   expect(await settledInvocations(log, 1)).toBe(1);
+});
+
+test("an extraArgs --output-directory also suppresses the default", async () => {
+  // The design argues `extraArgs` wins by argument order rather than by a
+  // check. That is a claim about a DIFFERENT code path from the typed option
+  // above -- comfyuiArgs emits typed options first and extraArgs last -- so it
+  // needs its own test or the property is unpinned.
+  const log = countingCli("launch");
+  const port = serveReadyAfter(1);
+
+  await launchInstance({
+    port,
+    extraArgs: ["--output-directory", join(workdir, "via-extra-args")],
+    timeoutMs: 5_000,
+    pollIntervalMs: 10,
+  });
+
+  expect(await settledInvocations(log, 1)).toBe(1);
+});
+
+test("the --output-directory=value spelling is recognised too", async () => {
+  // flagValue parses both forms; a check that only understood the
+  // space-separated one would append a second, conflicting flag.
+  const log = countingCli("launch");
+  const port = serveReadyAfter(1);
+
+  await launchInstance({
+    port,
+    extraArgs: [`--output-directory=${join(workdir, "equals-form")}`],
+    timeoutMs: 5_000,
+    pollIntervalMs: 10,
+  });
+
+  expect(await settledInvocations(log, 1)).toBe(1);
+});
+
+test("a workspace that does not exist is not turned into an output directory", async () => {
+  // `comfy which` returns ok:true for a nonexistent workspace (ground truth
+  // #55), so a try/catch alone would happily pass --output-directory
+  // <nonexistent>/output. The existence check is what catches it.
+  const argvOut = join(workdir, "argv");
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
+  process.env.FAKE_COMFY_MODE = "launch";
+  process.env.FAKE_COMFY_WHICH_PATH = join(workdir, "no-such-workspace");
+  process.env.FAKE_COMFY_ARGV_OUT = argvOut;
+  const port = serveReadyAfter(1);
+
+  await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+  // launchArgvOf, not readFileSync: asserting `not.toContain` against the
+  // which argv would pass no matter what the launch did.
+  expect(await launchArgvOf(argvOut)).not.toContain("--output-directory");
+});
+
+test("a failing `which` leaves the launch untouched", async () => {
+  const argvOut = join(workdir, "argv");
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
+  process.env.FAKE_COMFY_MODE = "launch";
+  process.env.FAKE_COMFY_WHICH_MODE = "fail";
+  process.env.FAKE_COMFY_ARGV_OUT = argvOut;
+  const port = serveReadyAfter(1);
+
+  // Legibility, never a precondition: this must not become a failed launch.
+  const result = await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+  expect(result.outcome).toBe("launched");
+  expect(await launchArgvOf(argvOut)).not.toContain("--output-directory");
+});
+
+test("an already-running instance costs no `which` call", async () => {
+  // The derivation sits after the early return, which is what keeps every
+  // settledInvocations(log, 0) assertion in this file at zero.
+  const log = countingCli("launch");
+  const port = serveReadyAfter(1);
+
+  await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
+  const after = await settledInvocations(log, 2);
+  expect(after).toBe(2); // which + launch -- fail loudly if the baseline moved
+
+  // The port now answers, so this second call short-circuits before any CLI.
+  await launchInstance({ port, timeoutMs: 5_000, pollIntervalMs: 10 });
+
+  expect(await settledInvocations(log, after)).toBe(after);
 });
