@@ -831,16 +831,45 @@ function explainVerdict(failure: unknown, workspace: string | undefined): unknow
 /**
  * A failure the CLI has *diagnosed*, as opposed to one it merely suffered.
  *
- * Only these two abort the readiness wait. `not_in_workspace` (what this user's
- * machine answers, since ComfyUI Desktop is not a comfy-cli workspace),
- * `port_in_use` and `server_already_running` are verdicts: no ComfyUI is coming,
- * and waiting two minutes to discover that helps nobody. A timeout or an
- * unreadable envelope is not a verdict — the CLI may simply have failed to tell
- * us about a server that is starting anyway, and the HTTP probe is the
- * authority on that.
+ * `not_in_workspace` (what this user's machine answers, since ComfyUI Desktop
+ * is not a comfy-cli workspace), `port_in_use` and `server_already_running`
+ * are verdicts: no ComfyUI is coming, and waiting two minutes to discover that
+ * helps nobody. A timeout or an unreadable envelope is not a verdict — the CLI
+ * may simply have failed to tell us about a server that is starting anyway,
+ * and the HTTP probe is the authority on that.
+ *
+ * A `NotCapable` thrown out of `resolveComfyBinary` is a verdict too, and
+ * deliberately checked by name rather than by type: it never reached this
+ * server as a `ComfyCliError` or `ComfyUnavailableError` in the first place —
+ * it is Deno's own sandbox refusing the `accessSync(X_OK)` check inside
+ * `binary.ts`'s `isExecutable` before `runComfy` ever gets to spawn anything.
+ * Before `isExecutable` was changed to rethrow it, this case could not reach
+ * here at all: a missing `--allow-sys=uid,gid` grant made `isExecutable`
+ * silently answer `false`, which is indistinguishable from "not found" and
+ * let `startLaunch` try to spawn the bare name anyway — sometimes even
+ * working, if the OS's own PATH lookup found what this server's own check
+ * could not. Once permission checks are allowed to fail loudly, this poll
+ * loop has to know a `NotCapable` is exactly as terminal as a diagnosed CLI
+ * failure: no amount of waiting fixes a sandbox grant, and the alternative is
+ * spending the full five-minute budget above on a launch that was never going
+ * to happen, with the real cause surviving only as trailing text in a
+ * `LaunchTimeoutError`.
+ *
+ * Exported for `tests/instance.test.ts` to call directly, on the same
+ * reasoning `binary.test.ts` unit-tests `resolveComfyBinary` in isolation:
+ * the specific condition that raises a genuine `NotCapable` here — a missing
+ * `--allow-sys=uid,gid` grant — cannot be reproduced through a live
+ * `launchInstance` call inside this suite, because `deno task test` itself
+ * must hold that exact grant for every other test in this file to exercise
+ * `defaultBinaryDeps()` correctly in the first place. The two cannot coexist
+ * in one `deno test` process, so the classification is pinned directly.
  */
-function isVerdict(failure: unknown): boolean {
-  return failure instanceof ComfyCliError || failure instanceof ComfyUnavailableError;
+export function isVerdict(failure: unknown): boolean {
+  return (
+    failure instanceof ComfyCliError ||
+    failure instanceof ComfyUnavailableError ||
+    (failure instanceof Error && failure.name === "NotCapable")
+  );
 }
 
 /**

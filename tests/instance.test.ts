@@ -10,6 +10,7 @@ import {
   LaunchTimeoutError,
   detectInstance,
   ensureInstance,
+  isVerdict,
   launchInstance,
   type InstanceDetection,
   type RunningInstance,
@@ -792,6 +793,28 @@ test("a failure the CLI diagnosed aborts the wait instead of polling to the budg
   expect(err).toBeInstanceOf(ComfyCliError);
   expect((err as ComfyCliError).code).toBe("not_in_workspace");
   expect(elapsed).toBeLessThan(3_000); // nowhere near the readiness budget
+});
+
+// A regression from the auto-discovery work: `isExecutable` in `binary.ts`
+// was fixed to rethrow `NotCapable` instead of swallowing it as a plain
+// "not found" (see CHANGELOG), but `isVerdict` did not yet know that name --
+// so a launch whose only problem was a missing `--allow-sys=uid,gid` grant
+// would poll for the FULL five-minute readiness budget before reporting a
+// generic timeout, instead of failing in milliseconds with the real cause.
+// Cannot be reproduced through a live `launchInstance` call in this suite:
+// the exact condition that raises a genuine `NotCapable` is incompatible
+// with the grant `deno task test` itself must hold for every other test in
+// this file (see `isVerdict`'s own doc comment), so this pins the
+// classification directly, the same way `binary.test.ts` unit-tests
+// `resolveComfyBinary` without a live process.
+test("isVerdict treats a NotCapable failure as terminal, exactly like a diagnosed CLI failure", () => {
+  const notCapable = new Error('Requires sys access to "uid", run again with the --allow-sys flag');
+  notCapable.name = "NotCapable";
+  expect(isVerdict(notCapable)).toBe(true);
+
+  // Contrast: an ordinary Error with some other name is still not a verdict --
+  // only a genuinely diagnosed failure aborts the wait.
+  expect(isVerdict(new Error("something else went wrong"))).toBe(false);
 });
 
 test("a launch whose CLI exits non-zero with no envelope fails fast, not after the full budget", async () => {

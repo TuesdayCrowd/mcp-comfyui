@@ -71,21 +71,40 @@ All notable changes to this project are recorded here. The format follows
 
   **This feature shipped broken under every Deno entry point, not only the
   compiled binary, and only a live run against a real `comfy` could show
-  that.** No test here calls `defaultBinaryDeps()` against a real file — every
-  test that reaches `resolveComfyBinary` either injects a fake `isExecutable`
-  (`tests/binary.test.ts`) or sets `COMFY_BIN`, which never calls
-  `isExecutable` at all — so no test can distinguish a true answer from a
-  false one, or from a sandbox refusing to answer at all. `accessSync(X_OK)`
-  needs `--allow-sys=uid` (and, for the general case, `gid`) just to look up
-  the calling process's own identity before it can compare it against the
-  file's owner — permissions this project's own documented flag sets did not
-  grant. It threw `NotCapable`, `isExecutable`'s catch-all silently turned that
-  into `false` for every real candidate, and discovery always fell through to
-  `not_found` for a real, executable `comfy` sitting exactly where it looked.
-  Reproduced directly with `deno run` against the flag set this project's own
-  README told an operator to use — `--allow-sys=homedir,networkInterfaces` —
-  not only under `deno compile`: **the primary, documented JSR install path
-  was broken for auto-discovery, not just the self-contained binary.**
+  that.** No test here **called** `defaultBinaryDeps()` against a real file
+  and got the right answer for the right reason. `tests/binary.test.ts`
+  injects a fake `isExecutable`, so it never touched the real one at all.
+  Three tests in `tests/exec.test.ts` — `"falls back to comfy on PATH when
+  COMFY_BIN is unset"`, `"a comfy already on PATH leaves the child's PATH
+  untouched"`, and `"a comfy that is nowhere names every candidate that was
+  tried"` — unset `COMFY_BIN` and do reach the real `defaultBinaryDeps()`, and
+  two of those exercise it against a **real symlink** standing in for `comfy`
+  on `PATH`. Those two passed anyway, for the wrong reason: `isExecutable`
+  silently returned `false` for that real, executable symlink too — the
+  identical bug this entry is about — resolution fell through to `not_found`,
+  and `spawn("comfy", …)` found the symlink via the OS's own `PATH` lookup
+  regardless of what this server's own check had decided, so the *observable*
+  result matched what a correct resolution would have produced. (The third
+  test's candidates are all nonexistent paths, so its `isExecutable` calls
+  never got past `statSync`'s own `ENOENT` to reach `accessSync` at all, and
+  its outcome was never touched by this bug either way.) One of those two
+  tests carries a guard — `process.env.HOME = workdir`, commented "not
+  belt-and-braces… without this the test does not fail cleanly" — that was
+  itself **inert** under the bug: even a real `~/.local/bin/comfy` on the
+  machine running the suite would have reported `false` regardless of `HOME`,
+  so overriding `HOME` changed nothing. It is genuinely load-bearing now.
+
+  `accessSync(X_OK)` needs `--allow-sys=uid` (and, for the general case,
+  `gid`) just to look up the calling process's own identity before it can
+  compare it against the file's owner — permissions this project's own
+  documented flag sets did not grant. It threw `NotCapable`, `isExecutable`'s
+  catch-all silently turned that into `false` for every real candidate, and
+  discovery always fell through to `not_found` for a real, executable `comfy`
+  sitting exactly where it looked. Reproduced directly with `deno run` against
+  the flag set this project's own README told an operator to use —
+  `--allow-sys=homedir,networkInterfaces` — not only under `deno compile`:
+  **the primary, documented JSR install path was broken for auto-discovery,
+  not just the self-contained binary.**
 
   Four things changed, together: `deno.json`'s `compile`, `test` and
   `test:one` tasks, README's long-form Deno flag list, and `toolResult.ts`'s
@@ -101,6 +120,44 @@ All notable changes to this project are recorded here. The format follows
   caught this, confirmed by re-running it against the old flag set and
   watching it fail. Measured 2026-09-19: the identical compiled binary went
   from `cli.source: "not_found"` to `"discovered"` with no other change.
+
+  **One configuration this rethrow turns from working-by-accident into a hard
+  failure, worth stating plainly:** Deno, the stale documented flag set, and a
+  `comfy` genuinely reachable on `PATH`. Before this fix, `isExecutable`
+  returned `false`, resolution fell to `not_found`, and `spawn("comfy", …)`
+  still found it via the OS's own `PATH` lookup — everything worked end to
+  end, and the only externally-visible defect was `cli.source` misreporting
+  `not_found` instead of `PATH`. Now the first real candidate `isExecutable`
+  reaches throws immediately, and every tool call that shells out fails
+  `permission_denied` instead of quietly working. That is the fail-fast
+  behaviour this rethrow is *for* — a missing grant is now visible instead of
+  silently masked — but it is a real behaviour change for that one
+  configuration, not only a message improvement, and worth naming as such.
+
+  **A second regression, introduced by the fix above and caught only by
+  reviewing this entry: `isVerdict` (`src/comfy/instance.ts`) did not
+  recognise `NotCapable` as terminal.** On the auto-launch path — the
+  default — a `NotCapable` thrown during `startLaunch`'s `runComfy` call was
+  captured into its polled `failure` state same as any other cause, but
+  `isVerdict` only matched `ComfyCliError` and `ComfyUnavailableError`, so the
+  poll loop never recognised it as terminal and burned the full five-minute
+  `DEFAULT_READY_TIMEOUT_MS` before reporting a generic `LaunchTimeoutError`
+  with the real cause surviving only as trailing text — a strict regression
+  from the *fast* `ComfyUnavailableError` an operator got before the rethrow
+  existed. Fixed by adding a `failure.name === "NotCapable"` arm to
+  `isVerdict` directly, rather than restructuring `startLaunch`'s
+  fire-and-poll design to await the failure instead: `isVerdict`'s whole job
+  is already "is this failure terminal", a `NotCapable` unambiguously is, and
+  the fix needed nothing else to change. `whichWorkspace`'s own catch of the
+  same error, earlier in the same launch, is correct to stay silent (a
+  missing `--output-directory` default must never fail a launch) — the fault
+  still surfaces because the identical, deterministic permission error
+  recurs on `startLaunch`'s own `runComfy` call moments later. Pinned by a
+  direct unit test of the now-exported `isVerdict`, not a live
+  `launchInstance` run: the exact condition that raises a genuine
+  `NotCapable` needs a permission grant `deno task test` itself must hold for
+  every other test to exercise `defaultBinaryDeps()` correctly, so the two
+  cannot coexist in one `deno test` process.
 
 ### Documentation
 
