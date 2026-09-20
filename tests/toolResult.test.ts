@@ -18,7 +18,13 @@ const REPO_ROOT = join(import.meta.dirname, "..");
  * string cannot silently drift from the grant it is describing.
  */
 test("a NotCapable error classifies as permission_denied and names every token deno.json's compile task grants", () => {
-  const notCapable = new Error('Requires sys access to "uid", run again with the --allow-sys flag');
+  // Deliberately names a sys permission NOT in the granted set ("hostname",
+  // not one of homedir/networkInterfaces/uid/gid): if the synthetic message
+  // itself contained one of the tokens under test, the loop below could pass
+  // vacuously against the error's own text instead of against toolResult.ts's
+  // advice string -- which is exactly what "uid" here originally did, since
+  // it appears in this error's own wording regardless of what the advice says.
+  const notCapable = new Error('Requires sys access to "hostname", run again with the --allow-sys flag');
   notCapable.name = "NotCapable";
 
   const body = describeError(notCapable);

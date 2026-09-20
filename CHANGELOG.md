@@ -87,12 +87,16 @@ All notable changes to this project are recorded here. The format follows
   result matched what a correct resolution would have produced. (The third
   test's candidates are all nonexistent paths, so its `isExecutable` calls
   never got past `statSync`'s own `ENOENT` to reach `accessSync` at all, and
-  its outcome was never touched by this bug either way.) One of those two
-  tests carries a guard — `process.env.HOME = workdir`, commented "not
-  belt-and-braces… without this the test does not fail cleanly" — that was
-  itself **inert** under the bug: even a real `~/.local/bin/comfy` on the
-  machine running the suite would have reported `false` regardless of `HOME`,
-  so overriding `HOME` changed nothing. It is genuinely load-bearing now.
+  its outcome was never touched by this bug either way.) That third test —
+  not either symlink test — is the one that carries a
+  `process.env.HOME = workdir` guard, commented "not belt-and-braces… without
+  this the test does not fail cleanly". The guard itself was always
+  load-bearing, for a reason unrelated to this bug: its `searched` assertion
+  checks for `join(workdir, ".local", "bin", "comfy")`, which needs `HOME` set
+  to `workdir` regardless of anything `isExecutable` does. What *was* inert is
+  the specific hazard the comment names — shelling out to the developer's own
+  real comfy-cli — because `isExecutable` answered `false` for that real
+  binary too, whatever `HOME` said. That hazard is genuine now.
 
   `accessSync(X_OK)` needs `--allow-sys=uid` (and, for the general case,
   `gid`) just to look up the calling process's own identity before it can
@@ -128,11 +132,18 @@ All notable changes to this project are recorded here. The format follows
   still found it via the OS's own `PATH` lookup — everything worked end to
   end, and the only externally-visible defect was `cli.source` misreporting
   `not_found` instead of `PATH`. Now the first real candidate `isExecutable`
-  reaches throws immediately, and every tool call that shells out fails
-  `permission_denied` instead of quietly working. That is the fail-fast
-  behaviour this rethrow is *for* — a missing grant is now visible instead of
-  silently masked — but it is a real behaviour change for that one
-  configuration, not only a message improvement, and worth naming as such.
+  reaches throws immediately, and every tool that shells out to `comfy` fails
+  `permission_denied` instead of quietly working — **including `comfy_status`,
+  which does not itself shell out but calls
+  `resolveComfyBinary(defaultBinaryDeps())` directly and unguarded
+  (`src/tools.ts:1514`) to fill in its own `cli` block.** In this exact
+  configuration `comfy_status` returns `permission_denied` in place of its
+  entire status report — no `target`, no `running`, no probe result — for the
+  one tool whose own description says "Call this first whenever another tool
+  reports the server unreachable." That is the fail-fast behaviour this
+  rethrow is *for* — a missing grant is now visible instead of silently
+  masked — but it is a real behaviour change for that one configuration, not
+  only a message improvement, and worth naming as such.
 
   **A second regression, introduced by the fix above and caught only by
   reviewing this entry: `isVerdict` (`src/comfy/instance.ts`) did not
