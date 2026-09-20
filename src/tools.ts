@@ -5,6 +5,7 @@ import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, isAbsolute, join, sep } from "node:path";
 import { z } from "zod";
+import { defaultBinaryDeps, resolveComfyBinary, type ResolvedBinary } from "./comfy/binary.ts";
 import { fetchArtifacts, type FetchBudget, type FetchedArtifact } from "./comfy/fetchOutputs.ts";
 import { fetchRemoteWorkflow, listRemoteWorkflows } from "./comfy/userdata.ts";
 import {
@@ -744,6 +745,22 @@ function assertPlainStem(stem: string): void {
 
 // --- wire shapes ---------------------------------------------------------
 
+/**
+ * Which comfy this server resolved, and how it got there.
+ *
+ * Reported because every other inference this server makes is reported beside
+ * its answer — `host_source`, `object_info.stale`, `target.local`. Discovery
+ * should not be the one piece of magic a caller cannot see.
+ */
+function cliBody(resolved: ResolvedBinary): Record<string, unknown> {
+  return {
+    path: resolved.path,
+    source: resolved.source,
+    path_repaired: resolved.childPath !== undefined,
+    ...(resolved.searched === undefined ? {} : { searched: resolved.searched }),
+  };
+}
+
 function instanceBody(instance: RunningInstance): Record<string, unknown> {
   return {
     running: true,
@@ -1470,7 +1487,8 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
       title: "ComfyUI status",
       description:
         "Report whether a ComfyUI server is reachable, and what it is: version, accelerator " +
-        "devices with their VRAM, and the output and input directories it was started with. " +
+        "devices with their VRAM, and the output and input directories it was started with, " +
+        "plus which `comfy` binary this server resolved and how it found it. " +
         "Nothing running is a normal answer rather than a failure — `running: false` comes back " +
         "with the address that was probed and the reason it did not answer. Call this first " +
         "whenever another tool reports the server unreachable. Pass `host` to ask about a " +
@@ -1493,6 +1511,7 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
                 port: detection.port,
                 reason: detection.reason,
               }),
+          cli: cliBody(resolveComfyBinary(defaultBinaryDeps())),
         };
       }),
   );
