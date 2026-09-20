@@ -1,7 +1,10 @@
 import { expect, test } from "./support/testing.ts";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
   COMFY_BINARY_NAME,
+  defaultBinaryDeps,
   resolveComfyBinary,
   type BinaryDeps,
 } from "../src/comfy/binary.ts";
@@ -127,4 +130,34 @@ test("a relative COMFY_BIN is left alone rather than guessed at", () => {
   const r = resolveComfyBinary(deps({ COMFY_BIN: "comfy", PATH: "/usr/bin" }));
   expect(r.path).toBe("comfy");
   expect(r.childPath).toBeUndefined();
+});
+
+// Every test above injects `isExecutable`, so none of them can distinguish a
+// real "yes" from a real "no" -- or from a real "the sandbox would not let me
+// check". `deno compile`'s default `--allow-sys` grant is missing `uid`/`gid`,
+// which `accessSync(X_OK)` needs just to look up the caller's own identity
+// before it can compare it against the file's owner bits; without them it
+// throws `NotCapable`, and the old blanket `catch { return false }` turned
+// that into an indistinguishable "not executable", so `dist/mcp-comfyui`
+// reported `not_found` for a real, executable comfy-cli on every real
+// installation. This is the one test in the file that calls
+// `defaultBinaryDeps()` itself, against a real file on the real filesystem,
+// so it lives or dies on the actual `--allow-sys` grant this task runs under
+// -- which is the property that would have caught the regression.
+test("defaultBinaryDeps().isExecutable reflects the real filesystem, not a mock", () => {
+  const dir = mkdtempSync(join(tmpdir(), "mcp-comfyui-binary-"));
+  try {
+    const exe = join(dir, COMFY_BINARY_NAME);
+    writeFileSync(exe, "#!/bin/sh\necho hi\n");
+
+    chmodSync(exe, 0o755);
+    expect(defaultBinaryDeps().isExecutable(exe)).toBe(true);
+
+    chmodSync(exe, 0o644);
+    expect(defaultBinaryDeps().isExecutable(exe)).toBe(false);
+
+    expect(defaultBinaryDeps().isExecutable(join(dir, "does-not-exist"))).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

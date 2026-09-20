@@ -63,7 +63,19 @@ export function defaultBinaryDeps(): BinaryDeps {
         if (!statSync(path).isFile()) return false;
         accessSync(path, constants.X_OK);
         return true;
-      } catch {
+      } catch (err) {
+        // `NotCapable` is not "the file isn't executable" -- it is the Deno
+        // sandbox refusing to let this call even ASK, because `accessSync`
+        // needs `--allow-sys=uid` (and, for the general case, `gid`) to check
+        // the caller's identity against the file's owner bits before it can
+        // answer at all. `deno compile`'s own permission grant lacked them,
+        // and swallowing this here turned a real, executable comfy-cli into a
+        // bogus `not_found` with a `searched` list naming the very file that
+        // was right there. `toolResult.ts` already has a dedicated
+        // `permission_denied` arm matched on this exact error name; rethrow
+        // so it reaches that machinery instead of being misreported as a
+        // missing binary.
+        if (err instanceof Error && err.name === "NotCapable") throw err;
         return false;
       }
     },

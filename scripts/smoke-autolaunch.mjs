@@ -5,6 +5,13 @@
 // test nothing. It WILL start a GPU process. Run `deno task build && deno task
 // compile` first, or you are testing the previous build.
 //
+// It does NOT stop the ComfyUI it launches when it finishes -- this script
+// kills only the MCP server process (`proc.kill()`), not the ComfyUI it told
+// that server to start. The caller is responsible for `comfy --skip-prompt
+// --json stop` both before running this (or the "nothing is running yet"
+// check proves nothing) and after (or the machine is left with a live GPU
+// process).
+//
 // Usage: node scripts/smoke-autolaunch.mjs [workflow]
 import { spawn } from "node:child_process";
 import { existsSync, statSync } from "node:fs";

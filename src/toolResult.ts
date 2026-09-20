@@ -539,7 +539,7 @@ export function describeError(err: unknown): ToolErrorBody {
         `${err.message}\n` +
         `This server is running under Deno without a permission it needs. The full set is ` +
         `--allow-run --allow-read --allow-write --allow-net --allow-env ` +
-        `--allow-sys=homedir,networkInterfaces, or -A for all of them.`,
+        `--allow-sys=homedir,networkInterfaces,uid,gid, or -A for all of them.`,
       error_name: err.name,
     };
   }

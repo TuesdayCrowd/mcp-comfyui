@@ -69,20 +69,38 @@ All notable changes to this project are recorded here. The format follows
   `local_paths` stops coming back empty for local runs. `comfy_status` gained a
   `cli` block reporting which binary was resolved and how.
 
-  **The compiled binary shipped this feature broken, and only a live run against
-  it could show that.** Every test here fakes `isExecutable`, so nothing
-  exercised `binary.ts`'s real `accessSync(path, X_OK)` under `deno compile`'s
-  actual sandbox. Under that sandbox, `accessSync(X_OK)` needs `--allow-sys=uid`
-  (and, for the general case, `gid`) to look up the calling process's own
-  identity before it can compare it against the file's owner — permissions the
-  `compile` task did not grant. It threw `NotCapable`, `isExecutable`'s
-  catch-all silently turned that into `false` for every real candidate, and
-  discovery always fell through to `not_found` in `dist/mcp-comfyui`, even
-  though the plain-Node build (`dist/index.js`, no sandbox to satisfy) resolved
-  the same path correctly. `deno.json`'s `compile` task now grants
-  `--allow-sys=networkInterfaces,homedir,uid,gid`. Measured 2026-09-19: the
-  identical binary went from `cli.source: "not_found"` to `"discovered"` with
-  no other change.
+  **This feature shipped broken under every Deno entry point, not only the
+  compiled binary, and only a live run against a real `comfy` could show
+  that.** No test here calls `defaultBinaryDeps()` against a real file — every
+  test that reaches `resolveComfyBinary` either injects a fake `isExecutable`
+  (`tests/binary.test.ts`) or sets `COMFY_BIN`, which never calls
+  `isExecutable` at all — so no test can distinguish a true answer from a
+  false one, or from a sandbox refusing to answer at all. `accessSync(X_OK)`
+  needs `--allow-sys=uid` (and, for the general case, `gid`) just to look up
+  the calling process's own identity before it can compare it against the
+  file's owner — permissions this project's own documented flag sets did not
+  grant. It threw `NotCapable`, `isExecutable`'s catch-all silently turned that
+  into `false` for every real candidate, and discovery always fell through to
+  `not_found` for a real, executable `comfy` sitting exactly where it looked.
+  Reproduced directly with `deno run` against the flag set this project's own
+  README told an operator to use — `--allow-sys=homedir,networkInterfaces` —
+  not only under `deno compile`: **the primary, documented JSR install path
+  was broken for auto-discovery, not just the self-contained binary.**
+
+  Four things changed, together: `deno.json`'s `compile`, `test` and
+  `test:one` tasks, README's long-form Deno flag list, and `toolResult.ts`'s
+  `permission_denied` message all now say `--allow-sys=…,uid,gid`.
+  `isExecutable`'s catch no longer swallows `NotCapable` as a plain "not
+  executable" — it rethrows, so a missing grant now reaches the
+  `permission_denied` classification this project already had for exactly
+  this error rather than being misreported as a missing binary. That
+  narrowing only became safe once the `test`/`test:one` tasks carried the same
+  grant the `compile` task needed, which is also what let a new
+  `tests/binary.test.ts` case exercise the real `defaultBinaryDeps()` against
+  a real, `chmod`-flipped file — the one test in the suite that would have
+  caught this, confirmed by re-running it against the old flag set and
+  watching it fail. Measured 2026-09-19: the identical compiled binary went
+  from `cli.source: "not_found"` to `"discovered"` with no other change.
 
 ### Documentation
 
