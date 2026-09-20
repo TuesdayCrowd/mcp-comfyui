@@ -185,11 +185,20 @@ test("defaultBinaryDeps().isExecutable reflects the real filesystem, not a mock"
 test("a NotCapable from isExecutable propagates rather than reading as 'not here'", () => {
   const notCapable = new Error('Requires sys access to "uid"');
   notCapable.name = "NotCapable";
+  // Throws only for the PATH candidate, and returns false (not throws) for
+  // every searchRoots candidate -- so a `try { … } catch { continue; }`
+  // wrapping ONLY the PATH-scan loop would swallow this, fall through to a
+  // discovery loop that reports "not found" instead of throwing, and this
+  // test would then fail to see a throw at all. A throwing-everywhere
+  // isExecutable can't tell that apart from a real propagation, because the
+  // discovery loop throws too and the assertion still passes either way.
+  const pathCandidate = join("/usr/bin", COMFY_BINARY_NAME);
   const throwing: BinaryDeps = {
     env: { PATH: "/usr/bin" },
     home: HOME,
-    isExecutable: () => {
-      throw notCapable;
+    isExecutable: (p) => {
+      if (p === pathCandidate) throw notCapable;
+      return false;
     },
   };
   expect(() => resolveComfyBinary(throwing)).toThrow(notCapable);

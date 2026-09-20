@@ -1284,6 +1284,11 @@ test("an explicit workspace needs no `which` call, and its value reaches the lau
   const argv = await launchArgvOf(argvOut);
   expect(argv).toContain("--workspace");
   expect(argv[argv.indexOf("--workspace") + 1]).toBe(ws);
+  // An explicit workspace that exists is still the main path this feature
+  // serves (MCP_COMFYUI_WORKSPACE): --output-directory IS appended, exactly
+  // as it would be for a workspace `comfy which` discovered on its own.
+  expect(argv).toContain("--output-directory");
+  expect(argv[argv.indexOf("--output-directory") + 1]).toBe(join(ws, "output"));
   rmSync(ws, { recursive: true, force: true });
 });
 

@@ -1069,11 +1069,11 @@ function isExistingDirectory(path: string): boolean {
  *
  * That warning reaches `launch_comfyui`'s own result, where a caller can see
  * it (`result.warnings` on the `launched` outcome). It does NOT currently reach
- * the auto-launch path, which is the default: `EnsureResult` declares no
- * `warnings` field, `ensureInstance` returns `launchInstance(opts)`'s result
- * straight through, and every caller of `ensureRunning`/`ensureInstance`
- * destructures only `{ instance }` — so on that path the warning is silently
- * dropped today. That is a known gap, not something to widen `EnsureResult`
+ * the auto-launch path, which is the default: `EnsureResult`'s `launched` arm
+ * declares no `warnings` field at all, and `ensureInstance` returns
+ * `launchInstance(opts)`'s result straight through — so no caller of
+ * `ensureRunning`/`ensureInstance` can read the warning, whatever shape of the
+ * result it keeps. That is a known gap, not something to widen `EnsureResult`
  * to fix here; it is recorded rather than solved.
  *
  * This is legibility, never a precondition: it must never convert a launch
