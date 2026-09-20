@@ -69,6 +69,21 @@ All notable changes to this project are recorded here. The format follows
   `local_paths` stops coming back empty for local runs. `comfy_status` gained a
   `cli` block reporting which binary was resolved and how.
 
+  **The compiled binary shipped this feature broken, and only a live run against
+  it could show that.** Every test here fakes `isExecutable`, so nothing
+  exercised `binary.ts`'s real `accessSync(path, X_OK)` under `deno compile`'s
+  actual sandbox. Under that sandbox, `accessSync(X_OK)` needs `--allow-sys=uid`
+  (and, for the general case, `gid`) to look up the calling process's own
+  identity before it can compare it against the file's owner — permissions the
+  `compile` task did not grant. It threw `NotCapable`, `isExecutable`'s
+  catch-all silently turned that into `false` for every real candidate, and
+  discovery always fell through to `not_found` in `dist/mcp-comfyui`, even
+  though the plain-Node build (`dist/index.js`, no sandbox to satisfy) resolved
+  the same path correctly. `deno.json`'s `compile` task now grants
+  `--allow-sys=networkInterfaces,homedir,uid,gid`. Measured 2026-09-19: the
+  identical binary went from `cli.source: "not_found"` to `"discovered"` with
+  no other change.
+
 ### Documentation
 
 - **The error contract is now documented.** Every tool answers a failure with
