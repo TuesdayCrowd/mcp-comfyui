@@ -360,12 +360,19 @@ test("a comfy already on PATH leaves the child's PATH untouched", async () => {
 
   await runComfy(["workflow", "slots"]);
 
-  // Resolved by rule 2, so there was nothing to repair -- and this must pass
-  // for that reason, not by accident.
+  // Rule 2 resolved this on PATH, so no repair was owed and none happened.
+  // This test passed before the resolver was wired in too -- it cannot, and
+  // does not, prove that rule 2 fired. It is a REGRESSION GUARD: it dies if
+  // the repair is ever made unconditional, prepending a directory to a child
+  // whose PATH already worked.
   expect(readFileSync(pathOut, "utf8").trim()).toBe(workdir);
 });
 
 test("the quoted command line names the resolved binary, not a stale one", async () => {
+  // Also passed before the resolver was wired in: with COMFY_BIN set, the old
+  // `process.env.COMFY_BIN ?? "comfy"` and the new `resolved.path` are the same
+  // string. It guards line 171 -- the separate `argv` array that builds
+  // `commandLine` -- against being dropped or left pointing at a stale binary.
   process.env.FAKE_COMFY_MODE = "echo_path";
   process.env.FAKE_COMFY_PATH_OUT = join(workdir, "child-path");
   const run = await runComfyRaw(["workflow", "slots"]);
