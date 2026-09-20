@@ -6,6 +6,50 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **The server finds comfy-cli itself, and repairs the `PATH` its children
+  get.** With `COMFY_BIN` unset the server checks `PATH`, then
+  `~/.local/bin`, uv's tool directory, and the two Homebrew prefixes. Set,
+  `COMFY_BIN` still wins absolutely and never falls back — a named binary
+  that is missing is an error, not an invitation to substitute one.
+
+  The `PATH` repair is the part that fixes a real failure. `comfy launch
+  --background` re-execs *itself* by bare name, so a GUI-launched MCP client —
+  which inherits `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else — could set
+  `COMFY_BIN` correctly and still have every auto-launch die with
+  `FileNotFoundError: … 'comfy'`, while every other subcommand worked. The
+  binary's directory is now *prepended* to the child's `PATH`, so comfy-cli's
+  own re-exec finds the binary this server resolved rather than some other
+  one earlier on the path (or none at all).
+
+- **A launch now also passes `--output-directory <workspace>/output`**,
+  which is where ComfyUI would have written anyway — the point is that the
+  path appears in its `system.argv`, so `outputs.ts` can resolve `/view`
+  URLs and `local_paths` stops coming back empty for local runs.
+
+- **`comfy_status` gained a `cli` block** reporting which binary was
+  resolved and how.
+
+### Changed
+
+- **Upgrade action if you invoke the long-form `deno run` flags by hand: add
+  `uid,gid` to `--allow-sys`, or every tool call now returns
+  `permission_denied`.** The auto-discovery added above confirms a candidate
+  is really executable with `accessSync(X_OK)`, which needs
+  `--allow-sys=uid` (and, for the general case, `gid`) just to look up the
+  calling process's own identity before it can compare it against the
+  file's owner — a grant this project's own previously-documented flag set
+  did not include. `deno.json`'s `compile`, `test` and `test:one` tasks and
+  README's long-form Deno flag list now all say `--allow-sys=…,uid,gid`; an
+  operator who copied the old flags into their own launcher config needs to
+  make the identical change by hand. Skip it and every tool that shells out
+  to `comfy` — **including `comfy_status`**, which calls `resolveComfyBinary`
+  directly to fill in its own new `cli` block — fails closed with
+  `permission_denied` instead of getting the discovery this release added.
+  See the matching entry under Fixed for why this grant is now required
+  rather than merely helpful.
+
 ### Fixed
 
 - **A launch that died on PATH no longer blames the workspace.**
@@ -31,7 +75,7 @@ All notable changes to this project are recorded here. The format follows
   (`garbage_self_exec`) whose signature deliberately sits past the snippet limit.
 
   **Superseded in the same release:** the server now repairs the child's `PATH`
-  itself (see the auto-discovery entry below), so this diagnosis should be
+  itself (see the auto-discovery entry above), so this diagnosis should be
   unreachable in normal use — and if it does fire, it now says that the repair
   was attempted and did not help, which is a different and more useful fact.
 
@@ -49,54 +93,36 @@ All notable changes to this project are recorded here. The format follows
   value is deliberately not quoted here** — naming it in a public changelog would
   republish exactly what this entry is about removing.
 
-- **The server finds comfy-cli itself, and repairs the `PATH` its children get.**
-  `COMFY_BIN` is now an override rather than a requirement: with it unset the
-  server checks `PATH`, then `~/.local/bin`, uv's tool directory, and the two
-  Homebrew prefixes. Set, it wins absolutely and never falls back — a named
-  binary that is missing is an error, not an invitation to substitute one.
-
-  The `PATH` repair is the part that fixes a real failure. `comfy launch
-  --background` re-execs *itself* by bare name, so a GUI-launched MCP client —
-  which inherits `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else — could set
-  `COMFY_BIN` correctly and still have every auto-launch die with
-  `FileNotFoundError: … 'comfy'`, while every other subcommand worked. The
-  binary's directory is *prepended*, so comfy-cli's re-exec finds the binary
-  this server resolved rather than some other one earlier on the path.
-
-  A launch now also passes `--output-directory <workspace>/output`, which is
-  where ComfyUI would have written anyway — the point is that the path appears
-  in its `system.argv`, so `outputs.ts` can resolve `/view` URLs and
-  `local_paths` stops coming back empty for local runs. `comfy_status` gained a
-  `cli` block reporting which binary was resolved and how.
-
-  **This feature shipped broken under every Deno entry point, not only the
-  compiled binary, and only a live run against a real `comfy` could show
-  that.** No test here **called** `defaultBinaryDeps()` against a real file
-  and got the right answer for the right reason. `tests/binary.test.ts`
-  injects a fake `isExecutable`, so it never touched the real one at all.
-  Three tests in `tests/exec.test.ts` — `"falls back to comfy on PATH when
-  COMFY_BIN is unset"`, `"a comfy already on PATH leaves the child's PATH
-  untouched"`, and `"a comfy that is nowhere names every candidate that was
-  tried"` — unset `COMFY_BIN` and do reach the real `defaultBinaryDeps()`, and
-  two of those exercise it against a **real symlink** standing in for `comfy`
-  on `PATH`. Those two passed anyway, for the wrong reason: `isExecutable`
-  silently returned `false` for that real, executable symlink too — the
-  identical bug this entry is about — resolution fell through to `not_found`,
-  and `spawn("comfy", …)` found the symlink via the OS's own `PATH` lookup
-  regardless of what this server's own check had decided, so the *observable*
-  result matched what a correct resolution would have produced. (The third
-  test's candidates are all nonexistent paths, so its `isExecutable` calls
-  never got past `statSync`'s own `ENOENT` to reach `accessSync` at all, and
-  its outcome was never touched by this bug either way.) That third test —
-  not either symlink test — is the one that carries a
-  `process.env.HOME = workdir` guard, commented "not belt-and-braces… without
-  this the test does not fail cleanly". The guard itself was always
-  load-bearing, for a reason unrelated to this bug: its `searched` assertion
-  checks for `join(workdir, ".local", "bin", "comfy")`, which needs `HOME` set
-  to `workdir` regardless of anything `isExecutable` does. What *was* inert is
-  the specific hazard the comment names — shelling out to the developer's own
-  real comfy-cli — because `isExecutable` answered `false` for that real
-  binary too, whatever `HOME` said. That hazard is genuine now.
+- **`isExecutable` silently swallowed a Deno permission error and reported a
+  real, executable `comfy-cli` as `not_found` — under every Deno entry
+  point, not only the compiled binary, and only a live run against a real
+  `comfy` could show it.** No test here **called** `defaultBinaryDeps()`
+  against a real file and got the right answer for the right reason.
+  `tests/binary.test.ts` injects a fake `isExecutable`, so it never touched
+  the real one at all. Three tests in `tests/exec.test.ts` — `"falls back to
+  comfy on PATH when COMFY_BIN is unset"`, `"a comfy already on PATH leaves
+  the child's PATH untouched"`, and `"a comfy that is nowhere names every
+  candidate that was tried"` — unset `COMFY_BIN` and do reach the real
+  `defaultBinaryDeps()`, and two of those exercise it against a **real
+  symlink** standing in for `comfy` on `PATH`. Those two passed anyway, for
+  the wrong reason: `isExecutable` silently returned `false` for that real,
+  executable symlink too — the identical bug this entry is about —
+  resolution fell through to `not_found`, and `spawn("comfy", …)` found the
+  symlink via the OS's own `PATH` lookup regardless of what this server's
+  own check had decided, so the *observable* result matched what a correct
+  resolution would have produced. (The third test's candidates are all
+  nonexistent paths, so its `isExecutable` calls never got past `statSync`'s
+  own `ENOENT` to reach `accessSync` at all, and its outcome was never
+  touched by this bug either way.) That third test — not either symlink
+  test — is the one that carries a `process.env.HOME = workdir` guard,
+  commented "not belt-and-braces… without this the test does not fail
+  cleanly". The guard itself was always load-bearing, for a reason unrelated
+  to this bug: its `searched` assertion checks for `join(workdir, ".local",
+  "bin", "comfy")`, which needs `HOME` set to `workdir` regardless of
+  anything `isExecutable` does. What *was* inert is the specific hazard the
+  comment names — shelling out to the developer's own real comfy-cli —
+  because `isExecutable` answered `false` for that real binary too, whatever
+  `HOME` said. That hazard is genuine now.
 
   `accessSync(X_OK)` needs `--allow-sys=uid` (and, for the general case,
   `gid`) just to look up the calling process's own identity before it can
@@ -112,7 +138,8 @@ All notable changes to this project are recorded here. The format follows
 
   Four things changed, together: `deno.json`'s `compile`, `test` and
   `test:one` tasks, README's long-form Deno flag list, and `toolResult.ts`'s
-  `permission_denied` message all now say `--allow-sys=…,uid,gid`.
+  `permission_denied` message all now say `--allow-sys=…,uid,gid` — the
+  upgrade action recorded under Changed above.
   `isExecutable`'s catch no longer swallows `NotCapable` as a plain "not
   executable" — it rethrows, so a missing grant now reaches the
   `permission_denied` classification this project already had for exactly
@@ -145,7 +172,7 @@ All notable changes to this project are recorded here. The format follows
   masked — but it is a real behaviour change for that one configuration, not
   only a message improvement, and worth naming as such.
 
-  **A second regression, introduced by the fix above and caught only by
+- **A second regression, introduced by the fix above and caught only by
   reviewing this entry: `isVerdict` (`src/comfy/instance.ts`) did not
   recognise `NotCapable` as terminal.** On the auto-launch path — the
   default — a `NotCapable` thrown during `startLaunch`'s `runComfy` call was

@@ -120,7 +120,7 @@ MCP_COMFYUI_WORKSPACE=/path/to/ComfyUI     # the directory containing main.py
 
 There is deliberately no auto-discovery. Picking between several installs by name is exactly how you end up launching the wrong ComfyUI against the right models.
 
-This setting affects **launching only**. It does not change how artifacts are reported — see below.
+This setting now also decides where a launched instance writes: the server sends `--output-directory <workspace>/output`, which is what lets `local_paths` resolve. It does not affect an instance this server did not start.
 
 ## More than one ComfyUI
 

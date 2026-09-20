@@ -1266,17 +1266,49 @@ test("a launch defaults --output-directory to the workspace's own output dir", a
   rmSync(ws, { recursive: true, force: true });
 });
 
-test("an explicit workspace needs no `which` call", async () => {
+test("an explicit workspace needs no `which` call, and its value reaches the launch argv", async () => {
   // opts.workspace is already the answer, so asking the CLI would be a
   // pointless extra invocation on a path that already takes seconds.
   const ws = mkdtempSync(join(tmpdir(), "mcp-comfyui-ws-"));
+  const argvOut = join(workdir, "argv");
   const log = countingCli("launch");
+  process.env.FAKE_COMFY_ARGV_OUT = argvOut;
   const port = serveReadyAfter(1);
 
   await launchInstance({ port, workspace: ws, timeoutMs: 5_000, pollIntervalMs: 10 });
 
   expect(await settledInvocations(log, 1)).toBe(1); // launch only
+  // launchArgvOf, not a bare readFileSync: a reintroduced `which` call would
+  // overwrite $FAKE_COMFY_ARGV_OUT before the launch call does, and a bare
+  // read could silently pick up that stale write instead of the launch's own.
+  const argv = await launchArgvOf(argvOut);
+  expect(argv).toContain("--workspace");
+  expect(argv[argv.indexOf("--workspace") + 1]).toBe(ws);
   rmSync(ws, { recursive: true, force: true });
+});
+
+test("an explicit nonexistent workspace yields neither the --output-directory flag nor a warning", async () => {
+  // The explicit workspace is the caller's own claim, not withDefaultOutputDirectory's
+  // to second-guess -- if it is wrong, `not_in_workspace` is the failure that
+  // says so, not a warning manufactured here.
+  const argvOut = join(workdir, "argv");
+  process.env.COMFY_BIN = FAKE_COMFY_LOGGING;
+  process.env.FAKE_COMFY_MODE = "launch";
+  process.env.FAKE_COMFY_ARGV_OUT = argvOut;
+  const noSuchWorkspace = join(workdir, "no-such-explicit-workspace");
+  const port = serveReadyAfter(1);
+
+  const result = await launchInstance({
+    port,
+    workspace: noSuchWorkspace,
+    timeoutMs: 5_000,
+    pollIntervalMs: 10,
+  });
+
+  expect(await launchArgvOf(argvOut)).not.toContain("--output-directory");
+  expect(result.outcome).toBe("launched");
+  if (result.outcome !== "launched") return;
+  expect(result.warnings).toEqual([]);
 });
 
 test("a caller's own --output-directory suppresses the default entirely", async () => {
@@ -1350,7 +1382,7 @@ test("a workspace that does not exist is not turned into an output directory", a
   // feature exists to remove: no flag, no local_paths, and no explanation.
   expect(result.outcome).toBe("launched");
   if (result.outcome !== "launched") return;
-  expect(result.warnings.join("\n")).toContain(`workspace does not exist: ${noSuchWorkspace}`);
+  expect(result.warnings.join("\n")).toContain(`workspace is not a directory: ${noSuchWorkspace}`);
 });
 
 test("a failing `which` leaves the launch untouched, but says why", async () => {

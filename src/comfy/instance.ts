@@ -308,7 +308,9 @@ export interface LaunchOptions {
  * another ComfyUI was already known to be running at a different address — a
  * real resource conflict (VRAM, the shared model directory) that is worth
  * surfacing, but not a reason to refuse a launch that was deliberately asked
- * for. Empty, never absent, when there was nothing to warn about.
+ * for — or when `--output-directory` could not be defaulted from the
+ * workspace (see {@link withDefaultOutputDirectory}). Empty, never absent,
+ * when there was nothing to warn about.
  *
  * Genuine faults still throw: {@link LaunchArgumentError} for arguments this
  * server will not send, {@link ComfyCliError} for a failure the CLI diagnosed
@@ -1046,20 +1048,33 @@ function isExistingDirectory(path: string): boolean {
  * The value is the directory ComfyUI would have used anyway, so nothing moves
  * for anyone — this makes an existing default legible, it does not relocate it.
  *
- * Skipped without a CLI call and without a `warning`, when there is genuinely
- * nothing to say: the caller already supplied `--output-directory`, or named
- * an explicit `opts.workspace` themselves. An explicit workspace is the
- * caller's own claim, not this function's to second-guess — if it is wrong,
- * `not_in_workspace` is the failure that says so.
+ * `opts.workspace` set explicitly costs no CLI call either way — `whichWorkspace`
+ * returns it verbatim, with no `comfy which` invocation — but that is NOT the
+ * same as the flag being skipped. When that directory exists, `--output-directory
+ * <workspace>/output` IS appended, exactly as it would be for a workspace `comfy
+ * which` discovered on its own: this is the main path this feature serves,
+ * `MCP_COMFYUI_WORKSPACE`. The flag (and any warning) is genuinely skipped only
+ * when the caller already supplied `--output-directory` themselves, or when an
+ * explicit `opts.workspace` does not exist — the caller's own claim, not this
+ * function's to second-guess; if it is wrong, `not_in_workspace` is the failure
+ * that says so.
  *
- * Skipped WITH a `warning` on the return value in the two cases that are
- * worth a caller's attention: no workspace could be determined (`comfy which`
- * failed, or reported none), or the workspace it reported does not exist —
+ * Skipped WITH a `warning` on the return value in the two cases that are worth
+ * a caller's attention, and only for a workspace this function derived rather
+ * than one the caller named: no workspace could be determined (`comfy which`
+ * failed, or reported none), or the workspace it reported is not a directory —
  * not hypothetical, `comfy which` returns ok:true for a nonexistent workspace
  * (ground truth #55), so a try/catch alone would not catch this and would
- * happily pass `--output-directory <nonexistent>/output`. A silent skip in
- * either case would recreate exactly the invisible failure this feature
- * exists to remove: no flag, no `local_paths`, and nothing said why.
+ * happily pass `--output-directory <nonexistent>/output`.
+ *
+ * That warning reaches `launch_comfyui`'s own result, where a caller can see
+ * it (`result.warnings` on the `launched` outcome). It does NOT currently reach
+ * the auto-launch path, which is the default: `EnsureResult` declares no
+ * `warnings` field, `ensureInstance` returns `launchInstance(opts)`'s result
+ * straight through, and every caller of `ensureRunning`/`ensureInstance`
+ * destructures only `{ instance }` — so on that path the warning is silently
+ * dropped today. That is a known gap, not something to widen `EnsureResult`
+ * to fix here; it is recorded rather than solved.
  *
  * This is legibility, never a precondition: it must never convert a launch
  * that would have worked into one that fails. The caller (`performLaunch`)
@@ -1097,7 +1112,7 @@ async function withDefaultOutputDirectory(
     return {
       argv,
       warning:
-        `workspace does not exist: ${workspace}; no --output-directory was sent, so artifact ` +
+        `workspace is not a directory: ${workspace}; no --output-directory was sent, so artifact ` +
         `paths will not resolve for this instance`,
     };
   }

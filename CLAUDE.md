@@ -176,11 +176,14 @@ Tests never contact a real ComfyUI and never invoke the real `comfy`. The CLI is
 | `FAKE_COMFY_JOBS_MODE` | `jobs` | `jobs` |
 | `FAKE_COMFY_NOTES_MODE` | `workflow notes` | `notes_file` |
 | `FAKE_COMFY_VARY_MODE` | `workflow vary` | `vary` |
+| `FAKE_COMFY_WHICH_MODE` | `which` | `which` |
 | `FAKE_COMFY_SLOTS_MODE` | `workflow slots` | *opt-in — no default* |
 | `FAKE_COMFY_LAUNCH_MODE` | `launch` | *opt-in — no default* |
 | `FAKE_COMFY_DISPATCH_LOG` | every call; argv **appended** | unset |
 
 The last three are the ones worth knowing. `SLOTS_MODE` and `LAUNCH_MODE` are deliberately undefaulted so that tests predating those call sites are untouched, and `DISPATCH_LOG` exists because the fixture's own `$FAKE_COMFY_ARGV_OUT` is *overwritten* per call — it therefore holds only the last of the two, which is never the `set-slot` one. Anything the dispatcher does not recognise falls through to `$FAKE_COMFY_MODE`, so a single-command test can still arm the fixture directly.
+
+`WHICH_MODE` is the row this section itself was missing until the branch that added `performLaunch`'s `comfy which` call — the exact defect class the 2026-08-27 audit entry below recorded and fixed once already, for a different gap in this same section. The sentence worth more than the row: **a launch test that arms the raw `fake-comfy` fixture directly (rather than `fake-comfy-dispatch`) now runs that single mode for both the `which` call and the `launch` call**, because `performLaunch` calls `comfy which` before it launches — one CLI mode answering two different subcommands is the hazard that forced three test fixes on this branch.
 
 Fixtures are real captures from a live ComfyUI 0.29.0 and 0.30.2, plus comfy-cli's own published JSON Schemas.
 

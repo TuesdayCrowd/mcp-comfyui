@@ -2649,8 +2649,10 @@ function registerLaunch(server: McpServer, config: ToolConfig): void {
         "this call, so launching on a free port succeeds even while ComfyUI Desktop is running " +
         "on its own. When a launch does proceed alongside another running instance, `warnings` " +
         "on the result says so, because the two compete for the same VRAM and the same shared " +
-        "model directory. On success it waits until the new server actually answers, which can " +
-        "take a minute or two while it loads. " +
+        "model directory — and the same field also carries a warning when this server could " +
+        "not default `--output-directory` from the workspace, in which case local artifact " +
+        "paths will not resolve for this instance. On success it waits until the new server " +
+        "actually answers, which can take a minute or two while it loads. " +
         "ComfyUI can only ever be started on THIS machine: `comfy launch` runs it wherever this " +
         "server runs and has no way to reach another box. A `host`, or a `listen` address, that " +
         "is not on this machine is refused outright rather than attempted — attempting it would " +

@@ -1,5 +1,5 @@
 import { expect, test } from "./support/testing.ts";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
@@ -163,7 +163,49 @@ test("defaultBinaryDeps().isExecutable reflects the real filesystem, not a mock"
     expect(defaultBinaryDeps().isExecutable(exe)).toBe(false);
 
     expect(defaultBinaryDeps().isExecutable(join(dir, "does-not-exist"))).toBe(false);
+
+    // The `isFile()` guard itself: `accessSync(X_OK)` alone answers `true`
+    // for a DIRECTORY named `comfy`, which would then read as `discovered`
+    // and fail at spawn with a confusing EACCES -- the failure the guard's
+    // own comment in binary.ts exists to prevent.
+    mkdirSync(join(dir, "as-a-directory", COMFY_BINARY_NAME), { recursive: true });
+    expect(
+      defaultBinaryDeps().isExecutable(join(dir, "as-a-directory", COMFY_BINARY_NAME)),
+    ).toBe(false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// Every test above injects `isExecutable`, so none of them can raise a real
+// `NotCapable` -- but the PROPAGATION of one through `resolveComfyBinary`'s two
+// scan loops is testable, and worth pinning: a future refactor wrapping either
+// loop in `try { … } catch { continue; }` would silently restore the exact
+// swallow three commits were spent removing (see `defaultBinaryDeps` above).
+test("a NotCapable from isExecutable propagates rather than reading as 'not here'", () => {
+  const notCapable = new Error('Requires sys access to "uid"');
+  notCapable.name = "NotCapable";
+  const throwing: BinaryDeps = {
+    env: { PATH: "/usr/bin" },
+    home: HOME,
+    isExecutable: () => {
+      throw notCapable;
+    },
+  };
+  expect(() => resolveComfyBinary(throwing)).toThrow(notCapable);
+});
+
+test("a NotCapable from isExecutable propagates out of the discovery loop too", () => {
+  // No PATH entries at all, so this exercises the SECOND loop (searchRoots)
+  // rather than the PATH scan the test above already covers.
+  const notCapable = new Error('Requires sys access to "uid"');
+  notCapable.name = "NotCapable";
+  const throwing: BinaryDeps = {
+    env: {},
+    home: HOME,
+    isExecutable: () => {
+      throw notCapable;
+    },
+  };
+  expect(() => resolveComfyBinary(throwing)).toThrow(notCapable);
 });
