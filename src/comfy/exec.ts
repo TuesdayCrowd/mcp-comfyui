@@ -73,19 +73,27 @@ export class ComfyUnavailableError extends Error {
   override readonly name = "ComfyUnavailableError";
   readonly binary: string;
   readonly cwd: string | undefined;
+  /**
+   * Candidate paths discovery tried, when it ran and found nothing. Undefined
+   * when `COMFY_BIN` named a binary — nothing was searched, and saying
+   * otherwise would send the operator looking in the wrong place.
+   */
+  readonly searched: string[] | undefined;
 
-  constructor(binary: string, cwd: string | undefined, cause: unknown) {
+  constructor(binary: string, cwd: string | undefined, cause: unknown, searched?: string[]) {
     const reason = cause instanceof Error ? cause.message : String(cause);
     super(
       // Name the cwd too: a missing working directory surfaces as ENOENT
       // quoting the BINARY, so blaming the install alone sends the operator to
       // reinstall a tool that was never broken.
       `could not start the comfy CLI at \`${binary}\`${cwd ? ` (cwd: ${cwd})` : ""}: ${reason}\n` +
-        `Install comfy-cli and put it on PATH, or set COMFY_BIN to the binary's full path.`,
+        `Install comfy-cli and put it on PATH, or set COMFY_BIN to the binary's full path.` +
+        (searched === undefined ? "" : `\nSearched: ${searched.join(", ")}`),
       { cause },
     );
     this.binary = binary;
     this.cwd = cwd;
+    this.searched = searched;
   }
 }
 
@@ -213,7 +221,7 @@ export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promis
     child.on("error", (cause: unknown) => {
       if (startedSettled) return;
       startedSettled = true;
-      reject(new ComfyUnavailableError(binary, opts.cwd, cause));
+      reject(new ComfyUnavailableError(binary, opts.cwd, cause, resolved.searched));
     });
   });
   await started;
@@ -221,7 +229,12 @@ export async function runComfyRaw(args: string[], opts: RunOptions = {}): Promis
   if (child.stdout === null || child.stderr === null) {
     // Unreachable with `stdio: ["ignore", "pipe", "pipe"]`; keeps the types
     // honest without a non-null assertion.
-    throw new ComfyUnavailableError(binary, opts.cwd, new Error("child produced no stdio pipes"));
+    throw new ComfyUnavailableError(
+      binary,
+      opts.cwd,
+      new Error("child produced no stdio pipes"),
+      resolved.searched,
+    );
   }
 
   // Both pipes are drained concurrently: reading them in sequence deadlocks as

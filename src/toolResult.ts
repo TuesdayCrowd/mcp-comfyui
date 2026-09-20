@@ -165,6 +165,8 @@ export interface ToolErrorBody {
   timeout_ms?: number;
   /** `comfy_unavailable`: the binary path that could not be started. */
   binary?: string;
+  /** `comfy_unavailable`: candidate paths discovery tried, when it ran. */
+  searched?: string[];
   /** `invalid_input`: the slot address at fault, when one input of many was. */
   address?: string;
   /** `workflow_file`: the caller's own path, exactly as it was passed. */
@@ -375,7 +377,14 @@ export function describeError(err: unknown): ToolErrorBody {
     return { kind: "timeout", message: err.message, timeout_ms: err.timeoutMs };
   }
   if (err instanceof ComfyUnavailableError) {
-    return { kind: "comfy_unavailable", message: err.message, binary: err.binary };
+    return {
+      kind: "comfy_unavailable",
+      message: err.message,
+      binary: err.binary,
+      // Only when discovery ran. Absent is meaningful: it says the operator
+      // named the binary, so the fix is that name, not the search path.
+      ...(err.searched === undefined ? {} : { searched: err.searched }),
+    };
   }
 
   // The CLI answered, but not with its own contract. Distinct from a CLI

@@ -371,10 +371,41 @@ test("a comfy already on PATH leaves the child's PATH untouched", async () => {
 test("the quoted command line names the resolved binary, not a stale one", async () => {
   // Also passed before the resolver was wired in: with COMFY_BIN set, the old
   // `process.env.COMFY_BIN ?? "comfy"` and the new `resolved.path` are the same
-  // string. It guards line 171 -- the separate `argv` array that builds
-  // `commandLine` -- against being dropped or left pointing at a stale binary.
+  // string. It guards the separate `argv` array that builds `commandLine` --
+  // against being dropped or left pointing at a stale binary.
   process.env.FAKE_COMFY_MODE = "echo_path";
   process.env.FAKE_COMFY_PATH_OUT = join(workdir, "child-path");
   const run = await runComfyRaw(["workflow", "slots"]);
   expect(run.commandLine).toBe(`${FAKE_COMFY} --skip-prompt workflow slots`);
+});
+
+test("a comfy that is nowhere names every candidate that was tried", async () => {
+  delete process.env.COMFY_BIN;
+  process.env.PATH = join(workdir, "empty"); // exists but holds no comfy
+  // HOME too, and this is not belt-and-braces: discovery's FIRST root is
+  // `<home>/.local/bin`, which on a developer machine really does hold
+  // comfy-cli. Without this the test does not fail cleanly -- it shells out to
+  // the real CLI, breaking "tests never invoke the real `comfy`".
+  process.env.HOME = workdir;
+
+  const err = await rejection(runComfy(["workflow", "slots"]));
+
+  expect(err).toBeInstanceOf(ComfyUnavailableError);
+  const searched = (err as ComfyUnavailableError).searched;
+  expect(searched).toBeDefined();
+  // Not a length: /opt/homebrew/bin/comfy and /usr/local/bin/comfy may exist on
+  // the machine running this. The home-derived root is the one we control.
+  expect(searched).toContain(join(workdir, ".local", "bin", "comfy"));
+  expect((err as Error).message).toContain("Searched:");
+  // The existing two sentences must survive -- other tests assert on them.
+  expect((err as Error).message).toContain("set COMFY_BIN to the binary's full path");
+});
+
+test("an explicit COMFY_BIN that is missing reports no search at all", async () => {
+  // Nothing was searched, because naming a binary suppresses discovery.
+  process.env.COMFY_BIN = join(workdir, "definitely-not-installed");
+  const err = await rejection(runComfy(["workflow", "slots"]));
+  expect(err).toBeInstanceOf(ComfyUnavailableError);
+  expect((err as ComfyUnavailableError).searched).toBeUndefined();
+  expect((err as Error).message).not.toContain("Searched:");
 });
