@@ -778,8 +778,10 @@ function launchDiagnosis(cause: EnvelopeParseError, workspace: string | undefine
       `on the PATH this server was started with.\n` +
       `COMFY_BIN does not help here: it tells *this server* where comfy is, and the lookup that ` +
       `failed is comfy-cli's own.\n` +
-      `A GUI-launched MCP client inherits a minimal PATH and hits this even where comfy runs ` +
-      `fine in a terminal; set PATH in that client's entry for this server.`
+      `This server prepends the resolved binary's own directory to the child's PATH, so ` +
+      `reaching this message means the repair did not help: the re-exec looked for ` +
+      `\`${missing}\` and a directory containing it was not found. Check that the name ` +
+      `comfy-cli re-execs matches the binary COMFY_BIN names.`
     );
   }
   return (

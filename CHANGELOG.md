@@ -30,6 +30,11 @@ All notable changes to this project are recorded here. The format follows
   under a GUI MCP client's bare launchd PATH, and pinned by a new fixture mode
   (`garbage_self_exec`) whose signature deliberately sits past the snippet limit.
 
+  **Superseded in the same release:** the server now repairs the child's `PATH`
+  itself (see the auto-discovery entry below), so this diagnosis should be
+  unreachable in normal use — and if it does fire, it now says that the repair
+  was attempted and did not help, which is a different and more useful fact.
+
 - **A real tailnet address was removed from a tracked test file.**
   `tests/target.test.ts` carried one in its injected interface table, under a test
   named "this machine's own Tailscale address" — and it sat in the same /24 as the

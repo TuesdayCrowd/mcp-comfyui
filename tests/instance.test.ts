@@ -848,6 +848,9 @@ test("a launch that died because comfy could not re-exec itself says so, not 'wo
   // And the wrong diagnosis must be gone.
   expect(message).not.toContain("The most common cause is a workspace");
   expect(message).not.toContain("MCP_COMFYUI_WORKSPACE");
+  // The advice is no longer "set PATH yourself" -- the server does that now,
+  // so reaching this message means the repair was tried and did not help.
+  expect(message).toContain("prepends the resolved binary's own directory");
 });
 
 test("a missing comfy binary aborts the wait rather than polling to the budget", async () => {
