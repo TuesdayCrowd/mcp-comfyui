@@ -854,6 +854,27 @@ test("nothing running is a successful answer, not a tool error", async () => {
   expect(body["port"]).toBe(deadPort);
 });
 
+test("comfy_status reports which comfy it resolved, and how", async () => {
+  const body = await ok(await connect(), "comfy_status");
+
+  const cli = body["cli"] as Record<string, unknown>;
+  // The suite points COMFY_BIN at the fixture, so this is the explicit arm.
+  expect(cli["source"]).toBe("COMFY_BIN");
+  expect(typeof cli["path"]).toBe("string");
+  expect(typeof cli["path_repaired"]).toBe("boolean");
+  // Nothing was searched, because naming a binary suppresses discovery.
+  expect(cli["searched"]).toBeUndefined();
+});
+
+test("comfy_status reports the cli block even when nothing is running", async () => {
+  // This is exactly when an operator most needs to know which binary was found.
+  nothingRunning();
+  const body = await ok(await connect(), "comfy_status");
+
+  expect(body["running"]).toBe(false);
+  expect((body["cli"] as Record<string, unknown>)["source"]).toBe("COMFY_BIN");
+});
+
 // --- list_workflows ------------------------------------------------------
 
 test("list_workflows enumerates the configured root and names the handles", async () => {

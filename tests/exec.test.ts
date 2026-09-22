@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { EnvelopeParseError } from "../src/comfy/envelope.ts";
 import {
   ComfyCliError,
@@ -37,6 +37,25 @@ afterEach(() => {
   delete process.env.FAKE_COMFY_ORPHAN_OUT;
   delete process.env.FAKE_COMFY_PROBE;
   rmSync(workdir, { recursive: true, force: true });
+});
+
+let savedPath: string | undefined;
+let savedHome: string | undefined;
+
+beforeEach(() => {
+  savedPath = process.env.PATH;
+  savedHome = process.env.HOME;
+});
+
+afterEach(() => {
+  if (savedPath === undefined) delete process.env.PATH;
+  else process.env.PATH = savedPath;
+  // HOME too: `homedir()` follows it, and discovery's first root is
+  // `<home>/.local/bin`. Without this, a discovery test reads the developer's
+  // real install and the suite shells out to a real comfy-cli.
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  delete process.env.FAKE_COMFY_PATH_OUT;
 });
 
 /** Await a promise that must reject, and hand back what it rejected with. */
@@ -313,4 +332,80 @@ test("runComfyRaw hands back both streams undecoded", async () => {
   expect(raw.stderr).toContain("RuntimeError: boom");
   expect(raw.exitCode).toBe(1);
   expect(raw.commandLine).toContain("--skip-prompt workflow slots");
+});
+
+test("the resolved binary's directory reaches the child's PATH", async () => {
+  // The bug this whole feature exists for: comfy-cli re-execs itself by bare
+  // name, so an absolute COMFY_BIN alone is not enough.
+  const pathOut = join(workdir, "child-path");
+  process.env.FAKE_COMFY_MODE = "echo_path";
+  process.env.FAKE_COMFY_PATH_OUT = pathOut;
+  process.env.PATH = "/usr/bin";
+
+  await runComfy(["workflow", "slots"]);
+
+  const childPath = readFileSync(pathOut, "utf8").trim();
+  expect(childPath.split(delimiter)[0]).toBe(dirname(FAKE_COMFY));
+  expect(childPath.endsWith("/usr/bin")).toBe(true);
+});
+
+test("a comfy already on PATH leaves the child's PATH untouched", async () => {
+  const pathOut = join(workdir, "child-path");
+  const link = join(workdir, "comfy");
+  symlinkSync(FAKE_COMFY, link);
+  delete process.env.COMFY_BIN;
+  process.env.PATH = workdir;
+  process.env.FAKE_COMFY_MODE = "echo_path";
+  process.env.FAKE_COMFY_PATH_OUT = pathOut;
+
+  await runComfy(["workflow", "slots"]);
+
+  // Rule 2 resolved this on PATH, so no repair was owed and none happened.
+  // This test passed before the resolver was wired in too -- it cannot, and
+  // does not, prove that rule 2 fired. It is a REGRESSION GUARD: it dies if
+  // the repair is ever made unconditional, prepending a directory to a child
+  // whose PATH already worked.
+  expect(readFileSync(pathOut, "utf8").trim()).toBe(workdir);
+});
+
+test("the quoted command line names the resolved binary, not a stale one", async () => {
+  // Also passed before the resolver was wired in: with COMFY_BIN set, the old
+  // `process.env.COMFY_BIN ?? "comfy"` and the new `resolved.path` are the same
+  // string. It guards the separate `argv` array that builds `commandLine` --
+  // against being dropped or left pointing at a stale binary.
+  process.env.FAKE_COMFY_MODE = "echo_path";
+  process.env.FAKE_COMFY_PATH_OUT = join(workdir, "child-path");
+  const run = await runComfyRaw(["workflow", "slots"]);
+  expect(run.commandLine).toBe(`${FAKE_COMFY} --skip-prompt workflow slots`);
+});
+
+test("a comfy that is nowhere names every candidate that was tried", async () => {
+  delete process.env.COMFY_BIN;
+  process.env.PATH = join(workdir, "empty"); // exists but holds no comfy
+  // HOME too, and this is not belt-and-braces: discovery's FIRST root is
+  // `<home>/.local/bin`, which on a developer machine really does hold
+  // comfy-cli. Without this the test does not fail cleanly -- it shells out to
+  // the real CLI, breaking "tests never invoke the real `comfy`".
+  process.env.HOME = workdir;
+
+  const err = await rejection(runComfy(["workflow", "slots"]));
+
+  expect(err).toBeInstanceOf(ComfyUnavailableError);
+  const searched = (err as ComfyUnavailableError).searched;
+  expect(searched).toBeDefined();
+  // Not a length: /opt/homebrew/bin/comfy and /usr/local/bin/comfy may exist on
+  // the machine running this. The home-derived root is the one we control.
+  expect(searched).toContain(join(workdir, ".local", "bin", "comfy"));
+  expect((err as Error).message).toContain("Searched:");
+  // The existing two sentences must survive -- other tests assert on them.
+  expect((err as Error).message).toContain("set COMFY_BIN to the binary's full path");
+});
+
+test("an explicit COMFY_BIN that is missing reports no search at all", async () => {
+  // Nothing was searched, because naming a binary suppresses discovery.
+  process.env.COMFY_BIN = join(workdir, "definitely-not-installed");
+  const err = await rejection(runComfy(["workflow", "slots"]));
+  expect(err).toBeInstanceOf(ComfyUnavailableError);
+  expect((err as ComfyUnavailableError).searched).toBeUndefined();
+  expect((err as Error).message).not.toContain("Searched:");
 });

@@ -1,3 +1,5 @@
+import { statSync } from "node:fs";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { z } from "zod";
 import { AUTO_LAUNCH_ENV, WORKSPACE_ENV } from "../config.ts";
@@ -57,6 +59,30 @@ const DEFAULT_READY_TIMEOUT_MS = 300_000;
 
 /** Between readiness probes. Short enough to feel immediate, idle otherwise. */
 const DEFAULT_POLL_INTERVAL_MS = 500;
+
+/**
+ * Budget for the `comfy which` call that derives the output directory.
+ *
+ * `RunOptions` defaults to 120 s. Blocking a launch for two minutes on a call
+ * measured as effectively instant would be wrong, and this call is optional —
+ * failing fast and skipping the flag is strictly better than waiting.
+ *
+ * This is a ceiling, not a guarantee: `whichWorkspace` clamps it to the
+ * caller's own `timeoutMs` too, so a caller who asked for a short launch
+ * budget never has this optional call spend more of it than they gave —
+ * `performLaunch` computes its readiness deadline AFTER this call returns, so
+ * an unclamped 10s here would silently borrow from a 2s caller's budget.
+ */
+const WHICH_TIMEOUT_MS = 10_000;
+
+/**
+ * `comfy which`'s payload. `looseObject` and no enum on purpose:
+ * `workspace_type` is a further open-string registry (non-negotiable #2), and
+ * nothing here needs to read it.
+ */
+const WhichPayloadSchema = z.looseObject({
+  workspace_path: z.string().nullable().optional(),
+});
 
 /**
  * The root-level JSON mode flag. Piped stdout would select JSON anyway, but
@@ -282,7 +308,9 @@ export interface LaunchOptions {
  * another ComfyUI was already known to be running at a different address — a
  * real resource conflict (VRAM, the shared model directory) that is worth
  * surfacing, but not a reason to refuse a launch that was deliberately asked
- * for. Empty, never absent, when there was nothing to warn about.
+ * for — or when `--output-directory` could not be defaulted from the
+ * workspace (see {@link withDefaultOutputDirectory}). Empty, never absent,
+ * when there was nothing to warn about.
  *
  * Genuine faults still throw: {@link LaunchArgumentError} for arguments this
  * server will not send, {@link ComfyCliError} for a failure the CLI diagnosed
@@ -752,8 +780,10 @@ function launchDiagnosis(cause: EnvelopeParseError, workspace: string | undefine
       `on the PATH this server was started with.\n` +
       `COMFY_BIN does not help here: it tells *this server* where comfy is, and the lookup that ` +
       `failed is comfy-cli's own.\n` +
-      `A GUI-launched MCP client inherits a minimal PATH and hits this even where comfy runs ` +
-      `fine in a terminal; set PATH in that client's entry for this server.`
+      `This server prepends the resolved binary's own directory to the child's PATH, so ` +
+      `reaching this message means the repair did not help: the re-exec looked for ` +
+      `\`${missing}\` and a directory containing it was not found. Check that the name ` +
+      `comfy-cli re-execs matches the binary COMFY_BIN names.`
     );
   }
   return (
@@ -803,16 +833,45 @@ function explainVerdict(failure: unknown, workspace: string | undefined): unknow
 /**
  * A failure the CLI has *diagnosed*, as opposed to one it merely suffered.
  *
- * Only these two abort the readiness wait. `not_in_workspace` (what this user's
- * machine answers, since ComfyUI Desktop is not a comfy-cli workspace),
- * `port_in_use` and `server_already_running` are verdicts: no ComfyUI is coming,
- * and waiting two minutes to discover that helps nobody. A timeout or an
- * unreadable envelope is not a verdict — the CLI may simply have failed to tell
- * us about a server that is starting anyway, and the HTTP probe is the
- * authority on that.
+ * `not_in_workspace` (what this user's machine answers, since ComfyUI Desktop
+ * is not a comfy-cli workspace), `port_in_use` and `server_already_running`
+ * are verdicts: no ComfyUI is coming, and waiting two minutes to discover that
+ * helps nobody. A timeout or an unreadable envelope is not a verdict — the CLI
+ * may simply have failed to tell us about a server that is starting anyway,
+ * and the HTTP probe is the authority on that.
+ *
+ * A `NotCapable` thrown out of `resolveComfyBinary` is a verdict too, and
+ * deliberately checked by name rather than by type: it never reached this
+ * server as a `ComfyCliError` or `ComfyUnavailableError` in the first place —
+ * it is Deno's own sandbox refusing the `accessSync(X_OK)` check inside
+ * `binary.ts`'s `isExecutable` before `runComfy` ever gets to spawn anything.
+ * Before `isExecutable` was changed to rethrow it, this case could not reach
+ * here at all: a missing `--allow-sys=uid,gid` grant made `isExecutable`
+ * silently answer `false`, which is indistinguishable from "not found" and
+ * let `startLaunch` try to spawn the bare name anyway — sometimes even
+ * working, if the OS's own PATH lookup found what this server's own check
+ * could not. Once permission checks are allowed to fail loudly, this poll
+ * loop has to know a `NotCapable` is exactly as terminal as a diagnosed CLI
+ * failure: no amount of waiting fixes a sandbox grant, and the alternative is
+ * spending the full five-minute budget above on a launch that was never going
+ * to happen, with the real cause surviving only as trailing text in a
+ * `LaunchTimeoutError`.
+ *
+ * Exported for `tests/instance.test.ts` to call directly, on the same
+ * reasoning `binary.test.ts` unit-tests `resolveComfyBinary` in isolation:
+ * the specific condition that raises a genuine `NotCapable` here — a missing
+ * `--allow-sys=uid,gid` grant — cannot be reproduced through a live
+ * `launchInstance` call inside this suite, because `deno task test` itself
+ * must hold that exact grant for every other test in this file to exercise
+ * `defaultBinaryDeps()` correctly in the first place. The two cannot coexist
+ * in one `deno test` process, so the classification is pinned directly.
  */
-function isVerdict(failure: unknown): boolean {
-  return failure instanceof ComfyCliError || failure instanceof ComfyUnavailableError;
+export function isVerdict(failure: unknown): boolean {
+  return (
+    failure instanceof ComfyCliError ||
+    failure instanceof ComfyUnavailableError ||
+    (failure instanceof Error && failure.name === "NotCapable")
+  );
 }
 
 /**
@@ -947,6 +1006,120 @@ async function contentionWarnings(
   ];
 }
 
+/**
+ * The workspace to derive an output directory from, or undefined.
+ *
+ * `opts.workspace` short-circuits the CLI call: it is already the answer, and
+ * asking anyway would add an invocation to every launch for nothing.
+ *
+ * `timeoutMs` is the CALLER's own launch budget, not a suggestion — the
+ * budget actually passed to `runComfy` is `Math.min(WHICH_TIMEOUT_MS,
+ * timeoutMs)`, so a caller who asked for a short launch never has this
+ * optional call outlive what they asked for.
+ */
+async function whichWorkspace(opts: LaunchOptions, timeoutMs: number): Promise<string | undefined> {
+  if (opts.workspace !== undefined) return opts.workspace;
+  try {
+    const payload = WhichPayloadSchema.parse(
+      await runComfy([JSON_MODE, "which"], { timeoutMs: Math.min(WHICH_TIMEOUT_MS, timeoutMs) }),
+    );
+    return payload.workspace_path ?? undefined;
+  } catch {
+    // Every failure is survivable here — see withDefaultOutputDirectory.
+    return undefined;
+  }
+}
+
+/** Whether `path` exists and is a directory — never a file, and never a throw. */
+function isExistingDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Give ComfyUI an explicit `--output-directory`, so the path it writes to
+ * appears in its own `system.argv` and `outputs.ts` can resolve artifact URLs
+ * against it (ground truth #54). Without it the flag is absent, `argv` says
+ * nothing, and every local artifact comes back with no `local_paths` entry.
+ *
+ * The value is the directory ComfyUI would have used anyway, so nothing moves
+ * for anyone — this makes an existing default legible, it does not relocate it.
+ *
+ * `opts.workspace` set explicitly costs no CLI call either way — `whichWorkspace`
+ * returns it verbatim, with no `comfy which` invocation — but that is NOT the
+ * same as the flag being skipped. When that directory exists, `--output-directory
+ * <workspace>/output` IS appended, exactly as it would be for a workspace `comfy
+ * which` discovered on its own: this is the main path this feature serves,
+ * `MCP_COMFYUI_WORKSPACE`. The flag (and any warning) is genuinely skipped only
+ * when the caller already supplied `--output-directory` themselves, or when an
+ * explicit `opts.workspace` does not exist — the caller's own claim, not this
+ * function's to second-guess; if it is wrong, `not_in_workspace` is the failure
+ * that says so.
+ *
+ * Skipped WITH a `warning` on the return value in the two cases that are worth
+ * a caller's attention, and only for a workspace this function derived rather
+ * than one the caller named: no workspace could be determined (`comfy which`
+ * failed, or reported none), or the workspace it reported is not a directory —
+ * not hypothetical, `comfy which` returns ok:true for a nonexistent workspace
+ * (ground truth #55), so a try/catch alone would not catch this and would
+ * happily pass `--output-directory <nonexistent>/output`.
+ *
+ * That warning reaches `launch_comfyui`'s own result, where a caller can see
+ * it (`result.warnings` on the `launched` outcome). It does NOT currently reach
+ * the auto-launch path, which is the default: `EnsureResult`'s `launched` arm
+ * declares no `warnings` field at all, and `ensureInstance` returns
+ * `launchInstance(opts)`'s result straight through — so no caller of
+ * `ensureRunning`/`ensureInstance` can read the warning, whatever shape of the
+ * result it keeps. That is a known gap, not something to widen `EnsureResult`
+ * to fix here; it is recorded rather than solved.
+ *
+ * This is legibility, never a precondition: it must never convert a launch
+ * that would have worked into one that fails. The caller (`performLaunch`)
+ * attaches the warning to the `launched` result's own `warnings` array.
+ *
+ * One invariant is now narrower than its documentation: `validateComfyuiArgs`
+ * runs in `launchInstance` BEFORE `performLaunch`, so the pair appended here
+ * is never validated. `join(workspace, "output")` cannot be empty and the flag
+ * is a literal, so nothing reachable is affected — but a future caller of this
+ * function must not assume validation covers what it adds.
+ */
+async function withDefaultOutputDirectory(
+  argv: string[],
+  opts: LaunchOptions,
+  timeoutMs: number,
+): Promise<{ argv: string[]; warning?: string }> {
+  if (flagValue(argv, OUTPUT_DIRECTORY_FLAG) !== null) return { argv };
+
+  const explicitWorkspace = opts.workspace !== undefined;
+  const workspace = await whichWorkspace(opts, timeoutMs);
+
+  if (workspace === undefined) {
+    // Only reachable with no explicit workspace: whichWorkspace always
+    // returns opts.workspace verbatim when it is set, never undefined.
+    return {
+      argv,
+      warning:
+        "could not determine a ComfyUI workspace, so no --output-directory was sent; artifact " +
+        "paths will not resolve for this instance",
+    };
+  }
+
+  if (!isExistingDirectory(workspace)) {
+    if (explicitWorkspace) return { argv }; // the caller's own claim; see the doc comment above
+    return {
+      argv,
+      warning:
+        `workspace is not a directory: ${workspace}; no --output-directory was sent, so artifact ` +
+        `paths will not resolve for this instance`,
+    };
+  }
+
+  return { argv: [...argv, OUTPUT_DIRECTORY_FLAG, join(workspace, "output")] };
+}
+
 /** The launch itself, once it has been established that this caller leads it. */
 async function performLaunch(opts: LaunchOptions, argv: string[], target: Target): Promise<LaunchResult> {
   const probeTimeoutMs = opts.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
@@ -961,7 +1134,9 @@ async function performLaunch(opts: LaunchOptions, argv: string[], target: Target
 
   const warnings = await contentionWarnings(opts, target, probeTimeoutMs);
 
-  const cli = startLaunch(launchArgv(argv, opts.workspace), timeoutMs);
+  const defaulted = await withDefaultOutputDirectory(argv, opts, timeoutMs);
+  if (defaulted.warning !== undefined) warnings.push(defaulted.warning);
+  const cli = startLaunch(launchArgv(defaulted.argv, opts.workspace), timeoutMs);
 
   const deadline = Date.now() + timeoutMs;
   let lastReason = "no probe completed";

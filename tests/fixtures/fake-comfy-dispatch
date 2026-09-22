@@ -15,6 +15,7 @@
 #                              `run_workflow` could make this call unchanged)
 #   $FAKE_COMFY_NOTES_MODE     mode for a `workflow notes` call (default: notes_file)
 #   $FAKE_COMFY_VARY_MODE      mode for a `workflow vary` call (default: vary)
+#   $FAKE_COMFY_WHICH_MODE     mode for a `which` call (default: which)
 #   $FAKE_COMFY_LAUNCH_MODE    mode for a `launch` call (default: none — opt-in,
 #                              exactly like $FAKE_COMFY_SLOTS_MODE and for the
 #                              same compatibility reason)
@@ -53,6 +54,11 @@ for arg in "$@"; do
     # than opt-in like `slots`: nothing written before `vary` existed can make
     # this call, so there is no earlier behaviour for a default to disturb.
     vary)     FAKE_COMFY_MODE="${FAKE_COMFY_VARY_MODE:-vary}"; break ;;
+    # `performLaunch` asks `comfy which` for the workspace so it can default
+    # --output-directory. Defaulted like `notes` and `vary` rather than opt-in
+    # like `launch`: nothing written before this call existed can make it, so
+    # there is no earlier behaviour for a default to disturb.
+    which)    FAKE_COMFY_MODE="${FAKE_COMFY_WHICH_MODE:-which}"; break ;;
     # Auto-launch fires from inside a tool handler, so `describe_workflow` and
     # `validate_workflow` can each make a `launch` call alongside their own —
     # and a test about a launch that FAILS needs the other call still

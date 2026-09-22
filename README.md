@@ -47,13 +47,13 @@ Nothing to clone, nothing to build. Verify Claude can see it:
 claude mcp list
 ```
 
-Deno needs every permission — it spawns `comfy`, reads workflow files, writes temp copies, talks to ComfyUI over HTTP, reads its configuration, and asks the OS for your home directory and this machine's own interface addresses — so `-A` is the practical form. The long spelling is:
+Deno needs every permission — it spawns `comfy`, reads workflow files, writes temp copies, talks to ComfyUI over HTTP, reads its configuration, and asks the OS for your home directory, this machine's own interface addresses, and (to find `comfy` itself when it is not on `PATH`) the identity checks a filesystem executable-bit test needs — so `-A` is the practical form. The long spelling is:
 
 ```
---allow-run --allow-read --allow-write --allow-net --allow-env --allow-sys=homedir,networkInterfaces
+--allow-run --allow-read --allow-write --allow-net --allow-env --allow-sys=homedir,networkInterfaces,uid,gid
 ```
 
-`--allow-sys` is easy to leave off and fails late: `homedir` is how the config and cache directories are found, and `networkInterfaces` is how the server decides whether an address is this machine's before it will start ComfyUI for it. Without it the first call that needs either one fails with `NotCapable`.
+`--allow-sys` is easy to leave off and fails late: `homedir` is how the config and cache directories are found (and where CLI discovery starts looking for `comfy`), `networkInterfaces` is how the server decides whether an address is this machine's before it will start ComfyUI for it, and `uid`/`gid` are what a real executable-bit check (`accessSync(X_OK)`) needs before it can even answer — without them it throws `NotCapable` instead of saying yes or no. Measured 2026-09-19: the compiled binary's own `--allow-sys` grant was missing `uid`/`gid` and CLI discovery silently reported every real, executable `comfy` as `not_found` as a result. Without any of these four, the first call that needs one fails with `NotCapable`.
 
 ### Node and Bun
 
@@ -93,9 +93,20 @@ A `deno task compile` task is also available if a self-contained platform binary
 | `MCP_COMFYUI_HOST` / `_PORT` | `127.0.0.1` / `8188` | Where the **default** ComfyUI is |
 | `MCP_COMFYUI_HOSTS_FILE` | `~/.config/mcp-comfyui/hosts.json` | The host registry, for more than one ComfyUI |
 | `MCP_COMFYUI_CACHE_DIR` | `~/.cache/mcp-comfyui` | `/object_info` cache |
-| `COMFY_BIN` | `comfy` | Path to the `comfy` binary |
+| `COMFY_BIN` | auto-detected | Optional override for the path to the `comfy` binary |
 
 Booleans accept `1/true/yes/on` and `0/false/no/off`; anything else is refused at startup rather than read as off.
+
+`COMFY_BIN` is an **override, not a requirement.** With it unset the server
+looks for `comfy` on `PATH`, then in `~/.local/bin`, uv's tool directory,
+`/opt/homebrew/bin` and `/usr/local/bin`. Setting it wins absolutely and
+disables that search — a named binary that is missing is reported as an error
+rather than quietly replaced.
+
+The server also **prepends the resolved binary's directory to the `PATH` it
+gives its children**, because `comfy launch --background` re-execs itself by
+bare name. A GUI-launched MCP client inherits a minimal `PATH`, so without this
+auto-launch fails there even though every other command works.
 
 The two launch switches answer different questions and are deliberately separate. `AUTO_LAUNCH` governs launches **the server decides to make** on your behalf. `ALLOW_LAUNCH` governs whether **a model may ask for one** with `--cpu`, `--listen` and a free-form argument list — strictly more powerful, so it stays opt-in.
 
@@ -109,7 +120,7 @@ MCP_COMFYUI_WORKSPACE=/path/to/ComfyUI     # the directory containing main.py
 
 There is deliberately no auto-discovery. Picking between several installs by name is exactly how you end up launching the wrong ComfyUI against the right models.
 
-This setting affects **launching only**. It does not change how artifacts are reported — see below.
+This setting now also decides where a launched instance writes: the server sends `--output-directory <workspace>/output`, which is what lets `local_paths` resolve. It does not affect an instance this server did not start.
 
 ## More than one ComfyUI
 
@@ -317,7 +328,16 @@ node scripts/smoke-remote-artifacts.mjs <host:port>    # needs a live REMOTE Com
 node scripts/smoke-sweep.mjs <host:port>               # needs a live ComfyUI
 ```
 
-Every one of them forces `MCP_COMFYUI_AUTO_LAUNCH=0`, so none can start a ComfyUI on your machine while it is aimed at another one.
+Every one of these three forces `MCP_COMFYUI_AUTO_LAUNCH=0`, so none can start a ComfyUI on your machine while it is aimed at another one.
+
+A fourth thing the suite cannot prove — that the server finds `comfy` and launches ComfyUI itself with **nothing configured** — has its own harness, built the opposite way on purpose:
+
+```bash
+deno task build && deno task compile   # this one drives the COMPILED binary, not dist/index.js
+node scripts/smoke-autolaunch.mjs
+```
+
+`scripts/smoke-autolaunch.mjs` leaves `MCP_COMFYUI_AUTO_LAUNCH` at its default (**on**) — auto-launch with nothing configured is the whole point — so unlike the three above, **it will start a GPU process on this machine**, and it does not stop ComfyUI when it finishes. Stop it yourself before and after: `comfy --skip-prompt --json stop`.
 
 `deno task release` exists because the version number lives in three files — `deno.json`, `SERVER_VERSION` in `src/server.ts`, and the CHANGELOG heading. It edits all three and stops, without committing or publishing: JSR refuses to republish a version number, so a spent one is spent.
 

@@ -1,0 +1,220 @@
+import { expect, test } from "./support/testing.ts";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
+import {
+  COMFY_BINARY_NAME,
+  defaultBinaryDeps,
+  resolveComfyBinary,
+  type BinaryDeps,
+} from "../src/comfy/binary.ts";
+
+const HOME = "/home/someone";
+
+/** A deps bag where only the listed paths are executable files. */
+function deps(
+  env: NodeJS.ProcessEnv,
+  executables: string[] = [],
+  home = HOME,
+): BinaryDeps {
+  const set = new Set(executables);
+  return { env, home, isExecutable: (p) => set.has(p) };
+}
+
+test("COMFY_BIN wins outright, and is not checked for existence", () => {
+  const r = resolveComfyBinary(deps({ COMFY_BIN: "/opt/custom/comfy", PATH: "/usr/bin" }));
+  expect(r.path).toBe("/opt/custom/comfy");
+  expect(r.source).toBe("COMFY_BIN");
+});
+
+test("COMFY_BIN never falls back to discovery, even pointing at nothing", () => {
+  // An operator who named a binary has expressed an intent. Substituting a
+  // different one silently would override it -- and eleven test files depend
+  // on COMFY_BIN meaning exactly what it says.
+  const r = resolveComfyBinary(
+    deps({ COMFY_BIN: "/nope/comfy" }, [join(HOME, ".local/bin", COMFY_BINARY_NAME)]),
+  );
+  expect(r.path).toBe("/nope/comfy");
+  expect(r.source).toBe("COMFY_BIN");
+  expect(r.searched).toBeUndefined();
+});
+
+test("COMFY_BIN still gets its directory prepended to the child PATH", () => {
+  // The measured failure: a correct COMFY_BIN and a PATH that could not
+  // satisfy comfy-cli's own re-exec of itself.
+  const r = resolveComfyBinary(deps({ COMFY_BIN: "/opt/custom/comfy", PATH: "/usr/bin" }));
+  expect(r.childPath).toBe(`/opt/custom${delimiter}/usr/bin`);
+});
+
+test("a comfy already on PATH is used bare, and nothing is repaired", () => {
+  const r = resolveComfyBinary(
+    deps({ PATH: `/usr/bin${delimiter}/opt/tools` }, [join("/opt/tools", COMFY_BINARY_NAME)]),
+  );
+  expect(r.path).toBe(COMFY_BINARY_NAME);
+  expect(r.source).toBe("PATH");
+  expect(r.childPath).toBeUndefined();
+});
+
+test("a later PATH entry still counts, so the scan does not stop at the first miss", () => {
+  // Deliberately NOT "first hit wins": rule 2 discards the winning directory
+  // (it returns the bare name), so which entry matched is unobservable in
+  // ResolvedBinary and a test asserting order could not fail. What IS
+  // observable, and worth pinning, is that a non-matching earlier entry does
+  // not abort the scan and fall through to discovery.
+  const r = resolveComfyBinary(
+    deps({ PATH: `/empty${delimiter}/b` }, [join("/b", COMFY_BINARY_NAME)]),
+  );
+  expect(r.source).toBe("PATH");
+  expect(r.childPath).toBeUndefined();
+});
+
+test("discovery finds ~/.local/bin when PATH has nothing", () => {
+  const found = join(HOME, ".local/bin", COMFY_BINARY_NAME);
+  const r = resolveComfyBinary(deps({ PATH: "/usr/bin" }, [found]));
+  expect(r.path).toBe(found);
+  expect(r.source).toBe("discovered");
+  expect(r.childPath).toBe(`${join(HOME, ".local/bin")}${delimiter}/usr/bin`);
+});
+
+test("discovery prefers ~/.local/bin over Homebrew", () => {
+  const local = join(HOME, ".local/bin", COMFY_BINARY_NAME);
+  const brew = join("/opt/homebrew/bin", COMFY_BINARY_NAME);
+  const r = resolveComfyBinary(deps({ PATH: "/usr/bin" }, [brew, local]));
+  expect(r.path).toBe(local);
+});
+
+test("discovery falls through to Homebrew when the home roots are empty", () => {
+  const brew = join("/opt/homebrew/bin", COMFY_BINARY_NAME);
+  const r = resolveComfyBinary(deps({ PATH: "/usr/bin" }, [brew]));
+  expect(r.path).toBe(brew);
+  expect(r.source).toBe("discovered");
+});
+
+test("nothing anywhere is not_found, and names every candidate tried", () => {
+  const r = resolveComfyBinary(deps({ PATH: "/usr/bin" }, []));
+  expect(r.source).toBe("not_found");
+  expect(r.path).toBe(COMFY_BINARY_NAME); // still what we will attempt
+  expect(r.searched).toEqual([
+    join(HOME, ".local/bin", COMFY_BINARY_NAME),
+    join(HOME, ".local/share/uv/tools/comfy-cli/bin", COMFY_BINARY_NAME),
+    join("/opt/homebrew/bin", COMFY_BINARY_NAME),
+    join("/usr/local/bin", COMFY_BINARY_NAME),
+  ]);
+  expect(r.childPath).toBeUndefined();
+});
+
+test("an undefined PATH is not a crash, and discovery still runs", () => {
+  const found = join(HOME, ".local/bin", COMFY_BINARY_NAME);
+  const r = resolveComfyBinary(deps({}, [found]));
+  expect(r.source).toBe("discovered");
+  expect(r.childPath).toBe(join(HOME, ".local/bin"));
+});
+
+test("a directory already on PATH is not prepended again", () => {
+  const found = join("/opt/tools", COMFY_BINARY_NAME);
+  const r = resolveComfyBinary(
+    deps({ COMFY_BIN: found, PATH: `/usr/bin${delimiter}/opt/tools` }),
+  );
+  expect(r.childPath).toBeUndefined();
+});
+
+test("the directory is PREPENDED, never appended", () => {
+  // comfy-cli re-execs the bare name `comfy`. Prepending is what guarantees
+  // that re-exec finds the binary we just resolved; appending would let a
+  // different, earlier comfy win it.
+  const r = resolveComfyBinary(deps({ COMFY_BIN: "/opt/custom/comfy", PATH: "/usr/bin" }));
+  expect(r.childPath?.startsWith("/opt/custom")).toBe(true);
+});
+
+test("a relative COMFY_BIN is left alone rather than guessed at", () => {
+  const r = resolveComfyBinary(deps({ COMFY_BIN: "comfy", PATH: "/usr/bin" }));
+  expect(r.path).toBe("comfy");
+  expect(r.childPath).toBeUndefined();
+});
+
+// Every test above injects `isExecutable`, so none of them can distinguish a
+// real "yes" from a real "no" -- or from a real "the sandbox would not let me
+// check". `accessSync(X_OK)` needs `--allow-sys=uid` (and, for the general
+// case, `gid`) just to look up the caller's own identity before it can
+// compare it against the file's owner bits; without them it throws
+// `NotCapable`. This was never specific to `deno compile` -- a bare `deno
+// run` under this project's own previously-documented long-form flags
+// (`--allow-sys=homedir,networkInterfaces`, no `uid`/`gid`) threw the
+// identical error, so both `deno.json`'s `compile` task and its `test`/
+// `test:one` tasks now grant `uid,gid`. Before that grant existed anywhere,
+// the old blanket `catch { return false }` turned `NotCapable` into an
+// indistinguishable "not executable", so a real, executable comfy-cli was
+// reported `not_found` under any of those flag sets -- compiled binary or
+// plain `deno run` alike. This is the one test in the file that calls
+// `defaultBinaryDeps()` itself, against a real file on the real filesystem,
+// so it lives or dies on the actual `--allow-sys` grant `deno.json`'s `test`
+// task carries -- which is the property that would have caught the
+// regression.
+test("defaultBinaryDeps().isExecutable reflects the real filesystem, not a mock", () => {
+  const dir = mkdtempSync(join(tmpdir(), "mcp-comfyui-binary-"));
+  try {
+    const exe = join(dir, COMFY_BINARY_NAME);
+    writeFileSync(exe, "#!/bin/sh\necho hi\n");
+
+    chmodSync(exe, 0o755);
+    expect(defaultBinaryDeps().isExecutable(exe)).toBe(true);
+
+    chmodSync(exe, 0o644);
+    expect(defaultBinaryDeps().isExecutable(exe)).toBe(false);
+
+    expect(defaultBinaryDeps().isExecutable(join(dir, "does-not-exist"))).toBe(false);
+
+    // The `isFile()` guard itself: `accessSync(X_OK)` alone answers `true`
+    // for a DIRECTORY named `comfy`, which would then read as `discovered`
+    // and fail at spawn with a confusing EACCES -- the failure the guard's
+    // own comment in binary.ts exists to prevent.
+    mkdirSync(join(dir, "as-a-directory", COMFY_BINARY_NAME), { recursive: true });
+    expect(
+      defaultBinaryDeps().isExecutable(join(dir, "as-a-directory", COMFY_BINARY_NAME)),
+    ).toBe(false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Every test above injects `isExecutable`, so none of them can raise a real
+// `NotCapable` -- but the PROPAGATION of one through `resolveComfyBinary`'s two
+// scan loops is testable, and worth pinning: a future refactor wrapping either
+// loop in `try { … } catch { continue; }` would silently restore the exact
+// swallow three commits were spent removing (see `defaultBinaryDeps` above).
+test("a NotCapable from isExecutable propagates rather than reading as 'not here'", () => {
+  const notCapable = new Error('Requires sys access to "uid"');
+  notCapable.name = "NotCapable";
+  // Throws only for the PATH candidate, and returns false (not throws) for
+  // every searchRoots candidate -- so a `try { … } catch { continue; }`
+  // wrapping ONLY the PATH-scan loop would swallow this, fall through to a
+  // discovery loop that reports "not found" instead of throwing, and this
+  // test would then fail to see a throw at all. A throwing-everywhere
+  // isExecutable can't tell that apart from a real propagation, because the
+  // discovery loop throws too and the assertion still passes either way.
+  const pathCandidate = join("/usr/bin", COMFY_BINARY_NAME);
+  const throwing: BinaryDeps = {
+    env: { PATH: "/usr/bin" },
+    home: HOME,
+    isExecutable: (p) => {
+      if (p === pathCandidate) throw notCapable;
+      return false;
+    },
+  };
+  expect(() => resolveComfyBinary(throwing)).toThrow(notCapable);
+});
+
+test("a NotCapable from isExecutable propagates out of the discovery loop too", () => {
+  // No PATH entries at all, so this exercises the SECOND loop (searchRoots)
+  // rather than the PATH scan the test above already covers.
+  const notCapable = new Error('Requires sys access to "uid"');
+  notCapable.name = "NotCapable";
+  const throwing: BinaryDeps = {
+    env: {},
+    home: HOME,
+    isExecutable: () => {
+      throw notCapable;
+    },
+  };
+  expect(() => resolveComfyBinary(throwing)).toThrow(notCapable);
+});
