@@ -411,9 +411,7 @@ export class LaunchFailedError extends Error {
     super(
       `ComfyUI never answered at ${url}: comfy launch exited before producing a usable server\n` +
         `  ${cause.message}\n` +
-        `The most common cause is a workspace comfy-cli could not resolve — the same failure ` +
-        `\`not_in_workspace\` reports when the CLI catches it instead of crashing.\n` +
-        workspaceGuidance(workspace),
+        launchDiagnosis(cause, workspace),
       { cause },
     );
     this.url = url;
@@ -714,6 +712,57 @@ function launchArgv(argv: readonly string[], workspace: string | undefined): str
  * which, pointed at the same shared model directory, is a mistake nobody would
  * see until the output was wrong.
  */
+/**
+ * comfy-cli failed to start a **bare command name**, which is a PATH lookup.
+ *
+ * `comfy launch --background` re-execs *itself* by name through
+ * `subprocess.Popen` (`comfy_cli/command/launch.py`), so this fires when the
+ * directory holding the comfy binary is missing from the PATH this server
+ * inherited. The name is required to contain no `/`: an absolute path that is
+ * missing is a different fault with a different fix, and claiming PATH for it
+ * would be the very substitution this function exists to stop.
+ */
+const SELF_EXEC_FAILURE = /(FileNotFoundError: [^\n]*No such file or directory: '([^'/\n]+)')/;
+
+/**
+ * Say what actually killed the launch.
+ *
+ * The workspace arm is the fallback rather than the assertion it used to be.
+ * Measured 2026-09-19: a launch under a GUI client's bare PATH resolved its
+ * workspace fine, printed `Launching ComfyUI from: …`, and then died on
+ * `FileNotFoundError: … 'comfy'` — and this function's predecessor answered
+ * "the most common cause is a workspace comfy-cli could not resolve" and
+ * pointed at {@link WORKSPACE_ENV}, a setting that cannot fix a PATH problem.
+ * A confident wrong diagnosis is worse than a vague right one, so a cause we
+ * can *recognise* is now named from the evidence, and the guess is kept only
+ * for stderr that shows nothing recognisable.
+ *
+ * This reads {@link EnvelopeParseError.stderr}, not `cause.message`, because
+ * the message holds only the first 200 characters and a traceback's diagnosis
+ * is its last line.
+ */
+function launchDiagnosis(cause: EnvelopeParseError, workspace: string | undefined): string {
+  const selfExec = cause.stderr?.match(SELF_EXEC_FAILURE);
+  if (selfExec !== null && selfExec !== undefined) {
+    const [, line, missing] = selfExec;
+    return (
+      `  ${line}\n` +
+      `comfy-cli could not start \`${missing}\`. \`comfy launch --background\` re-execs itself ` +
+      `by bare name, resolved through PATH — so the directory holding the comfy binary must be ` +
+      `on the PATH this server was started with.\n` +
+      `COMFY_BIN does not help here: it tells *this server* where comfy is, and the lookup that ` +
+      `failed is comfy-cli's own.\n` +
+      `A GUI-launched MCP client inherits a minimal PATH and hits this even where comfy runs ` +
+      `fine in a terminal; set PATH in that client's entry for this server.`
+    );
+  }
+  return (
+    `The most common cause is a workspace comfy-cli could not resolve — the same failure ` +
+    `\`not_in_workspace\` reports when the CLI catches it instead of crashing.\n` +
+    workspaceGuidance(workspace)
+  );
+}
+
 function workspaceGuidance(workspace: string | undefined): string {
   const passed =
     workspace === undefined

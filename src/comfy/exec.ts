@@ -272,7 +272,9 @@ function decodeStdout(run: ComfyRun): ParsedEnvelope {
         `  reason: ${cause.message}\n` +
         `  stderr: ${snippet(run.stderr)}`,
       run.stdout,
-      { cause },
+      // The message quotes stderr truncated; carry it whole as well, because a
+      // crash puts its diagnosis at the end and callers have to classify it.
+      { cause, stderr: run.stderr },
     );
   }
 }
